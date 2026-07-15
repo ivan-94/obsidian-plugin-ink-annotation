@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inkstone S09 Ink feasibility lab</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="lab-header">
+      <div>
+        <p class="eyebrow">S09 · isolated experiment · non-canonical</p>
+        <h1>Ink feasibility lab</h1>
+        <p>Pen or primary mouse draws. Touch, wheel, and trackpad remain navigation.</p>
+      </div>
+      <div class="lab-actions" role="group" aria-label="Ink lab actions">
+        <button id="clear" type="button">Clear</button>
+        <button id="mismatch" type="button">Simulate layout mismatch</button>
+        <button id="theme" type="button">Toggle theme</button>
+        <button id="export-metrics" type="button">Export metrics</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="experiment" aria-label="Fixed logical annotation layout">
+        <div id="stage-shell" class="stage-shell">
+          <article id="logical-stage" class="logical-stage">
+            <div class="reading-copy">
+              <p class="kicker">Fixed logical width: 960 · two hidden bounded surfaces</p>
+              <h2>Mutable Markdown needs a stable drawing contract</h2>
+              <p>
+                This reading surface stays at one logical width and scales as a unit. Text and Ink
+                therefore share the same coordinate system across viewport changes.
+              </p>
+              <blockquote>
+                A stroke may look continuous while its canonical fragments belong to separate
+                bounded surfaces.
+              </blockquote>
+              <h3>Surface one</h3>
+              <p>
+                Draw from this paragraph into the lower section. The visible line remains
+                continuous; metrics report linked fragments without showing a technical page
+                boundary.
+              </p>
+              <div class="spacer" aria-hidden="true"></div>
+              <h3>Surface two</h3>
+              <p>
+                Layout fingerprints cover typography, theme, logical width, source revision, and
+                block fingerprints. A mismatch blocks a false alignment claim.
+              </p>
+            </div>
+            <canvas id="committed" width="960" height="1200" aria-hidden="true"></canvas>
+            <canvas
+              id="active"
+              width="960"
+              height="1200"
+              aria-label="Experimental Ink input surface"
+            ></canvas>
+          </article>
+        </div>
+      </section>
+
+      <aside class="metrics-panel" aria-live="polite">
+        <div class="status-row">
+          <span>Layout</span>
+          <strong id="layout-status" data-status="match">Match</strong>
+        </div>
+        <pre id="metrics">Draw a stroke to collect aggregate metrics.</pre>
+        <h2>Environment events</h2>
+        <ol id="events"></ol>
+      </aside>
+    </main>
+
+    <script type="module" src="bundle.js"></script>
+  </body>
+</html>

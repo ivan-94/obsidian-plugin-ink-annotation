@@ -1,0 +1,15 @@
+node_modules/
+coverage/
+dist/
+main.js
+main.js.map
+prototypes/s09-ink-spike/bundle.js
+.DS_Store
+*.log
+.hat/
+test-fixtures/vault/.obsidian/*
+!test-fixtures/vault/.obsidian/community-plugins.json
+artifacts/
+hats/
+test-fixtures
+docs/delivery

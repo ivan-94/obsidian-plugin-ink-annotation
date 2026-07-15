@@ -1,0 +1,45 @@
+{
+  "name": "inkstone-annotations",
+  "version": "0.1.0",
+  "description": "Text and ink annotations for mutable Markdown in Obsidian.",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "npm run typecheck && node esbuild.config.mjs production && npm run check:mobile",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run build",
+    "check:mobile": "node scripts/check-mobile-bundle.mjs",
+    "dev": "node esbuild.config.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "install:dev": "node scripts/install-dev.mjs",
+    "lint": "eslint .",
+    "measure:scale": "node scripts/run-scale-harness.mjs",
+    "prepare:physical-scale": "node scripts/run-physical-scale-fixture.mjs",
+    "package:rc": "npm run check && node scripts/package-release.mjs && node scripts/verify-release-lifecycle.mjs",
+    "prototype:s01": "node scripts/serve-prototype.mjs prototypes/s01-ui",
+    "prototype:s09": "node scripts/build-s09-prototype.mjs && node scripts/serve-prototype.mjs prototypes/s09-ink-spike",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "verify:rc-lifecycle": "node scripts/verify-release-lifecycle.mjs"
+  },
+  "devDependencies": {
+    "@codemirror/state": "6.5.0",
+    "@codemirror/view": "6.38.6",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.1",
+    "@vitest/coverage-v8": "^4.1.10",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.7.0",
+    "jsdom": "^29.1.1",
+    "obsidian": "^1.13.1",
+    "prettier": "^3.9.5",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.64.0",
+    "vitest": "^4.1.10"
+  }
+}

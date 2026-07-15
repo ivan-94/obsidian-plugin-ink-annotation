@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inkstone S01 低保真交互原型</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- PROTOTYPE — Three adaptive annotation layouts, switchable via ?variant=. Throw away after S01. -->
+    <header class="prototype-header">
+      <div>
+        <span class="prototype-badge">THROWAWAY PROTOTYPE · S01</span>
+        <h1>Inkstone interaction lab</h1>
+        <p id="variant-description"></p>
+      </div>
+      <div class="lab-controls" aria-label="原型环境控制">
+        <label
+          >设备
+          <select id="platform">
+            <option value="desktop">Desktop</option>
+            <option value="ipad">iPad</option>
+          </select></label
+        >
+        <label
+          >视口
+          <select id="viewport">
+            <option value="wide">Wide</option>
+            <option value="narrow">Narrow</option>
+            <option value="portrait">Portrait</option>
+            <option value="landscape">Landscape</option>
+          </select></label
+        >
+        <label
+          >选择位置
+          <select id="collision">
+            <option value="center">Center</option>
+            <option value="top">Top collision</option>
+            <option value="bottom">Bottom collision</option>
+            <option value="left">Left collision</option>
+            <option value="right">Right collision</option>
+          </select></label
+        >
+        <label
+          >场景
+          <select id="scenario">
+            <option value="normal">Normal</option>
+            <option value="empty">Empty current file</option>
+            <option value="unsupported">Unsupported selection</option>
+            <option value="unanchored">Unanchored</option>
+            <option value="needs-rebase">Needs rebase</option>
+            <option value="conflict">iCloud conflict</option>
+            <option value="local-only">Local save only</option>
+            <option value="ink-save-error">Ink save failure</option>
+          </select></label
+        >
+        <label class="check-control"><input id="keyboard" type="checkbox" /> 显示键盘</label>
+      </div>
+    </header>
+
+    <main class="stage-shell">
+      <section id="device-frame" class="device-frame" aria-label="Obsidian 标注交互原型">
+        <div id="app"></div>
+      </section>
+      <aside class="state-panel" aria-label="完整原型状态">
+        <div class="state-heading">
+          <h2>State</h2>
+          <button id="reset" type="button">Reset</button>
+        </div>
+        <pre id="state-output"></pre>
+        <h2>任务脚本</h2>
+        <ol>
+          <li>点击正文选择文字；确认没有自动写入。</li>
+          <li>一键高亮，或 Add note 后模拟后台恢复。</li>
+          <li>点击重叠标注，选择正确记录并返回。</li>
+          <li>进入 Ink，绘制模拟笔迹，退出或重试保存。</li>
+          <li>在侧栏 Problems 中预览并修复目标。</li>
+        </ol>
+        <p class="prototype-warning">原型结论不是 WebView、Pencil 或 iCloud 平台事实。</p>
+      </aside>
+    </main>
+
+    <nav class="prototype-switcher" aria-label="原型版本切换">
+      <button id="previous-variant" aria-label="上一个版本">←</button>
+      <span id="variant-label"></span>
+      <button id="next-variant" aria-label="下一个版本">→</button>
+    </nav>
+    <div id="live-region" class="sr-only" aria-live="polite"></div>
+    <script type="module" src="prototype.js"></script>
+  </body>
+</html>

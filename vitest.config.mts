@@ -1,0 +1,27 @@
+import { fileURLToPath, URL } from 'node:url';
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  resolve: {
+    alias: {
+      obsidian: fileURLToPath(new URL('./test-fixtures/obsidian-runtime.ts', import.meta.url)),
+    },
+  },
+  test: {
+    coverage: {
+      exclude: ['src/**/*.test.ts'],
+      include: ['src/**/*.ts'],
+      provider: 'v8',
+      reporter: ['text', 'html', 'json-summary'],
+      thresholds: {
+        branches: 65,
+        functions: 67,
+        lines: 73,
+        statements: 72,
+      },
+    },
+    environment: 'node',
+    include: ['src/**/*.test.ts', 'scripts/**/*.test.mts'],
+    restoreMocks: true,
+  },
+});

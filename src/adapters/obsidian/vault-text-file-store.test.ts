@@ -1,0 +1,148 @@
+import { describe, expect, it } from 'vitest';
+
+import { ObsidianVaultTextFileStore } from './vault-text-file-store';
+
+describe('Obsidian DataAdapter text-file store', () => {
+  it('creates hidden nested folders and supports read, update and direct-child listing', async () => {
+    const adapter = new MemoryDataAdapter();
+    const store = new ObsidianVaultTextFileStore(adapter);
+    const directory = '.obsidian-annotations/v1/notes/hash';
+    const path = `${directory}/meta.json`;
+
+    await store.mkdir(`${directory}/annotations`);
+    await store.write(path, 'version 1');
+    await expect(store.read(path)).resolves.toBe('version 1');
+    await expect(store.list(directory)).resolves.toEqual(['annotations', 'meta.json']);
+
+    await store.write(path, 'version 2');
+    await expect(store.read(path)).resolves.toBe('version 2');
+    await store.append(path, ' plus');
+    await expect(store.read(path)).resolves.toBe('version 2 plus');
+    await expect(store.exists(path)).resolves.toBe(true);
+  });
+
+  it('turns a stalled hydrated-file read into a retryable timeout', async () => {
+    const adapter = new MemoryDataAdapter(true);
+    await adapter.write('.obsidian-annotations/stalled.json', 'visible but not hydrated');
+    const store = new ObsidianVaultTextFileStore(adapter, 5);
+
+    await expect(store.read('.obsidian-annotations/stalled.json')).rejects.toThrow(
+      /timed out.*read/u,
+    );
+  });
+
+  it('recovers process interruption states without exposing partial canonical bytes', async () => {
+    const adapter = new MemoryDataAdapter();
+    const directory = '.obsidian-annotations/v1/notes/hash/annotations';
+    const target = `${directory}/record.json`;
+    await adapter.mkdir(directory);
+    await adapter.write(`${target}.inkstone-bak`, 'complete revision 1');
+    await adapter.write(`${target}.inkstone-tmp`, 'partial revision 2');
+    const store = new ObsidianVaultTextFileStore(adapter);
+
+    await expect(store.list(directory)).resolves.toEqual(['record.json']);
+    await expect(store.read(target)).resolves.toBe('complete revision 1');
+    await expect(adapter.exists(`${target}.inkstone-bak`)).resolves.toBe(false);
+    await expect(adapter.exists(`${target}.inkstone-tmp`)).resolves.toBe(false);
+
+    await adapter.write(target, 'complete revision 2');
+    await adapter.write(`${target}.inkstone-bak`, 'complete revision 1');
+    await expect(store.read(target)).resolves.toBe('complete revision 2');
+    await expect(adapter.exists(`${target}.inkstone-bak`)).resolves.toBe(false);
+
+    await adapter.write(`${directory}/new.json.inkstone-tmp`, 'interrupted create');
+    await expect(store.list(directory)).resolves.toEqual(['record.json']);
+    await expect(store.read(`${directory}/new.json`)).resolves.toBeNull();
+  });
+
+  it('rolls back a failed journal promotion and later writes the complete replacement', async () => {
+    const adapter = new MemoryDataAdapter();
+    const target = '.obsidian-annotations/v1/notes/hash/meta.json';
+    await adapter.mkdir('.obsidian-annotations/v1/notes/hash');
+    await adapter.write(target, 'revision 1');
+    const store = new ObsidianVaultTextFileStore(adapter);
+    adapter.failNextPromotion();
+
+    await expect(store.write(target, 'revision 2')).rejects.toThrow('Injected promotion failure');
+    await expect(store.read(target)).resolves.toBe('revision 1');
+
+    await store.write(target, 'revision 2');
+    await expect(store.read(target)).resolves.toBe('revision 2');
+    await expect(adapter.exists(`${target}.inkstone-bak`)).resolves.toBe(false);
+    await expect(adapter.exists(`${target}.inkstone-tmp`)).resolves.toBe(false);
+  });
+});
+
+class MemoryDataAdapter {
+  private failPromotion = false;
+  private readonly files = new Map<string, string>();
+  private readonly folders = new Set<string>();
+
+  constructor(private readonly hangReads = false) {}
+
+  append(path: string, contents: string): Promise<void> {
+    this.files.set(path, `${this.files.get(path) ?? ''}${contents}`);
+    return Promise.resolve();
+  }
+
+  exists(path: string): Promise<boolean> {
+    return Promise.resolve(this.files.has(path) || this.folders.has(path));
+  }
+
+  list(
+    path: string,
+  ): Promise<{ readonly files: readonly string[]; readonly folders: readonly string[] }> {
+    const prefix = `${path}/`;
+    const files = [...this.files.keys()].filter(
+      (candidate) => candidate.startsWith(prefix) && !candidate.slice(prefix.length).includes('/'),
+    );
+    const folders = [...this.folders].filter(
+      (candidate) => candidate.startsWith(prefix) && !candidate.slice(prefix.length).includes('/'),
+    );
+    return Promise.resolve({ files, folders });
+  }
+
+  mkdir(path: string): Promise<void> {
+    if (this.files.has(path) || this.folders.has(path)) {
+      return Promise.reject(new Error('Folder already exists.'));
+    }
+    this.folders.add(path);
+    return Promise.resolve();
+  }
+
+  failNextPromotion(): void {
+    this.failPromotion = true;
+  }
+
+  read(path: string): Promise<string> {
+    if (this.hangReads) {
+      return new Promise(() => undefined);
+    }
+    const contents = this.files.get(path);
+    return contents === undefined
+      ? Promise.reject(new Error(`Missing file ${path}.`))
+      : Promise.resolve(contents);
+  }
+
+  remove(path: string): Promise<void> {
+    this.files.delete(path);
+    return Promise.resolve();
+  }
+
+  rename(from: string, to: string): Promise<void> {
+    if (this.failPromotion && from.endsWith('.inkstone-tmp')) {
+      this.failPromotion = false;
+      return Promise.reject(new Error('Injected promotion failure'));
+    }
+    const contents = this.files.get(from);
+    if (contents === undefined) return Promise.reject(new Error(`Missing file ${from}.`));
+    this.files.delete(from);
+    this.files.set(to, contents);
+    return Promise.resolve();
+  }
+
+  write(path: string, contents: string): Promise<void> {
+    this.files.set(path, contents);
+    return Promise.resolve();
+  }
+}

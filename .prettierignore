@@ -1,0 +1,9 @@
+coverage/
+main.js
+prototypes/s09-ink-spike/bundle.js
+node_modules/
+package-lock.json
+test-fixtures/vault/.obsidian/
+test-fixtures/vault/.obsidian-annotations/
+test-fixtures/vault/HAT Long 200k.md
+test-fixtures/vault/Inkstone Exports/

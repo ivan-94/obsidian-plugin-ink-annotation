@@ -1,0 +1,58 @@
+import { describe, expect, it } from 'vitest';
+
+import type { InkStroke, InkSurfaceRecord } from '../domain/ink-surface';
+import { InkDocumentSession } from './ink-document-session';
+
+describe('Ink document interaction performance', () => {
+  it('hit-tests and removes one stroke among 10,000 within the desktop interaction budget', () => {
+    const strokes = Array.from({ length: 10_000 }, (_value, index): InkStroke => ({
+      color: '#111111',
+      id: `stroke-${index}`,
+      points: [
+        point(index % 900, Math.floor(index / 900) * 4),
+        point((index % 900) + 2, Math.floor(index / 900) * 4 + 2),
+      ],
+      tool: 'pen',
+      width: 2,
+    }));
+    const session = new InkDocumentSession({
+      surfaces: [{ ...surface(), strokes }],
+      writer: { updateSurface: () => Promise.resolve() },
+    });
+    const startedAt = performance.now();
+
+    const erased = session.eraseStrokeAt(point(450, 20), 4);
+    const durationMs = performance.now() - startedAt;
+
+    expect(erased).not.toBeNull();
+    expect(durationMs).toBeLessThan(250);
+  });
+});
+
+function surface(): InkSurfaceRecord {
+  return {
+    createdAt: '2026-07-14T08:00:00.000Z',
+    filePath: 'Ink.md',
+    id: 'surface-a',
+    layout: {
+      blockFingerprints: ['a'],
+      fontFamily: 'Inter',
+      fontSize: 16,
+      lineHeight: 24,
+      logicalHeight: 1000,
+      logicalWidth: 1000,
+      sourceRevision: 'source',
+      themeMode: 'light',
+    },
+    noteId: 'note',
+    revision: 1,
+    schemaVersion: 1,
+    status: 'active',
+    strokes: [],
+    updatedAt: '2026-07-14T08:00:00.000Z',
+  };
+}
+
+function point(x: number, y: number) {
+  return { pressure: 0.5, time: x + y, x, y };
+}
