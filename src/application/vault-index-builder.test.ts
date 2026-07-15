@@ -80,6 +80,15 @@ describe('Vault index builder', () => {
       'Fresh.md:ink',
     ]);
   });
+
+  it('does not index an active Ink surface with no visible strokes', async () => {
+    const source = new DelayedCanonicalSource(['Empty.md'], 0);
+    const index = new VaultAnnotationIndex();
+
+    await new VaultIndexBuilder({ index, source }).rebuild();
+
+    expect(index.snapshot().map((entry) => entry.type)).toEqual(['highlight']);
+  });
 });
 
 class MemoryIndexCache {
@@ -119,7 +128,10 @@ class DelayedCanonicalSource implements CanonicalVaultAnnotationSource {
   private activeReads = 0;
   maximumConcurrentReads = 0;
 
-  constructor(private readonly paths: readonly string[]) {}
+  constructor(
+    private readonly paths: readonly string[],
+    private readonly inkStrokeCount = 2,
+  ) {}
 
   listAnnotations(filePath: string): Promise<{
     readonly conflicts: readonly RepositoryConflict[];
@@ -162,7 +174,7 @@ class DelayedCanonicalSource implements CanonicalVaultAnnotationSource {
         position: 20,
         revision: 1,
         status: 'active',
-        strokeCount: 2,
+        strokeCount: this.inkStrokeCount,
         thumbnailSvg: '<svg/>',
         updatedAt: '2026-07-14T08:00:00.000Z',
       },

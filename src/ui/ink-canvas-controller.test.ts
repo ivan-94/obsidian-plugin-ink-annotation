@@ -244,13 +244,14 @@ describe('Ink canvas controller', () => {
 
     expect(controls?.getAttribute('role')).toBe('toolbar');
     expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
-      'Done drawing',
+      'Move Ink toolbar',
       'Pen',
       'Highlighter',
       'Eraser',
       'Undo Ink change',
       'Redo Ink change',
       'Show or hide Ink color and width',
+      'Done drawing',
       'Retry local Ink save',
     ]);
     expect(
@@ -263,13 +264,77 @@ describe('Ink canvas controller', () => {
       'polite',
     );
     expect(root.querySelector('[data-inkstone-ink-status]')?.getAttribute('role')).toBe('status');
+    expect(root.querySelector('[data-inkstone-ink-width-control]')).not.toBeNull();
+    expect(root.querySelector<HTMLInputElement>('[data-inkstone-ink-color]')?.hidden).toBe(false);
+    expect(
+      root
+        .querySelector<HTMLButtonElement>('button[aria-label="Done drawing"]')
+        ?.querySelector('.inkstone-icon-button__label'),
+    ).toBeNull();
     const more = root.querySelector<HTMLButtonElement>(
       'button[aria-label="Show or hide Ink color and width"]',
     );
     more?.focus();
     more?.click();
+    expect(root.querySelector<HTMLInputElement>('[aria-label="Ink color"]')?.hidden).toBe(true);
+    more?.click();
     expect(document.activeElement?.getAttribute('aria-label')).toBe('Ink color');
     expect(root.querySelector<HTMLInputElement>('[aria-label="Ink color"]')?.hidden).toBe(false);
+  });
+
+  it('moves the compact floating palette by its drag handle and keeps it in the viewport', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+    const controls = root.querySelector<HTMLElement>('.inkstone-ink-controls');
+    const handle = root.querySelector<HTMLButtonElement>('[data-inkstone-ink-drag-handle]');
+    if (controls === null || handle === null) throw new Error('Missing draggable Ink controls.');
+    vi.spyOn(controls, 'getBoundingClientRect').mockReturnValue(rect(760, 80, 420, 48));
+    Object.defineProperties(document.documentElement, {
+      clientHeight: { configurable: true, value: 800 },
+      clientWidth: { configurable: true, value: 1200 },
+    });
+
+    handle.dispatchEvent(pointer('pointerdown', 780, 100));
+    document.dispatchEvent(pointer('pointermove', 400, 300));
+    document.dispatchEvent(pointer('pointerup', 400, 300));
+
+    expect(controls.dataset.inkstoneInkDragged).toBe('true');
+    expect(controls.style.left).toBe('380px');
+    expect(controls.style.top).toBe('280px');
+    expect(controls.style.right).toBe('auto');
+
+    handle.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowLeft' }));
+    expect(controls.style.left).toBe('752px');
+  });
+
+  it('defaults a compact document pane to the bottom so the toolbar does not cover its title', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(100, 80, 480, 600));
+    Object.defineProperties(document.documentElement, {
+      clientHeight: { configurable: true, value: 800 },
+      clientWidth: { configurable: true, value: 1200 },
+    });
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+    const controls = root.querySelector<HTMLElement>('.inkstone-ink-controls');
+    if (controls === null) throw new Error('Missing Ink controls.');
+    vi.spyOn(controls, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 420, 46));
+
+    controller.enter();
+
+    expect(controls.style.left).toBe('148px');
+    expect(controls.style.top).toBe('618px');
+    expect(controls.dataset.inkstoneInkDragged).toBeUndefined();
   });
 
   it('delegates the palette Exit button to the host Ink mode lifecycle', async () => {
@@ -307,6 +372,25 @@ describe('Ink canvas controller', () => {
     retry?.click();
     await vi.waitFor(() => expect(session.retryCalls).toBe(1));
   });
+
+  it('keeps routine local-save success out of the compact toolbar', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    session.savedLocally = true;
+    const controller = new InkCanvasController({
+      document,
+      preference: { color: '#4f46d8', hintShown: true, tool: 'pen', width: 4 },
+      root,
+      session,
+    });
+
+    controller.enter();
+
+    const status = root.querySelector<HTMLElement>('[data-inkstone-ink-status]');
+    expect(status?.textContent).toContain('Saved locally');
+    expect(status?.hidden).toBe(true);
+  });
 });
 
 class FakeSession {
@@ -315,6 +399,7 @@ class FakeSession {
   failExit = false;
   retryCalls = 0;
   redoCalls = 0;
+  savedLocally = false;
   state: InkSurfaceSessionSnapshot['state'] = {
     dirty: false,
     kind: 'ink-mode',
@@ -336,7 +421,9 @@ class FakeSession {
               kind: 'error',
               message: "Couldn't save Ink locally. Retry.",
             }
-          : { kind: 'idle' },
+          : this.savedLocally
+            ? { kind: 'saved-locally' }
+            : { kind: 'idle' },
       state: this.state,
       surface: { ...this.record, strokes: this.strokes },
     };

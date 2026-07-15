@@ -6,10 +6,14 @@ import type { InkSurfaceSummary } from '../domain/ink-surface-summary';
 import { createDismissibleMenu } from './dismissible-menu';
 import { createIcon, createIconButton, createIconStatus } from './icon-button';
 
+const RESTORE_WINDOW_MS = 5_000;
+
 export class CurrentFileSidebar {
   private activeId: string | null = null;
   private readonly container: HTMLElement;
   private readonly document: Document;
+  private restoreTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly onDeleteAnnotation: (annotationId: string) => void;
   private readonly onSelect: (annotationId: string) => void;
   private readonly onInspect: (annotationId: string, invoker: HTMLElement) => void;
   private readonly onEntireVault: () => void | Promise<void>;
@@ -21,12 +25,14 @@ export class CurrentFileSidebar {
   private readonly onExportInkReport: () => void;
   private readonly onExportInkSvg: (surfaceId: string) => void;
   private readonly onRestoreInk: (surfaceId: string) => void;
+  private readonly onRestoreAnnotation: (annotationId: string, expectedRevision: number) => void;
   private readonly onReviewConflicts: (invoker: HTMLElement) => void;
   private readonly onSelectInk: (summary: InkSurfaceSummary) => void;
 
   constructor(input: {
     readonly container: HTMLElement;
     readonly document: Document;
+    readonly onDeleteAnnotation?: (annotationId: string) => void;
     readonly onInspect?: (annotationId: string, invoker: HTMLElement) => void;
     readonly onDeleteInk?: (surfaceId: string) => void;
     readonly onEditInk?: (surfaceId: string) => void;
@@ -38,11 +44,13 @@ export class CurrentFileSidebar {
     readonly onRetry?: () => void;
     readonly onReviewConflicts?: (invoker: HTMLElement) => void;
     readonly onRestoreInk?: (surfaceId: string) => void;
+    readonly onRestoreAnnotation?: (annotationId: string, expectedRevision: number) => void;
     readonly onSelect: (annotationId: string) => void;
     readonly onSelectInk?: (summary: InkSurfaceSummary) => void;
   }) {
     this.container = input.container;
     this.document = input.document;
+    this.onDeleteAnnotation = input.onDeleteAnnotation ?? (() => undefined);
     this.onInspect = input.onInspect ?? (() => undefined);
     this.onDeleteInk = input.onDeleteInk ?? (() => undefined);
     this.onEditInk = input.onEditInk ?? (() => undefined);
@@ -54,6 +62,7 @@ export class CurrentFileSidebar {
     this.onRetry = input.onRetry ?? (() => undefined);
     this.onReviewConflicts = input.onReviewConflicts ?? (() => undefined);
     this.onRestoreInk = input.onRestoreInk ?? (() => undefined);
+    this.onRestoreAnnotation = input.onRestoreAnnotation ?? (() => undefined);
     this.onSelect = input.onSelect;
     this.onSelectInk = input.onSelectInk ?? (() => undefined);
   }
@@ -66,6 +75,42 @@ export class CurrentFileSidebar {
     },
     inkSummaries: readonly InkSurfaceSummary[] = [],
   ): void {
+    this.clearRestoreTimer();
+    const now = Date.now();
+    const visibleGroups = model.groups
+      .map((group) => ({
+        ...group,
+        rows: group.rows.filter((row) => {
+          if (row.deletedAt === undefined) return true;
+          const deletedAt = Date.parse(row.deletedAt);
+          return Number.isFinite(deletedAt) && now < deletedAt + RESTORE_WINDOW_MS;
+        }),
+      }))
+      .filter((group) => group.rows.length > 0);
+    const visibleTextRows = visibleGroups.flatMap((group) => group.rows);
+    const visibleInkSummaries = inkSummaries.filter((summary) => {
+      if (summary.strokeCount === 0) return false;
+      if (summary.deletedAt === undefined) return true;
+      const deletedAt = Date.parse(summary.deletedAt);
+      return Number.isFinite(deletedAt) && now < deletedAt + RESTORE_WINDOW_MS;
+    });
+    const nextExpiry = [
+      ...visibleTextRows.flatMap((row) =>
+        row.deletedAt === undefined ? [] : [Date.parse(row.deletedAt) + RESTORE_WINDOW_MS],
+      ),
+      ...visibleInkSummaries.flatMap((summary) =>
+        summary.deletedAt === undefined ? [] : [Date.parse(summary.deletedAt) + RESTORE_WINDOW_MS],
+      ),
+    ].sort((left, right) => left - right)[0];
+    if (nextExpiry !== undefined) {
+      this.restoreTimer = setTimeout(
+        () => {
+          this.restoreTimer = null;
+          this.render(model, health, inkSummaries);
+        },
+        Math.max(0, nextExpiry - now),
+      );
+    }
     const focusTarget = this.captureFocusTarget();
     this.container.replaceChildren();
     this.container.classList.add('inkstone-sidebar');
@@ -172,7 +217,7 @@ export class CurrentFileSidebar {
       this.container.append(alert);
     }
 
-    if (model.total === 0 && inkSummaries.length === 0) {
+    if (visibleTextRows.length === 0 && visibleInkSummaries.length === 0) {
       const empty = this.document.createElement('div');
       empty.className = 'inkstone-sidebar__empty';
       empty.append(createIcon(this.document, 'bookmark-plus', 'inkstone-sidebar__empty-icon'));
@@ -205,11 +250,11 @@ export class CurrentFileSidebar {
     });
     this.container.append(search);
 
-    if (inkSummaries.length > 0) {
-      this.container.append(this.createInkSection(inkSummaries));
+    if (visibleInkSummaries.length > 0) {
+      this.container.append(this.createInkSection(visibleInkSummaries));
     }
 
-    for (const group of model.groups) {
+    for (const group of visibleGroups) {
       const section = this.document.createElement('section');
       section.className = `inkstone-sidebar-group inkstone-sidebar-group--${group.kind}`;
       const heading = this.document.createElement('h3');
@@ -245,7 +290,12 @@ export class CurrentFileSidebar {
     return true;
   }
 
+  dispose(): void {
+    this.clearRestoreTimer();
+  }
+
   renderFailure(message: string): void {
+    this.clearRestoreTimer();
     this.container.replaceChildren();
     this.container.classList.add('inkstone-sidebar');
     this.container.classList.remove('inkstone-sidebar--vault');
@@ -265,7 +315,7 @@ export class CurrentFileSidebar {
   private createRow(row: CompactAnnotationRow): HTMLElement {
     const wrapper = this.document.createElement('div');
     wrapper.className = 'inkstone-sidebar-row';
-    wrapper.dataset.inkstoneAnnotationStatus = row.status;
+    wrapper.dataset.inkstoneAnnotationStatus = row.deletedAt === undefined ? row.status : 'deleted';
 
     const button = this.document.createElement('button');
     button.className = 'inkstone-sidebar-row__summary';
@@ -302,7 +352,11 @@ export class CurrentFileSidebar {
     metadata.textContent = [
       markerLabel(row),
       ...row.tags.map((tag) => `#${tag}`),
-      row.status === 'active' ? undefined : formatStatus(row.status),
+      row.deletedAt !== undefined
+        ? 'Deleted'
+        : row.status === 'active'
+          ? undefined
+          : formatStatus(row.status),
       formatCompactTimestamp(row.updatedAt),
     ]
       .filter((part): part is string => part !== undefined)
@@ -314,50 +368,81 @@ export class CurrentFileSidebar {
 
     const actions = this.document.createElement('div');
     actions.className = 'inkstone-sidebar-row__actions';
-    const menuId = `inkstone-annotation-menu-${encodeURIComponent(row.id)}`;
-    const more = createIconButton(this.document, {
-      icon: 'ellipsis',
-      label: `Open actions for ${row.quote}`,
-    });
-    more.dataset.inkstoneAnnotationActions = row.id;
-    more.id = `inkstone-annotation-edit-${encodeURIComponent(row.id)}`;
-    more.setAttribute('aria-controls', menuId);
-    more.setAttribute('aria-expanded', 'false');
-    more.setAttribute('aria-haspopup', 'menu');
-    const menu = this.document.createElement('div');
-    menu.className = 'inkstone-sidebar-row__menu';
-    menu.dataset.inkstoneAnnotationMenu = row.id;
-    menu.id = menuId;
-    menu.hidden = true;
-    menu.setAttribute('role', 'menu');
-    const annotationMenu = createDismissibleMenu({
-      document: this.document,
-      menu,
-      trigger: more,
-    });
-    more.addEventListener('click', () => {
-      if (annotationMenu.toggle()) menu.querySelector<HTMLButtonElement>('button')?.focus();
-    });
-    const edit = createIconButton(this.document, {
-      icon: 'square-pen',
-      label: 'Edit annotation',
-      text: 'Edit',
-    });
-    edit.setAttribute('role', 'menuitem');
-    edit.addEventListener('click', () => {
-      annotationMenu.close();
-      this.onInspect(row.id, more);
-    });
-    menu.append(edit);
-    actions.append(more, menu);
+    if (row.deletedAt !== undefined) {
+      button.setAttribute('aria-disabled', 'true');
+      const restore = createIconButton(this.document, {
+        icon: 'rotate-ccw',
+        label: 'Restore annotation',
+        text: 'Restore',
+      });
+      restore.dataset.inkstoneAnnotationRestore = row.id;
+      restore.addEventListener('click', () => this.onRestoreAnnotation(row.id, row.revision));
+      actions.append(restore);
+    } else {
+      const menuId = `inkstone-annotation-menu-${encodeURIComponent(row.id)}`;
+      const more = createIconButton(this.document, {
+        icon: 'ellipsis',
+        label: `Open actions for ${row.quote}`,
+      });
+      more.dataset.inkstoneAnnotationActions = row.id;
+      more.id = `inkstone-annotation-edit-${encodeURIComponent(row.id)}`;
+      more.setAttribute('aria-controls', menuId);
+      more.setAttribute('aria-expanded', 'false');
+      more.setAttribute('aria-haspopup', 'menu');
+      const menu = this.document.createElement('div');
+      menu.className = 'inkstone-sidebar-row__menu';
+      menu.dataset.inkstoneAnnotationMenu = row.id;
+      menu.id = menuId;
+      menu.hidden = true;
+      menu.setAttribute('role', 'menu');
+      const annotationMenu = createDismissibleMenu({
+        document: this.document,
+        menu,
+        trigger: more,
+      });
+      more.addEventListener('click', () => {
+        if (annotationMenu.toggle()) menu.querySelector<HTMLButtonElement>('button')?.focus();
+      });
+      const edit = createIconButton(this.document, {
+        icon: 'square-pen',
+        label: 'Edit annotation',
+        text: 'Edit',
+      });
+      edit.setAttribute('role', 'menuitem');
+      edit.addEventListener('click', () => {
+        annotationMenu.close();
+        this.onInspect(row.id, more);
+      });
+      const remove = createIconButton(this.document, {
+        danger: true,
+        icon: 'trash-2',
+        label: 'Delete annotation',
+        text: 'Delete',
+      });
+      remove.setAttribute('role', 'menuitem');
+      remove.addEventListener('click', () => {
+        annotationMenu.close();
+        this.onDeleteAnnotation(row.id);
+      });
+      menu.append(edit, remove);
+      actions.append(more, menu);
+    }
     wrapper.append(actions);
 
-    button.addEventListener('click', () => {
-      this.activeId = row.id;
-      this.applyActiveState();
-      this.onSelect(row.id);
-    });
+    if (row.deletedAt === undefined) {
+      button.addEventListener('click', () => {
+        this.activeId = row.id;
+        this.applyActiveState();
+        this.onSelect(row.id);
+      });
+    }
     return wrapper;
+  }
+
+  private clearRestoreTimer(): void {
+    if (this.restoreTimer === null) return;
+    clearTimeout(this.restoreTimer);
+    this.restoreTimer = null;
   }
 
   private createInkSection(summaries: readonly InkSurfaceSummary[]): HTMLElement {

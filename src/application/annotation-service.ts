@@ -18,6 +18,8 @@ import {
   type SidecarRepository,
 } from '../storage/sidecar-repository';
 
+const TEXT_RESTORE_WINDOW_MS = 5_000;
+
 export interface CreateHighlightInput {
   readonly filePath: string;
   readonly selection: {
@@ -251,7 +253,10 @@ export class AnnotationService {
     return {
       conflicts: loaded.conflicts,
       issues: loaded.issues,
-      model: buildCurrentFileAnnotationList(loaded.records),
+      model: buildCurrentFileAnnotationList(loaded.records, {
+        deletedRestoreWindowMs: TEXT_RESTORE_WINDOW_MS,
+        now: this.now(),
+      }),
     };
   }
 

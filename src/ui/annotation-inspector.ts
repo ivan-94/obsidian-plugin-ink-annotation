@@ -1,7 +1,6 @@
 import type { ReattachmentCandidate } from '../domain/annotation-reattachment';
 import type { StylePreset } from '../domain/style-preset';
 import type { TextAnnotationRecord } from '../domain/text-annotation';
-import { createDismissibleMenu } from './dismissible-menu';
 import { createIcon, createIconButton } from './icon-button';
 
 export interface AnnotationInspectorChanges {
@@ -190,6 +189,7 @@ export class AnnotationInspector {
     const inspector = this.requireElement();
     inspector.replaceChildren();
     delete inspector.dataset.inkstoneOverlapChooser;
+    delete inspector.dataset.inkstoneDeletedState;
     inspector.dataset.inkstoneInspectorEditor = '';
     inspector.dataset.annotationId = record.id;
     this.rememberInvoker(invoker);
@@ -220,8 +220,6 @@ export class AnnotationInspector {
       markButtons.set(kind, button);
       markTypes.append(button);
     }
-    inspector.append(markTypes);
-
     const styleRow = this.document.createElement('div');
     styleRow.className = 'inkstone-annotation-inspector__styles';
     styleRow.setAttribute('aria-label', 'Style');
@@ -250,12 +248,15 @@ export class AnnotationInspector {
       styleButtons.set(preset.id, button);
       styleRow.append(button);
     }
-    inspector.append(styleRow);
+    const editorControls = this.document.createElement('div');
+    editorControls.className = 'inkstone-annotation-inspector__editor-controls';
+    editorControls.append(markTypes, styleRow);
+    inspector.append(editorControls);
 
     const note = this.document.createElement('textarea');
     note.setAttribute('aria-label', 'Note');
     note.placeholder = 'Add a note…';
-    note.rows = 4;
+    note.rows = 2;
     note.value = record.body ?? '';
     note.addEventListener('input', () => {
       dirty = true;
@@ -287,7 +288,6 @@ export class AnnotationInspector {
     save.className = 'inkstone-annotation-inspector__save mod-cta';
     save.setAttribute('aria-label', 'Save annotation');
     save.textContent = 'Save';
-    inspector.append(save);
 
     const changes = (): AnnotationInspectorChanges => ({
       body: note.value,
@@ -369,23 +369,10 @@ export class AnnotationInspector {
       this.onNavigate(currentRecord);
       showActionFeedback(navigate, 'Source opened');
     });
-    const more = createIconButton(this.document, { icon: 'ellipsis', label: 'More actions' });
-    more.setAttribute('aria-haspopup', 'menu');
-    const moreMenu = this.document.createElement('div');
-    moreMenu.className = 'inkstone-annotation-inspector__more-menu';
-    moreMenu.hidden = true;
-    moreMenu.setAttribute('role', 'menu');
-    const moreMenuController = createDismissibleMenu({
-      document: this.document,
-      menu: moreMenu,
-      trigger: more,
-    });
     const copyJson = createIconButton(this.document, {
       icon: 'braces',
       label: 'Copy annotation JSON',
-      text: 'Copy JSON',
     });
-    copyJson.setAttribute('role', 'menuitem');
     copyJson.addEventListener('click', () => {
       void this.writeClipboard(`${JSON.stringify(currentRecord, null, 2)}\n`).then(
         () => showActionFeedback(copyJson, 'Annotation JSON copied'),
@@ -393,10 +380,7 @@ export class AnnotationInspector {
           status.textContent = "Couldn't copy. Retry.";
         },
       );
-      moreMenuController.close();
     });
-    more.addEventListener('click', moreMenuController.toggle);
-    moreMenu.append(copyJson);
     const remove = createIconButton(this.document, {
       danger: true,
       icon: 'trash-2',
@@ -410,7 +394,7 @@ export class AnnotationInspector {
           status.textContent = "Couldn't delete locally. Retry.";
         });
     });
-    actions.append(copyQuote, copyLink, navigate, exportAnnotation, more, remove, moreMenu);
+    actions.append(copyQuote, copyLink, navigate, exportAnnotation, copyJson, remove);
     if (
       record.status === 'unanchored' &&
       this.onPreviewReattach !== undefined &&
@@ -432,7 +416,10 @@ export class AnnotationInspector {
       });
       inspector.append(repair);
     }
-    inspector.append(actions);
+    const footer = this.document.createElement('div');
+    footer.className = 'inkstone-annotation-inspector__footer';
+    footer.append(actions, save);
+    inspector.append(footer);
 
     const syncControls = (): void => {
       for (const [kind, button] of markButtons) {
@@ -503,12 +490,12 @@ export class AnnotationInspector {
     this.rememberInvoker(invoker);
     inspector.append(this.createHeader('Annotation deleted', 'trash-2'));
     const message = this.document.createElement('p');
-    message.textContent = 'Saved locally. You can undo this deletion.';
+    message.textContent = 'Saved locally';
     inspector.append(message);
     const undo = createIconButton(this.document, {
       icon: 'undo-2',
       label: 'Undo delete',
-      text: 'Undo delete',
+      text: 'Undo',
     });
     undo.classList.add('mod-cta');
     undo.addEventListener('click', () => {

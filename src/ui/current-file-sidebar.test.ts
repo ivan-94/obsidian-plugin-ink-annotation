@@ -1,13 +1,16 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { CurrentFileAnnotationList } from '../domain/current-file-annotation-list';
 import type { InkSurfaceSummary } from '../domain/ink-surface-summary';
 import { CurrentFileSidebar } from './current-file-sidebar';
 
 describe('current-file sidebar', () => {
-  afterEach(() => document.body.replaceChildren());
+  afterEach(() => {
+    vi.useRealTimers();
+    document.body.replaceChildren();
+  });
 
   it('shows an instructional empty state without fake annotation data', () => {
     const container = document.createElement('div');
@@ -105,6 +108,58 @@ describe('current-file sidebar', () => {
     document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
     expect(annotationMenu?.hidden).toBe(true);
     expect(annotationToggle?.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('deletes a text annotation from its row menu and exposes a short Restore action', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-15T13:42:00.000Z'));
+    const deleted: string[] = [];
+    const restored: string[] = [];
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onDeleteAnnotation: (id: string) => deleted.push(id),
+      onRestoreAnnotation: (id: string, revision: number) => restored.push(`${id}:${revision}`),
+      onSelect: () => undefined,
+    });
+    sidebar.render(fixture());
+
+    container
+      .querySelector<HTMLButtonElement>('[data-inkstone-annotation-actions="active-1"]')
+      ?.click();
+    container
+      .querySelector<HTMLElement>('[data-inkstone-annotation-menu="active-1"]')
+      ?.querySelector<HTMLButtonElement>('[aria-label="Delete annotation"]')
+      ?.click();
+    expect(deleted).toEqual(['active-1']);
+
+    sidebar.render({
+      groups: [
+        {
+          kind: 'heading',
+          rows: [
+            {
+              ...fixture().groups[1]!.rows[0]!,
+              deletedAt: '2026-07-15T13:42:00.000Z',
+              revision: 2,
+            },
+          ],
+          title: 'Intro',
+        },
+      ],
+      total: 1,
+    });
+    const restore = container.querySelector<HTMLButtonElement>(
+      '[data-inkstone-annotation-restore="active-1"]',
+    );
+    expect(restore).not.toBeNull();
+    restore?.click();
+    expect(restored).toEqual(['active-1:2']);
+
+    vi.advanceTimersByTime(5_000);
+    expect(container.querySelector('[data-inkstone-annotation-restore="active-1"]')).toBeNull();
+    sidebar.dispose();
   });
 
   it('synchronizes a document hit only while the already-open component exists', () => {
@@ -270,6 +325,8 @@ describe('current-file sidebar', () => {
   });
 
   it('renders Ink thumbnail metadata and routes locate/edit/delete/restore without loading vectors', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-14T12:01:03.000Z'));
     const actions: string[] = [];
     const container = document.createElement('div');
     document.body.append(container);
@@ -341,6 +398,45 @@ describe('current-file sidebar', () => {
       'restore:surface-2',
     ]);
   });
+
+  it('removes a deleted Ink restore row five seconds after its tombstone time', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-14T12:01:00.000Z'));
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onSelect: () => undefined,
+    });
+
+    sidebar.render({ groups: [], total: 0 }, undefined, [deletedInkSummary()]);
+    expect(container.querySelector('[data-inkstone-ink-restore="surface-2"]')).not.toBeNull();
+
+    vi.advanceTimersByTime(4_999);
+    expect(container.querySelector('[data-inkstone-ink-restore="surface-2"]')).not.toBeNull();
+    vi.advanceTimersByTime(1);
+
+    expect(container.querySelector('[data-inkstone-ink-restore="surface-2"]')).toBeNull();
+    expect(container.textContent).toContain('No annotations yet');
+    sidebar.dispose();
+    vi.useRealTimers();
+  });
+
+  it('never exposes a zero-stroke internal surface as a user annotation', () => {
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onSelect: () => undefined,
+    });
+
+    sidebar.render({ groups: [], total: 0 }, undefined, [
+      { ...inkSummary(), strokeCount: 0, thumbnailSvg: '<svg></svg>' },
+    ]);
+
+    expect(container.querySelector('[data-inkstone-ink-row]')).toBeNull();
+    expect(container.textContent).toContain('No annotations yet');
+  });
 });
 
 function fixture(): CurrentFileAnnotationList {
@@ -355,6 +451,7 @@ function fixture(): CurrentFileAnnotationList {
             notePreview: null,
             position: 20,
             quote: 'Lost quote',
+            revision: 1,
             status: 'unanchored',
             tags: ['repair'],
             updatedAt: '2026-07-14T09:00:00.000Z',
@@ -371,6 +468,7 @@ function fixture(): CurrentFileAnnotationList {
             notePreview: 'A short note',
             position: 40,
             quote: 'Active quote',
+            revision: 1,
             status: 'active',
             tags: ['tag-one'],
             updatedAt: '2026-07-14T09:01:00.000Z',

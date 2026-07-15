@@ -121,7 +121,7 @@ export class VaultIndexBuilder {
           );
         }
         for (const summary of inkSummaries) {
-          if (summary.deletedAt === undefined) {
+          if (summary.deletedAt === undefined && summary.strokeCount > 0) {
             entries.push(inkSummaryToIndexEntry(summary, note.noteId));
           }
         }

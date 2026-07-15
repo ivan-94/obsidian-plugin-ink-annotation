@@ -252,6 +252,32 @@ describe('ink surface repository contract', () => {
     expect(restored).toMatchObject({ revision: 3, strokes: [{ id: 'keep-me' }] });
     expect(restored.deletedAt).toBeUndefined();
   });
+
+  it('reclaims active zero-stroke surfaces as tombstones without touching visible Ink', async () => {
+    const { repository, surface } = await createFixture();
+    const visible = { ...surface, id: 'surface-visible', strokes: [stroke('keep')] };
+    await repository.writeSurface(surface);
+    await repository.writeSurface(visible);
+
+    const reclaimed = await (
+      repository as unknown as {
+        reclaimEmptySurfaces: (
+          filePath: string,
+          now: string,
+          deviceId: string,
+        ) => Promise<readonly InkSurfaceRecord[]>;
+      }
+    ).reclaimEmptySurfaces('Ink.md', '2026-07-14T12:02:00.000Z', 'desktop-device');
+
+    expect(reclaimed.map((record) => record.id)).toEqual([surface.id]);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toMatchObject({
+      deletedAt: '2026-07-14T12:02:00.000Z',
+      deviceId: 'desktop-device',
+      revision: 2,
+      strokes: [],
+    });
+    await expect(repository.readSurface(visible.filePath, visible.id)).resolves.toEqual(visible);
+  });
 });
 
 async function createFixture(writeDelayMs = 0): Promise<{

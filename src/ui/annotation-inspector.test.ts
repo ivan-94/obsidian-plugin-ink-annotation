@@ -8,6 +8,32 @@ import { AnnotationInspector } from './annotation-inspector';
 describe('annotation inspector', () => {
   afterEach(() => document.body.replaceChildren());
 
+  it('groups editor controls and footer actions into a compact layout', () => {
+    const inspector = new AnnotationInspector({
+      document,
+      onDelete: (item) => Promise.resolve(item),
+      onNavigate: () => undefined,
+      onSave: (item) => Promise.resolve(item),
+      onUndo: (item) => Promise.resolve(item),
+      presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
+      writeClipboard: () => Promise.resolve(),
+    });
+
+    inspector.show({ anchorRect: new DOMRect(), records: [record('compact', 'Compact quote')] });
+
+    const controls = document.querySelector('.inkstone-annotation-inspector__editor-controls');
+    const footer = document.querySelector('.inkstone-annotation-inspector__footer');
+    expect(controls).not.toBeNull();
+    expect(footer).not.toBeNull();
+    expect(controls?.querySelector('.inkstone-annotation-inspector__segments')).not.toBeNull();
+    expect(controls?.querySelector('.inkstone-annotation-inspector__styles')).not.toBeNull();
+    expect(footer?.querySelector('.inkstone-annotation-inspector__actions')).not.toBeNull();
+    expect(footer?.querySelector('.inkstone-annotation-inspector__save')).not.toBeNull();
+    expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Note"]')?.rows).toBe(
+      2,
+    );
+  });
+
   it('moves keyboard focus into a single-record dialog and returns it on Escape', async () => {
     const invoker = document.createElement('button');
     document.body.append(invoker);
@@ -34,7 +60,7 @@ describe('annotation inspector', () => {
     await vi.waitFor(() => expect(document.activeElement).toBe(invoker));
   });
 
-  it('dismisses the inspector overflow menu when clicking elsewhere in the inspector', () => {
+  it('keeps Copy JSON directly available without an overflow menu', () => {
     const inspector = new AnnotationInspector({
       document,
       onDelete: (item) => Promise.resolve(item),
@@ -45,16 +71,9 @@ describe('annotation inspector', () => {
       writeClipboard: () => Promise.resolve(),
     });
     inspector.show({ anchorRect: new DOMRect(), records: [record('one', 'One quote')] });
-    const more = document.querySelector<HTMLButtonElement>('button[aria-label="More actions"]');
-    const menu = document.querySelector<HTMLElement>('.inkstone-annotation-inspector__more-menu');
-
-    more?.click();
-    expect(menu?.hidden).toBe(false);
-    document
-      .querySelector('[data-inkstone-inspector-status]')
-      ?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-    expect(menu?.hidden).toBe(true);
-    expect(document.querySelector('[data-inkstone-annotation-inspector]')).not.toBeNull();
+    expect(document.querySelector('button[aria-label="Copy annotation JSON"]')).not.toBeNull();
+    expect(document.querySelector('button[aria-label="More actions"]')).toBeNull();
+    expect(document.querySelector('.inkstone-annotation-inspector__more-menu')).toBeNull();
   });
 
   it('shows every overlapping record before editing the explicitly chosen one', () => {
@@ -301,6 +320,7 @@ describe('annotation inspector', () => {
     await vi.waitFor(() =>
       expect(document.querySelector('[data-inkstone-inspector-editor]')).not.toBeNull(),
     );
+    expect(document.querySelector('[data-inkstone-deleted-state]')).toBeNull();
     expect(events).toEqual(['delete:recover-me', 'undo:recover-me:2']);
 
     document

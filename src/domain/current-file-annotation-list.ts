@@ -1,6 +1,7 @@
 import type { TextAnnotationRecord } from './text-annotation';
 
 export interface CompactAnnotationRow {
+  readonly deletedAt?: string;
   readonly id: string;
   readonly marker:
     | { readonly kind: 'highlight' | 'underline'; readonly styleId: string }
@@ -8,6 +9,7 @@ export interface CompactAnnotationRow {
   readonly notePreview: string | null;
   readonly position: number;
   readonly quote: string;
+  readonly revision: number;
   readonly status: TextAnnotationRecord['status'];
   readonly tags: readonly string[];
   readonly updatedAt: string;
@@ -26,9 +28,19 @@ export interface CurrentFileAnnotationList {
 
 export function buildCurrentFileAnnotationList(
   records: readonly TextAnnotationRecord[],
+  options: {
+    readonly deletedRestoreWindowMs?: number;
+    readonly now?: string;
+  } = {},
 ): CurrentFileAnnotationList {
+  const now = options.now === undefined ? Number.NaN : Date.parse(options.now);
   const visible = records
-    .filter((record) => record.deletedAt === undefined)
+    .filter((record) => {
+      if (record.deletedAt === undefined) return true;
+      if (options.deletedRestoreWindowMs === undefined || !Number.isFinite(now)) return false;
+      const deletedAt = Date.parse(record.deletedAt);
+      return Number.isFinite(deletedAt) && now < deletedAt + options.deletedRestoreWindowMs;
+    })
     .sort(compareDocumentPosition);
   const problems: CompactAnnotationRow[] = [];
   const headingGroups = new Map<string, CompactAnnotationRow[]>();
@@ -66,6 +78,7 @@ function compareDocumentPosition(left: TextAnnotationRecord, right: TextAnnotati
 
 function toCompactRow(record: TextAnnotationRecord): CompactAnnotationRow {
   return {
+    ...(record.deletedAt === undefined ? {} : { deletedAt: record.deletedAt }),
     id: record.id,
     marker:
       record.mark === undefined
@@ -75,6 +88,7 @@ function toCompactRow(record: TextAnnotationRecord): CompactAnnotationRow {
       typeof record.body === 'string' && record.body.trim().length > 0 ? record.body.trim() : null,
     position: record.target.position.start,
     quote: record.target.quote.exact,
+    revision: record.revision,
     status: record.status,
     tags: [...record.tags],
     updatedAt: record.updatedAt,

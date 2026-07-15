@@ -396,39 +396,73 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             this.sidebarView = null;
           }
         },
+        onDeleteAnnotation: async (filePath, annotationId) => {
+          const deleted = await annotationService.deleteAnnotation(filePath, annotationId);
+          lastDeleted = deleted;
+          await refreshAnnotationSurfaces(filePath);
+        },
         onBulkDeleteInk: async (selection) => {
           const failed: (typeof selection)[number][] = [];
-          for (const item of selection) {
-            try {
-              const current = await inkRepository.readSurface(item.filePath, item.id);
-              if (
-                current === null ||
-                current.deletedAt !== undefined ||
-                current.revision !== item.expectedRevision
-              ) {
+          const filePaths = [...new Set(selection.map((item) => item.filePath))];
+          const preparedFilePaths: string[] = [];
+          try {
+            for (const filePath of filePaths) {
+              await inkMode?.prepareFileMutation(filePath);
+              preparedFilePaths.push(filePath);
+            }
+          } catch (error) {
+            console.warn('[Inkstone Annotations]', error);
+            for (const filePath of preparedFilePaths) {
+              await inkMode
+                ?.refreshFile(filePath)
+                .catch((refreshError) => console.warn('[Inkstone Annotations]', refreshError));
+            }
+            return { failed: selection };
+          }
+          try {
+            for (const item of selection) {
+              try {
+                const current = await inkRepository.readSurface(item.filePath, item.id);
+                if (
+                  current === null ||
+                  current.deletedAt !== undefined ||
+                  current.revision !== item.expectedRevision
+                ) {
+                  failed.push(item);
+                  continue;
+                }
+                await inkRepository.tombstoneSurface(
+                  item.filePath,
+                  item.id,
+                  new Date().toISOString(),
+                  this.pluginSettings.deviceId,
+                );
+              } catch (error) {
+                console.warn('[Inkstone Annotations]', error);
                 failed.push(item);
-                continue;
               }
-              await inkRepository.tombstoneSurface(
-                item.filePath,
-                item.id,
-                new Date().toISOString(),
-                this.pluginSettings.deviceId,
-              );
-            } catch (error) {
-              console.warn('[Inkstone Annotations]', error);
-              failed.push(item);
+            }
+          } finally {
+            for (const filePath of preparedFilePaths) {
+              await inkMode
+                ?.refreshFile(filePath)
+                .catch((error) => console.warn('[Inkstone Annotations]', error));
             }
           }
           return { failed };
         },
         onDeleteInk: async (filePath, surfaceId) => {
-          await inkRepository.tombstoneSurface(
-            filePath,
-            surfaceId,
-            new Date().toISOString(),
-            this.pluginSettings.deviceId,
-          );
+          await inkMode?.prepareFileMutation(filePath);
+          try {
+            await inkRepository.tombstoneSurface(
+              filePath,
+              surfaceId,
+              new Date().toISOString(),
+              this.pluginSettings.deviceId,
+            );
+          } finally {
+            await inkMode?.refreshFile(filePath);
+          }
         },
         onEditInk: (filePath, surfaceId) => {
           void inkRepository
@@ -530,12 +564,23 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             .catch((error) => console.warn('[Inkstone Annotations]', error));
         },
         onRestoreInk: async (filePath, surfaceId) => {
-          await inkRepository.restoreSurface(
-            filePath,
-            surfaceId,
-            new Date().toISOString(),
-            this.pluginSettings.deviceId,
-          );
+          try {
+            await inkRepository.restoreSurface(
+              filePath,
+              surfaceId,
+              new Date().toISOString(),
+              this.pluginSettings.deviceId,
+            );
+          } finally {
+            await inkMode?.refreshFile(filePath);
+          }
+        },
+        onRestoreAnnotation: async (filePath, annotationId, expectedRevision) => {
+          await annotationService.undoDeletion(filePath, annotationId, expectedRevision);
+          if (lastDeleted?.id === annotationId && lastDeleted.filePath === filePath) {
+            lastDeleted = null;
+          }
+          await refreshAnnotationSurfaces(filePath);
         },
         service: annotationService,
         stylePresets: this.pluginSettings.stylePresets,

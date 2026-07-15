@@ -14,7 +14,10 @@ export function applyCanonicalInkSurfaceChanged(
   record: InkSurfaceRecord,
 ): RecordChangedResult {
   if (!index.isReady()) return 'not-ready';
-  if (record.deletedAt !== undefined) {
+  if (
+    record.deletedAt !== undefined ||
+    !record.strokes.some((stroke) => stroke.tool !== 'eraser')
+  ) {
     return index.remove({
       expectedRevision: record.revision - 1,
       id: record.id,

@@ -68,6 +68,18 @@ describe('Vault index canonical record events', () => {
     ).toBe('removed');
     expect(index.snapshot()).toEqual([]);
   });
+
+  it('removes an Ink index entry when its last visible stroke is erased', () => {
+    const index = new VaultAnnotationIndex();
+    index.rebuild([]);
+    const active = inkSurface({ revision: 1 });
+    expect(applyCanonicalInkSurfaceChanged(index, active)).toBe('applied');
+
+    expect(applyCanonicalInkSurfaceChanged(index, { ...active, revision: 2, strokes: [] })).toBe(
+      'removed',
+    );
+    expect(index.snapshot()).toEqual([]);
+  });
 });
 
 function record(input: {

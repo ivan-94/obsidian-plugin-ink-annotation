@@ -19,6 +19,14 @@ interface InkSessionLike {
   undo(): boolean;
 }
 
+interface InkControlsDragState {
+  readonly left: number;
+  readonly pointerId: number;
+  readonly startX: number;
+  readonly startY: number;
+  readonly top: number;
+}
+
 /** A single fixed logical surface. It is visible but pointer-transparent outside Ink Mode. */
 export class InkCanvasController {
   private active = false;
@@ -30,15 +38,19 @@ export class InkCanvasController {
   private readonly committedCanvas: HTMLCanvasElement;
   private readonly committedContext: CanvasRenderingContext2D;
   private readonly controls: HTMLElement;
+  private readonly controlsHost: HTMLElement;
+  private controlsDragState: InkControlsDragState | null = null;
   private color = '#4f46d8';
   private readonly colorInput: HTMLInputElement;
   private disposed = false;
   private readonly document: Document;
+  private readonly dragHandle: HTMLButtonElement;
   private readonly exitButton: HTMLButtonElement;
   private readonly extentProbeTimeouts = new Set<number>();
   private frame: number | null = null;
   private hintShown: boolean;
   private layoutRoot: HTMLElement;
+  private readonly moreButton: HTMLButtonElement;
   private readonly onExitRequested: () => Promise<void>;
   private readonly onLayoutExtentChanged: (minimumHeight: number) => void;
   private readonly onPreferenceChanged: (preference: InkToolPreference) => void;
@@ -57,15 +69,17 @@ export class InkCanvasController {
   private readonly session: InkSessionLike;
   private readonly status: HTMLElement;
   private tool: InkStroke['tool'] = 'pen';
-  private toolOptionsVisible = false;
+  private toolOptionsVisible = true;
   private readonly toolButtons = new Map<InkStroke['tool'], HTMLButtonElement>();
   private readonly undoButton: HTMLButtonElement;
   private viewportHeight: number;
   private viewportTop: number;
   private width = 4;
+  private readonly widthControl: HTMLElement;
   private readonly widthInput: HTMLSelectElement;
 
   constructor(input: {
+    readonly controlsHost?: HTMLElement;
     readonly document: Document;
     readonly layoutRoot?: HTMLElement;
     readonly now?: () => number;
@@ -79,6 +93,7 @@ export class InkCanvasController {
     readonly session: InkSessionLike;
   }) {
     this.document = input.document;
+    this.controlsHost = input.controlsHost ?? input.root;
     this.root = input.root;
     this.layoutRoot = input.layoutRoot ?? input.root;
     this.scrollContainer = input.scrollContainer ?? null;
@@ -129,9 +144,20 @@ export class InkCanvasController {
     this.status.dataset.inkstoneInkStatus = 'true';
     this.status.setAttribute('aria-live', 'polite');
     this.status.setAttribute('role', 'status');
+    this.status.hidden = true;
+    this.dragHandle = input.document.createElement('button');
+    this.dragHandle.type = 'button';
+    decorateIconButton(this.dragHandle, {
+      icon: 'grip-vertical',
+      label: 'Move Ink toolbar',
+    });
+    this.dragHandle.classList.add('inkstone-ink-controls__drag-handle');
+    this.dragHandle.dataset.inkstoneInkDragHandle = 'true';
+    this.dragHandle.addEventListener('pointerdown', this.onControlsDragStart);
+    this.dragHandle.addEventListener('keydown', this.onControlsDragKeyDown);
     this.exitButton = input.document.createElement('button');
     this.exitButton.type = 'button';
-    decorateIconButton(this.exitButton, { icon: 'check', label: 'Done drawing', text: 'Done' });
+    decorateIconButton(this.exitButton, { icon: 'circle-check', label: 'Done drawing' });
     this.exitButton.classList.add('inkstone-ink-controls__done');
     this.exitButton.addEventListener('click', () => {
       void this.onExitRequested().catch(() => undefined);
@@ -162,13 +188,23 @@ export class InkCanvasController {
     this.colorInput = input.document.createElement('input');
     this.colorInput.type = 'color';
     this.colorInput.value = this.color;
-    this.colorInput.hidden = true;
+    this.colorInput.hidden = false;
     this.colorInput.dataset.inkstoneInkColor = 'true';
     this.colorInput.setAttribute('aria-label', 'Ink color');
     this.colorInput.addEventListener('input', () => {
       this.color = this.colorInput.value;
       this.persistPreference();
     });
+    this.widthControl = input.document.createElement('label');
+    this.widthControl.className = 'inkstone-ink-controls__width';
+    this.widthControl.dataset.inkstoneInkWidthControl = 'true';
+    this.widthControl.title = 'Ink width';
+    for (const sample of [2, 4, 8]) {
+      const line = input.document.createElement('span');
+      line.dataset.inkstoneInkWidthSample = String(sample);
+      line.setAttribute('aria-hidden', 'true');
+      this.widthControl.append(line);
+    }
     this.widthInput = input.document.createElement('select');
     this.widthInput.dataset.inkstoneInkWidth = 'true';
     this.widthInput.setAttribute('aria-label', 'Ink width');
@@ -182,6 +218,7 @@ export class InkCanvasController {
     this.widthInput.value = String(this.width);
     this.widthInput.addEventListener('change', () => {
       this.width = Number.parseInt(this.widthInput.value, 10);
+      this.syncWidthSamples();
       this.persistPreference();
     });
     this.undoButton = input.document.createElement('button');
@@ -198,33 +235,38 @@ export class InkCanvasController {
     this.redoButton.addEventListener('click', () => {
       if (this.session.redo()) this.sync(this.session.snapshot());
     });
-    const more = input.document.createElement('button');
-    more.type = 'button';
-    decorateIconButton(more, {
+    this.widthControl.append(this.widthInput);
+    this.syncWidthSamples();
+    this.moreButton = input.document.createElement('button');
+    this.moreButton.type = 'button';
+    decorateIconButton(this.moreButton, {
       icon: 'ellipsis',
       label: 'Show or hide Ink color and width',
     });
-    more.addEventListener('click', () => {
+    this.moreButton.setAttribute('aria-expanded', 'true');
+    this.moreButton.addEventListener('click', () => {
       const visible = !this.toolOptionsVisible;
       this.setToolOptionsVisible(visible);
       if (visible) this.colorInput.focus({ preventScroll: true });
     });
     this.controls.append(
-      this.exitButton,
+      this.dragHandle,
       pen,
       highlighter,
       eraser,
       this.colorInput,
-      this.widthInput,
+      this.widthControl,
       this.undoButton,
       this.redoButton,
-      more,
-      this.status,
+      this.moreButton,
+      this.exitButton,
       this.retryButton,
+      this.status,
     );
-    this.overlay.append(this.committedCanvas, this.activeCanvas, this.controls);
+    this.overlay.append(this.committedCanvas, this.activeCanvas);
     this.positionOverlay();
     input.root.append(this.overlay);
+    this.controlsHost.append(this.controls);
 
     this.activeCanvas.addEventListener('pointerdown', this.onPointerDown);
     this.activeCanvas.addEventListener('pointermove', this.onPointerMove);
@@ -252,6 +294,7 @@ export class InkCanvasController {
     this.root.classList.add('is-ink-mode');
     this.activeCanvas.style.pointerEvents = 'auto';
     this.controls.style.display = 'flex';
+    this.positionControlsDefault();
     this.exitButton.hidden = false;
     this.sync(this.session.snapshot());
     if (!this.hintShown) {
@@ -318,6 +361,7 @@ export class InkCanvasController {
     this.redoButton.disabled = !this.session.canRedo();
     const error = snapshot.persistence.kind === 'error';
     this.retryButton.hidden = !error;
+    this.status.hidden = !error;
     this.status.textContent = error
       ? `Ink Mode · ${snapshot.persistence.message}`
       : snapshot.persistence.kind === 'saving'
@@ -337,6 +381,9 @@ export class InkCanvasController {
     this.activeCanvas.removeEventListener('pointermove', this.onPointerMove);
     this.activeCanvas.removeEventListener('pointerup', this.onPointerEnd);
     this.activeCanvas.removeEventListener('pointercancel', this.onPointerCancel);
+    this.dragHandle.removeEventListener('pointerdown', this.onControlsDragStart);
+    this.dragHandle.removeEventListener('keydown', this.onControlsDragKeyDown);
+    this.stopControlsDrag();
     this.scrollContainer?.removeEventListener('scroll', this.onViewportChanged);
     this.document.defaultView?.removeEventListener('resize', this.onViewportChanged);
     this.resizeObserver?.disconnect();
@@ -346,6 +393,7 @@ export class InkCanvasController {
     }
     this.extentProbeTimeouts.clear();
     this.overlay.remove();
+    this.controls.remove();
     this.root.classList.remove('inkstone-ink-host', 'is-ink-mode');
     this.root.style.position = this.previousPosition;
   }
@@ -388,6 +436,55 @@ export class InkCanvasController {
     }
     event.preventDefault();
     this.finishStroke(false);
+  };
+
+  private readonly onControlsDragStart = (event: PointerEvent): void => {
+    if (event.button !== 0) return;
+    const bounds = this.controls.getBoundingClientRect();
+    event.preventDefault();
+    event.stopPropagation();
+    this.controlsDragState = {
+      left: bounds.left,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      top: bounds.top,
+    };
+    this.dragHandle.classList.add('is-dragging');
+    this.dragHandle.setPointerCapture?.(event.pointerId);
+    this.document.addEventListener('pointermove', this.onControlsDragMove);
+    this.document.addEventListener('pointerup', this.onControlsDragEnd);
+    this.document.addEventListener('pointercancel', this.onControlsDragEnd);
+  };
+
+  private readonly onControlsDragMove = (event: PointerEvent): void => {
+    const drag = this.controlsDragState;
+    if (drag === null || event.pointerId !== drag.pointerId) return;
+    event.preventDefault();
+    this.moveControls(
+      drag.left + event.clientX - drag.startX,
+      drag.top + event.clientY - drag.startY,
+    );
+  };
+
+  private readonly onControlsDragEnd = (event: PointerEvent): void => {
+    if (event.pointerId !== this.controlsDragState?.pointerId) return;
+    this.stopControlsDrag();
+  };
+
+  private readonly onControlsDragKeyDown = (event: KeyboardEvent): void => {
+    const delta = event.shiftKey ? 32 : 8;
+    const movements: Record<string, readonly [number, number]> = {
+      ArrowDown: [0, delta],
+      ArrowLeft: [-delta, 0],
+      ArrowRight: [delta, 0],
+      ArrowUp: [0, -delta],
+    };
+    const movement = movements[event.key];
+    if (movement === undefined) return;
+    event.preventDefault();
+    const bounds = this.controls.getBoundingClientRect();
+    this.moveControls(bounds.left + movement[0], bounds.top + movement[1]);
   };
 
   private appendEventPoints(event: PointerEvent): void {
@@ -532,6 +629,7 @@ export class InkCanvasController {
 
   private readonly onRootResized = (): void => {
     if (this.disposed) return;
+    this.clampDraggedControls();
     this.updateViewport(false);
     const extent = Math.ceil(
       Math.max(this.layoutRoot.scrollHeight, this.layoutRoot.getBoundingClientRect().height),
@@ -629,6 +727,7 @@ export class InkCanvasController {
       if (tool === 'highlighter') this.width = 12;
       if (tool === 'eraser') this.width = 16;
       this.widthInput.value = String(this.width);
+      this.syncWidthSamples();
       this.setToolOptionsVisible(false);
       for (const [candidate, candidateButton] of this.toolButtons) {
         candidateButton.setAttribute('aria-pressed', String(candidate === tool));
@@ -642,7 +741,72 @@ export class InkCanvasController {
   private setToolOptionsVisible(visible: boolean): void {
     this.toolOptionsVisible = visible;
     this.colorInput.hidden = !visible;
-    this.widthInput.hidden = !visible;
+    this.widthControl.hidden = !visible;
+    this.moreButton.setAttribute('aria-expanded', String(visible));
+  }
+
+  private syncWidthSamples(): void {
+    const samples = [
+      ...this.widthControl.querySelectorAll<HTMLElement>('[data-inkstone-ink-width-sample]'),
+    ];
+    const selected = samples.reduce<HTMLElement | null>((closest, sample) => {
+      if (closest === null) return sample;
+      const sampleWidth = Number(sample.dataset.inkstoneInkWidthSample);
+      const closestWidth = Number(closest.dataset.inkstoneInkWidthSample);
+      return Math.abs(sampleWidth - this.width) < Math.abs(closestWidth - this.width)
+        ? sample
+        : closest;
+    }, null);
+    for (const sample of samples) {
+      sample.toggleAttribute('data-selected', sample === selected);
+    }
+    this.widthControl.title = `Ink width: ${this.width} px`;
+  }
+
+  private moveControls(left: number, top: number, markDragged = true): void {
+    const bounds = this.controls.getBoundingClientRect();
+    const viewport = this.document.documentElement;
+    const width = bounds.width || this.controls.offsetWidth;
+    const height = bounds.height || this.controls.offsetHeight;
+    const maxLeft = Math.max(8, viewport.clientWidth - width - 8);
+    const maxTop = Math.max(8, viewport.clientHeight - height - 8);
+    this.controls.style.left = `${Math.round(clamp(left, 8, maxLeft))}px`;
+    this.controls.style.top = `${Math.round(clamp(top, 8, maxTop))}px`;
+    this.controls.style.right = 'auto';
+    this.controls.style.bottom = 'auto';
+    if (markDragged) this.controls.dataset.inkstoneInkDragged = 'true';
+  }
+
+  private positionControlsDefault(): void {
+    if (this.controls.dataset.inkstoneInkDragged === 'true') return;
+    if (this.document.documentElement.clientWidth <= 600) return;
+    const hostBounds = this.root.getBoundingClientRect();
+    const controlsBounds = this.controls.getBoundingClientRect();
+    if (hostBounds.width <= 0 || hostBounds.height <= 0 || controlsBounds.width <= 0) return;
+    const compactHost = hostBounds.width < controlsBounds.width + 160;
+    this.moveControls(
+      Math.max(hostBounds.left + 8, hostBounds.right - controlsBounds.width - 12),
+      compactHost ? hostBounds.bottom - controlsBounds.height - 16 : hostBounds.top + 8,
+      false,
+    );
+  }
+
+  private clampDraggedControls(): void {
+    if (this.controls.dataset.inkstoneInkDragged !== 'true') return;
+    const bounds = this.controls.getBoundingClientRect();
+    this.moveControls(bounds.left, bounds.top);
+  }
+
+  private stopControlsDrag(): void {
+    const pointerId = this.controlsDragState?.pointerId;
+    if (pointerId !== undefined && this.dragHandle.hasPointerCapture?.(pointerId)) {
+      this.dragHandle.releasePointerCapture(pointerId);
+    }
+    this.controlsDragState = null;
+    this.dragHandle.classList.remove('is-dragging');
+    this.document.removeEventListener('pointermove', this.onControlsDragMove);
+    this.document.removeEventListener('pointerup', this.onControlsDragEnd);
+    this.document.removeEventListener('pointercancel', this.onControlsDragEnd);
   }
 
   private persistPreference(): void {

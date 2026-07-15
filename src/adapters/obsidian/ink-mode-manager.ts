@@ -44,7 +44,10 @@ export class ObsidianInkModeManager {
   private readonly reconcileQueue = new KeyedTrailingTaskQueue<MarkdownView>();
   private readonly onIssue: (error: unknown) => void;
   private readonly onWillEnter: () => void;
+  private pendingAction: 'enter' | 'exit' | null = null;
+  private pendingView: MarkdownView | null = null;
   private rebaseDialog: InkRebaseDialog | null = null;
+  private toggleTransition: Promise<void> | null = null;
   private readonly visibilityHandler = (): void => {
     if (this.input.document.hidden) {
       void this.background().catch(this.onIssue);
@@ -89,7 +92,7 @@ export class ObsidianInkModeManager {
     view.contentEl
       .querySelectorAll<HTMLElement>('.inkstone-ink-surface')
       .forEach((surface) => surface.remove());
-    const action = view.addAction('pen-line', 'Draw on this note', () => {
+    const action = view.addAction('paintbrush', 'Draw on this note', () => {
       void this.toggle(view).catch(this.onIssue);
     });
     action.dataset.inkstoneInkAction = 'true';
@@ -102,16 +105,30 @@ export class ObsidianInkModeManager {
     });
     observer.observe(view.contentEl, { childList: true, subtree: true });
     this.observers.set(view, observer);
-    void this.scheduleReconcile(view).catch(this.onIssue);
   }
 
-  async toggle(view = this.input.app.workspace.getActiveViewOfType(MarkdownView)): Promise<void> {
+  toggle(view = this.input.app.workspace.getActiveViewOfType(MarkdownView)): Promise<void> {
     if (view === null) {
       new Notice('Open a Markdown note in Reading View to use Ink Mode.');
-      return;
+      return Promise.resolve();
     }
+    if (this.toggleTransition !== null) return this.toggleTransition;
     this.registerView(view);
-    await this.scheduleReconcile(view);
+    this.pendingView = view;
+    this.pendingAction = this.activeView === view ? 'exit' : 'enter';
+    const transition = this.performToggle(view).finally(() => {
+      if (this.toggleTransition !== transition) return;
+      this.toggleTransition = null;
+      this.pendingView = null;
+      this.pendingAction = null;
+      this.syncActions();
+    });
+    this.toggleTransition = transition;
+    this.syncActions();
+    return transition;
+  }
+
+  private async performToggle(view: MarkdownView): Promise<void> {
     if (this.activeView === view) {
       await this.exit();
       return;
@@ -151,6 +168,12 @@ export class ObsidianInkModeManager {
     this.activeView = null;
     this.syncActions();
     this.disposeMount(view);
+    let reclaimError: unknown;
+    try {
+      await this.reclaimEmptySurfaces(mounted.filePath);
+    } catch (error) {
+      reclaimError = error;
+    }
     await this.ensureMounted(view, false);
     if (restoreActionFocus) {
       const action = this.actions.get(view);
@@ -160,6 +183,11 @@ export class ObsidianInkModeManager {
       restoreFocus();
       this.input.document.defaultView?.requestAnimationFrame(restoreFocus);
     }
+    if (reclaimError !== undefined) {
+      throw reclaimError instanceof Error
+        ? reclaimError
+        : new Error('Failed to reclaim empty Ink surfaces.', { cause: reclaimError });
+    }
   }
 
   async background(): Promise<void> {
@@ -167,6 +195,35 @@ export class ObsidianInkModeManager {
       return;
     }
     await this.mounted.get(this.activeView)?.controller.background();
+  }
+
+  /** Flushes active Ink before a canonical whole-surface mutation and detaches its live session. */
+  async prepareFileMutation(filePath: string): Promise<void> {
+    const view = this.activeView;
+    if (view === null) return;
+    const mounted = this.mounted.get(view);
+    if (mounted === undefined || mounted.filePath !== filePath) return;
+    await mounted.controller.exit();
+    this.activeView = null;
+    this.syncActions();
+    this.disposeMount(view);
+    await this.reclaimEmptySurfaces(filePath);
+  }
+
+  /** Rebuilds passive Ink overlays from canonical records after delete or restore. */
+  async refreshFile(filePath: string): Promise<void> {
+    await this.prepareFileMutation(filePath);
+    const views = new Set<MarkdownView>();
+    for (const [view, mounted] of this.mounted) {
+      if (mounted.filePath === filePath) views.add(view);
+    }
+    for (const view of this.actions.keys()) {
+      if (view.file?.path === filePath) views.add(view);
+    }
+    for (const view of views) {
+      this.disposeMount(view);
+      await this.ensureMounted(view, false);
+    }
   }
 
   async navigateToSurface(summary: InkSurfaceSummary, enterInk = false): Promise<void> {
@@ -196,9 +253,6 @@ export class ObsidianInkModeManager {
     const current = this.input.app.workspace.getActiveViewOfType(MarkdownView);
     if (this.activeView !== null && current !== this.activeView) {
       void this.exit().catch(this.onIssue);
-    }
-    if (current !== null) {
-      void this.scheduleReconcile(current).catch(this.onIssue);
     }
   }
 
@@ -242,6 +296,14 @@ export class ObsidianInkModeManager {
     createIfMissing: boolean,
   ): Promise<MountedInkSurface | null> {
     return this.mountQueue.schedule(view, () => this.mountView(view, createIfMissing));
+  }
+
+  private reclaimEmptySurfaces(filePath: string): Promise<readonly InkSurfaceRecord[]> {
+    return this.input.inkRepository.reclaimEmptySurfaces(
+      filePath,
+      new Date().toISOString(),
+      this.input.deviceId,
+    );
   }
 
   private async mountView(
@@ -401,6 +463,7 @@ export class ObsidianInkModeManager {
       writer: this.input.inkRepository,
     });
     controller = new InkCanvasController({
+      controlsHost: this.input.document.body,
       document: this.input.document,
       layoutRoot: root,
       onExitRequested: () => this.exit(),
@@ -464,9 +527,24 @@ export class ObsidianInkModeManager {
   private syncActions(): void {
     for (const [view, action] of this.actions) {
       const active = view === this.activeView;
+      const pending = view === this.pendingView;
+      const label = pending
+        ? this.pendingAction === 'exit'
+          ? 'Exiting Ink Mode…'
+          : 'Opening Ink Mode…'
+        : active
+          ? 'Exit Ink Mode'
+          : 'Draw on this note';
       action.classList.toggle('is-active', active);
+      action.classList.toggle('is-pending', pending);
       action.setAttribute('aria-pressed', String(active));
-      action.setAttribute('aria-label', active ? 'Exit Ink Mode' : 'Draw on this note');
+      action.setAttribute('aria-busy', String(pending));
+      action.setAttribute('aria-label', label);
+      if (pending && this.pendingAction !== null) {
+        action.dataset.inkstoneInkTransition = this.pendingAction;
+      } else {
+        delete action.dataset.inkstoneInkTransition;
+      }
       action.setAttribute('data-tooltip-position', 'bottom');
     }
   }

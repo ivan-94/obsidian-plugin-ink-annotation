@@ -261,6 +261,31 @@ export class InkSurfaceRepository {
     return deleted;
   }
 
+  /**
+   * Reclaims persisted drawing sessions that contain no visible Ink.
+   *
+   * Empty surfaces are tombstoned instead of physically removed so an older iCloud artifact
+   * cannot resurrect them on another device.
+   */
+  async reclaimEmptySurfaces(
+    filePath: string,
+    now: string,
+    deviceId?: string,
+  ): Promise<readonly InkSurfaceRecord[]> {
+    const loaded = await this.listSurfaces(filePath);
+    const reclaimed: InkSurfaceRecord[] = [];
+    for (const record of loaded.records) {
+      if (
+        record.deletedAt !== undefined ||
+        record.strokes.some((stroke) => stroke.tool !== 'eraser')
+      ) {
+        continue;
+      }
+      reclaimed.push(await this.tombstoneSurface(filePath, record.id, now, deviceId));
+    }
+    return reclaimed;
+  }
+
   async restoreSurface(
     filePath: string,
     surfaceId: string,

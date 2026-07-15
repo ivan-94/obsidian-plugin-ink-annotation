@@ -49,6 +49,29 @@ describe('current-file annotation list', () => {
     expect(model.groups.flatMap((group) => group.rows)).toHaveLength(500);
     expect(performance.now() - startedAt).toBeLessThan(50);
   });
+
+  it('includes a recent tombstone only inside an explicit Restore window', () => {
+    const deleted = record('deleted', 10, {
+      deletedAt: '2026-07-15T13:42:00.000Z',
+      heading: 'Intro',
+    });
+
+    const recoverable = buildCurrentFileAnnotationList([deleted], {
+      deletedRestoreWindowMs: 5_000,
+      now: '2026-07-15T13:42:04.999Z',
+    });
+    const expired = buildCurrentFileAnnotationList([deleted], {
+      deletedRestoreWindowMs: 5_000,
+      now: '2026-07-15T13:42:05.000Z',
+    });
+
+    expect(recoverable.groups[0]?.rows[0]).toMatchObject({
+      deletedAt: '2026-07-15T13:42:00.000Z',
+      id: 'deleted',
+      revision: 1,
+    });
+    expect(expired).toEqual({ groups: [], total: 0 });
+  });
 });
 
 function record(
