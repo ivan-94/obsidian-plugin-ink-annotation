@@ -370,218 +370,220 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     let inkMode: ObsidianInkModeManager | null = null;
     this.registerView(ANNOTATION_SIDEBAR_VIEW_TYPE, (leaf) => {
       const view = new AnnotationSidebarView(leaf, {
-        getCurrentFilePath: () => this.app.workspace.getActiveFile()?.path ?? null,
-        inkRepository,
-        inspectAnnotation: (annotationId, invoker) => openInspector([annotationId], invoker),
-        navigateToAnnotation: (annotationId) =>
-          this.readingView?.focusAnnotation(annotationId) ?? false,
-        navigateToVaultAnnotation: (entry) => {
-          if (entry.type === 'ink') {
+        commands: {
+          getCurrentFilePath: () => this.app.workspace.getActiveFile()?.path ?? null,
+          inspectAnnotation: (annotationId, invoker) => openInspector([annotationId], invoker),
+          navigateToAnnotation: (annotationId) =>
+            this.readingView?.focusAnnotation(annotationId) ?? false,
+          navigateToVaultAnnotation: (entry) => {
+            if (entry.type === 'ink') {
+              void inkRepository
+                .listSurfaceSummaries(entry.filePath)
+                .then((summaries) => summaries.find((summary) => summary.id === entry.id))
+                .then((summary) =>
+                  summary === undefined ? undefined : inkMode?.navigateToSurface(summary),
+                )
+                .catch((error) => console.warn('[Inkstone Annotations]', error));
+              return;
+            }
+            void annotationService
+              .getAnnotationsById(entry.filePath, [entry.id])
+              .then(([record]) => (record === undefined ? undefined : navigateToSource(record)))
+              .catch((error) => console.warn('[Inkstone Annotations]', error));
+          },
+          closed: () => {
+            if (this.sidebarView === view) {
+              this.sidebarView = null;
+            }
+          },
+          deleteAnnotation: async (filePath, annotationId) => {
+            const deleted = await annotationService.deleteAnnotation(filePath, annotationId);
+            lastDeleted = deleted;
+            await refreshAnnotationSurfaces(filePath);
+          },
+          bulkDeleteInk: async (selection) => {
+            const failed: (typeof selection)[number][] = [];
+            const filePaths = [...new Set(selection.map((item) => item.filePath))];
+            const preparedFilePaths: string[] = [];
+            try {
+              for (const filePath of filePaths) {
+                await inkMode?.prepareFileMutation(filePath);
+                preparedFilePaths.push(filePath);
+              }
+            } catch (error) {
+              console.warn('[Inkstone Annotations]', error);
+              for (const filePath of preparedFilePaths) {
+                await inkMode
+                  ?.refreshFile(filePath)
+                  .catch((refreshError) => console.warn('[Inkstone Annotations]', refreshError));
+              }
+              return { failed: selection };
+            }
+            try {
+              for (const item of selection) {
+                try {
+                  const current = await inkRepository.readSurface(item.filePath, item.id);
+                  if (
+                    current === null ||
+                    current.deletedAt !== undefined ||
+                    current.revision !== item.expectedRevision
+                  ) {
+                    failed.push(item);
+                    continue;
+                  }
+                  await inkRepository.tombstoneSurface(
+                    item.filePath,
+                    item.id,
+                    new Date().toISOString(),
+                    this.pluginSettings.deviceId,
+                  );
+                } catch (error) {
+                  console.warn('[Inkstone Annotations]', error);
+                  failed.push(item);
+                }
+              }
+            } finally {
+              for (const filePath of preparedFilePaths) {
+                await inkMode
+                  ?.refreshFile(filePath)
+                  .catch((error) => console.warn('[Inkstone Annotations]', error));
+              }
+            }
+            return { failed };
+          },
+          deleteInk: async (filePath, surfaceId) => {
+            await inkMode?.prepareFileMutation(filePath);
+            try {
+              await inkRepository.tombstoneSurface(
+                filePath,
+                surfaceId,
+                new Date().toISOString(),
+                this.pluginSettings.deviceId,
+              );
+            } finally {
+              await inkMode?.refreshFile(filePath);
+            }
+          },
+          editInk: (filePath, surfaceId) => {
             void inkRepository
-              .listSurfaceSummaries(entry.filePath)
-              .then((summaries) => summaries.find((summary) => summary.id === entry.id))
+              .listSurfaceSummaries(filePath)
+              .then((summaries) => summaries.find((summary) => summary.id === surfaceId))
               .then((summary) =>
-                summary === undefined ? undefined : inkMode?.navigateToSurface(summary),
+                summary === undefined ? undefined : inkMode?.navigateToSurface(summary, true),
               )
               .catch((error) => console.warn('[Inkstone Annotations]', error));
-            return;
-          }
-          void annotationService
-            .getAnnotationsById(entry.filePath, [entry.id])
-            .then(([record]) => (record === undefined ? undefined : navigateToSource(record)))
-            .catch((error) => console.warn('[Inkstone Annotations]', error));
-        },
-        onClosed: () => {
-          if (this.sidebarView === view) {
-            this.sidebarView = null;
-          }
-        },
-        onDeleteAnnotation: async (filePath, annotationId) => {
-          const deleted = await annotationService.deleteAnnotation(filePath, annotationId);
-          lastDeleted = deleted;
-          await refreshAnnotationSurfaces(filePath);
-        },
-        onBulkDeleteInk: async (selection) => {
-          const failed: (typeof selection)[number][] = [];
-          const filePaths = [...new Set(selection.map((item) => item.filePath))];
-          const preparedFilePaths: string[] = [];
-          try {
-            for (const filePath of filePaths) {
-              await inkMode?.prepareFileMutation(filePath);
-              preparedFilePaths.push(filePath);
-            }
-          } catch (error) {
-            console.warn('[Inkstone Annotations]', error);
-            for (const filePath of preparedFilePaths) {
-              await inkMode
-                ?.refreshFile(filePath)
-                .catch((refreshError) => console.warn('[Inkstone Annotations]', refreshError));
-            }
-            return { failed: selection };
-          }
-          try {
-            for (const item of selection) {
-              try {
-                const current = await inkRepository.readSurface(item.filePath, item.id);
-                if (
-                  current === null ||
-                  current.deletedAt !== undefined ||
-                  current.revision !== item.expectedRevision
-                ) {
-                  failed.push(item);
-                  continue;
-                }
-                await inkRepository.tombstoneSurface(
-                  item.filePath,
-                  item.id,
-                  new Date().toISOString(),
-                  this.pluginSettings.deviceId,
-                );
-              } catch (error) {
-                console.warn('[Inkstone Annotations]', error);
-                failed.push(item);
-              }
-            }
-          } finally {
-            for (const filePath of preparedFilePaths) {
-              await inkMode
-                ?.refreshFile(filePath)
-                .catch((error) => console.warn('[Inkstone Annotations]', error));
-            }
-          }
-          return { failed };
-        },
-        onDeleteInk: async (filePath, surfaceId) => {
-          await inkMode?.prepareFileMutation(filePath);
-          try {
-            await inkRepository.tombstoneSurface(
-              filePath,
-              surfaceId,
-              new Date().toISOString(),
-              this.pluginSettings.deviceId,
+          },
+          exportCurrentFile: (filePath, invoker) => {
+            void exportItemsForFile(filePath)
+              .then((items) =>
+                showExportDialog({
+                  invoker,
+                  items: () => items,
+                  title: `Annotations - ${filePath}`,
+                }),
+              )
+              .catch((error) => console.warn('[Inkstone Annotations]', error));
+          },
+          exportInkPng: async (filePath, surfaceId) => {
+            const record = await inkRepository.readSurface(filePath, surfaceId);
+            if (record === null) throw new Error(`Ink surface no longer exists: ${surfaceId}`);
+            const path = await writeInkPngExport(record, sidecarStore);
+            new Notice(`Exported Ink PNG to ${path}`);
+          },
+          exportInkReport: async (filePath) => {
+            const loaded = await inkRepository.listSurfaces(filePath);
+            const path = await writeInkStandaloneReport(
+              loaded.records,
+              {
+                generatedAt: new Date().toISOString(),
+                title: `Ink - ${filePath}`,
+              },
+              sidecarStore,
             );
-          } finally {
-            await inkMode?.refreshFile(filePath);
-          }
-        },
-        onEditInk: (filePath, surfaceId) => {
-          void inkRepository
-            .listSurfaceSummaries(filePath)
-            .then((summaries) => summaries.find((summary) => summary.id === surfaceId))
-            .then((summary) =>
-              summary === undefined ? undefined : inkMode?.navigateToSurface(summary, true),
-            )
-            .catch((error) => console.warn('[Inkstone Annotations]', error));
-        },
-        onExportCurrentFile: (filePath, invoker) => {
-          void exportItemsForFile(filePath)
-            .then((items) =>
-              showExportDialog({
+            new Notice(`Exported Ink report to ${path}`);
+          },
+          exportInkSvg: async (filePath, surfaceId) => {
+            const record = await inkRepository.readSurface(filePath, surfaceId);
+            if (record === null) throw new Error(`Ink surface no longer exists: ${surfaceId}`);
+            const path = await writeInkSvgExport(record, sidecarStore);
+            new Notice(`Exported Ink SVG to ${path}`);
+          },
+          exportVaultEntries: (entries, invoker) => {
+            const textEntries = entries.filter((entry) => entry.type !== 'ink');
+            const inkEntries = entries.filter((entry) => entry.type === 'ink');
+            if (inkEntries.length === 0) {
+              exportDialog.show({
                 invoker,
-                items: () => items,
-                title: `Annotations - ${filePath}`,
-              }),
-            )
-            .catch((error) => console.warn('[Inkstone Annotations]', error));
-        },
-        onExportInkPng: async (filePath, surfaceId) => {
-          const record = await inkRepository.readSurface(filePath, surfaceId);
-          if (record === null) throw new Error(`Ink surface no longer exists: ${surfaceId}`);
-          const path = await writeInkPngExport(record, sidecarStore);
-          new Notice(`Exported Ink PNG to ${path}`);
-        },
-        onExportInkReport: async (filePath) => {
-          const loaded = await inkRepository.listSurfaces(filePath);
-          const path = await writeInkStandaloneReport(
-            loaded.records,
-            {
-              generatedAt: new Date().toISOString(),
-              title: `Ink - ${filePath}`,
-            },
-            sidecarStore,
-          );
-          new Notice(`Exported Ink report to ${path}`);
-        },
-        onExportInkSvg: async (filePath, surfaceId) => {
-          const record = await inkRepository.readSurface(filePath, surfaceId);
-          if (record === null) throw new Error(`Ink surface no longer exists: ${surfaceId}`);
-          const path = await writeInkSvgExport(record, sidecarStore);
-          new Notice(`Exported Ink SVG to ${path}`);
-        },
-        onExportVaultEntries: (entries, invoker) => {
-          const textEntries = entries.filter((entry) => entry.type !== 'ink');
-          const inkEntries = entries.filter((entry) => entry.type === 'ink');
-          if (inkEntries.length === 0) {
+                onExport: (format) =>
+                  createVaultTextEntriesExport(textEntries, 'Annotations - Vault results', format),
+                title: 'Annotations - Vault results',
+              });
+              return;
+            }
             exportDialog.show({
               invoker,
-              onExport: (format) =>
-                createVaultTextEntriesExport(textEntries, 'Annotations - Vault results', format),
-              title: 'Annotations - Vault results',
+              onExport: async (format) => {
+                const paths: string[] = [];
+                if (textEntries.length > 0) {
+                  paths.push(
+                    await createVaultTextEntriesExport(
+                      textEntries,
+                      'Annotations - Vault results',
+                      format,
+                    ),
+                  );
+                }
+                paths.push(await createInkEntriesExport(inkEntries));
+                return paths.join(' + ');
+              },
+              title:
+                textEntries.length === 0
+                  ? 'Export selected Ink as standalone HTML'
+                  : 'Export text plus Ink standalone HTML',
             });
-            return;
-          }
-          exportDialog.show({
-            invoker,
-            onExport: async (format) => {
-              const paths: string[] = [];
-              if (textEntries.length > 0) {
-                paths.push(
-                  await createVaultTextEntriesExport(
-                    textEntries,
-                    'Annotations - Vault results',
-                    format,
-                  ),
-                );
-              }
-              paths.push(await createInkEntriesExport(inkEntries));
-              return paths.join(' + ');
-            },
-            title:
-              textEntries.length === 0
-                ? 'Export selected Ink as standalone HTML'
-                : 'Export text plus Ink standalone HTML',
-          });
-        },
-        onIssue: (error) => console.warn('[Inkstone Annotations]', error),
-        onRepairInkConflict: async (filePath, conflict, candidatePath) => {
-          const candidate = conflict.candidates.find(({ path }) => path === candidatePath);
-          if (candidate === undefined) {
-            throw new Error('The selected Ink conflict candidate is no longer available.');
-          }
-          await inkRepository.resolveConflict({
-            candidate,
-            deviceId: this.pluginSettings.deviceId,
-            expectedHighestRevision: Math.max(
-              ...conflict.candidates.map(({ record }) => record.revision),
-            ),
-            filePath,
-            now: new Date().toISOString(),
-          });
-        },
-        onNavigateInk: (summary) => {
-          void inkMode
-            ?.navigateToSurface(summary)
-            .catch((error) => console.warn('[Inkstone Annotations]', error));
-        },
-        onRestoreInk: async (filePath, surfaceId) => {
-          try {
-            await inkRepository.restoreSurface(
+          },
+          issue: (error) => console.warn('[Inkstone Annotations]', error),
+          repairInkConflict: async (filePath, conflict, candidatePath) => {
+            const candidate = conflict.candidates.find(({ path }) => path === candidatePath);
+            if (candidate === undefined) {
+              throw new Error('The selected Ink conflict candidate is no longer available.');
+            }
+            await inkRepository.resolveConflict({
+              candidate,
+              deviceId: this.pluginSettings.deviceId,
+              expectedHighestRevision: Math.max(
+                ...conflict.candidates.map(({ record }) => record.revision),
+              ),
               filePath,
-              surfaceId,
-              new Date().toISOString(),
-              this.pluginSettings.deviceId,
-            );
-          } finally {
-            await inkMode?.refreshFile(filePath);
-          }
+              now: new Date().toISOString(),
+            });
+          },
+          navigateToInk: (summary) => {
+            void inkMode
+              ?.navigateToSurface(summary)
+              .catch((error) => console.warn('[Inkstone Annotations]', error));
+          },
+          restoreInk: async (filePath, surfaceId) => {
+            try {
+              await inkRepository.restoreSurface(
+                filePath,
+                surfaceId,
+                new Date().toISOString(),
+                this.pluginSettings.deviceId,
+              );
+            } finally {
+              await inkMode?.refreshFile(filePath);
+            }
+          },
+          restoreAnnotation: async (filePath, annotationId, expectedRevision) => {
+            await annotationService.undoDeletion(filePath, annotationId, expectedRevision);
+            if (lastDeleted?.id === annotationId && lastDeleted.filePath === filePath) {
+              lastDeleted = null;
+            }
+            await refreshAnnotationSurfaces(filePath);
+          },
         },
-        onRestoreAnnotation: async (filePath, annotationId, expectedRevision) => {
-          await annotationService.undoDeletion(filePath, annotationId, expectedRevision);
-          if (lastDeleted?.id === annotationId && lastDeleted.filePath === filePath) {
-            lastDeleted = null;
-          }
-          await refreshAnnotationSurfaces(filePath);
-        },
+        inkRepository,
         service: annotationService,
         stylePresets: this.pluginSettings.stylePresets,
         vaultIndex,

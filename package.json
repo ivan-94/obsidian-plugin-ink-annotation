@@ -9,7 +9,7 @@
   "private": true,
   "scripts": {
     "build": "npm run typecheck && node esbuild.config.mjs production && npm run check:mobile",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run build",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run test:performance && npm run build",
     "check:mobile": "node scripts/check-mobile-bundle.mjs",
     "dev": "node esbuild.config.mjs",
     "format": "prettier --write .",
@@ -22,7 +22,8 @@
     "prototype:s01": "node scripts/serve-prototype.mjs prototypes/s01-ui",
     "prototype:s09": "node scripts/build-s09-prototype.mjs && node scripts/serve-prototype.mjs prototypes/s09-ink-spike",
     "test": "vitest run",
-    "test:coverage": "vitest run --coverage",
+    "test:coverage": "vitest run --coverage --exclude 'src/**/*.performance.test.ts'",
+    "test:performance": "vitest run performance --coverage=false",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "verify:rc-lifecycle": "node scripts/verify-release-lifecycle.mjs"
@@ -41,5 +42,9 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.64.0",
     "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "@preact/signals": "^2.9.3",
+    "preact": "^10.29.7"
   }
 }

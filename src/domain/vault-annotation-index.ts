@@ -45,16 +45,63 @@ export interface VaultAnnotationFilters {
   readonly updatedBefore?: string;
 }
 
-export class VaultAnnotationIndex {
+export interface VaultAnnotationFacets {
+  readonly folders: readonly string[];
+  readonly noteIds: readonly string[];
+  readonly notes: readonly { readonly filePath: string; readonly noteId: string }[];
+  readonly statuses: readonly AnnotationIndexStatus[];
+  readonly styleIds: readonly string[];
+  readonly styles: readonly { readonly id: string; readonly name: string }[];
+  readonly tags: readonly string[];
+  readonly types: readonly AnnotationIndexEntry['type'][];
+}
+
+export interface VaultAnnotationQueryPort {
+  readonly version: number;
+  facets(): VaultAnnotationFacets;
+  isReady(): boolean;
+  query(input?: {
+    readonly filters?: VaultAnnotationFilters;
+    readonly text?: string;
+  }): VaultAnnotationQueryResult;
+  snapshot(): readonly AnnotationIndexEntry[];
+  subscribe(listener: () => void): () => void;
+}
+
+export class VaultAnnotationIndex implements VaultAnnotationQueryPort {
   private readonly entries = new Map<string, AnnotationIndexEntry>();
   private initialized = false;
+  private readonly listeners = new Set<() => void>();
+  private cachedFacets: VaultAnnotationFacets | null = null;
+  private cachedQuery: {
+    readonly key: string;
+    readonly result: VaultAnnotationQueryResult;
+  } | null = null;
+  private cachedSearchableSnapshot:
+    | readonly {
+        readonly entry: AnnotationIndexEntry;
+        readonly text: string;
+      }[]
+    | null = null;
+  private cachedSnapshot: readonly AnnotationIndexEntry[] | null = null;
+  private cachedSearchText = new Map<string, string>();
+  private currentVersion = 0;
+
+  get version(): number {
+    return this.currentVersion;
+  }
 
   rebuild(entries: readonly AnnotationIndexEntry[]): void {
     this.entries.clear();
+    this.cachedSearchText.clear();
     for (const entry of entries) {
-      this.entries.set(entryKey(entry), freezeEntry(entry));
+      const frozen = freezeEntry(entry);
+      const key = entryKey(frozen);
+      this.entries.set(key, frozen);
+      this.cachedSearchText.set(key, searchableText(frozen));
     }
     this.initialized = true;
+    this.invalidate();
   }
 
   isReady(): boolean {
@@ -77,7 +124,10 @@ export class VaultAnnotationIndex {
         }
       }
     }
-    this.entries.set(key, freezeEntry(entry));
+    const frozen = freezeEntry(entry);
+    this.entries.set(key, frozen);
+    this.cachedSearchText.set(key, searchableText(frozen));
+    this.invalidate();
     return 'applied';
   }
 
@@ -95,41 +145,135 @@ export class VaultAnnotationIndex {
       return 'stale';
     }
     this.entries.delete(key);
+    this.cachedSearchText.delete(key);
+    this.invalidate();
     return 'removed';
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   query(
     input: { readonly filters?: VaultAnnotationFilters; readonly text?: string } = {},
   ): VaultAnnotationQueryResult {
-    const all = this.snapshot();
+    const key = queryKey(input);
+    if (this.cachedQuery?.key === key) {
+      return this.cachedQuery.result;
+    }
+    const all = this.searchableSnapshot();
     if (all.length === 0) {
-      return { groups: [], state: 'no-annotations', total: 0 };
+      return this.cacheQuery(key, { groups: [], state: 'no-annotations', total: 0 });
     }
     const needle = normalizeSearch(input.text ?? '');
-    const textMatches =
-      needle.length === 0 ? all : all.filter((entry) => searchableText(entry).includes(needle));
-    const rows = textMatches.filter((entry) => matchesFilters(entry, input.filters));
-    if (rows.length === 0) {
-      return { groups: [], state: 'no-matches', total: 0 };
-    }
     const groups = new Map<string, AnnotationIndexEntry[]>();
-    for (const row of rows) {
-      const group = groups.get(row.filePath) ?? [];
-      group.push(row);
-      groups.set(row.filePath, group);
+    let total = 0;
+    for (const { entry, text } of all) {
+      if (needle.length > 0 && !text.includes(needle)) continue;
+      if (!matchesFilters(entry, input.filters)) continue;
+      const group = groups.get(entry.filePath) ?? [];
+      group.push(entry);
+      groups.set(entry.filePath, group);
+      total += 1;
     }
-    return {
+    if (total === 0) {
+      return this.cacheQuery(key, { groups: [], state: 'no-matches', total: 0 });
+    }
+    return this.cacheQuery(key, {
       groups: [...groups.entries()].map(([filePath, groupedRows]) => ({
         filePath,
         rows: groupedRows,
       })),
       state: 'ready',
-      total: rows.length,
-    };
+      total,
+    });
   }
 
   snapshot(): readonly AnnotationIndexEntry[] {
-    return [...this.entries.values()].sort(compareEntries);
+    this.cachedSnapshot ??= Object.freeze([...this.entries.values()].sort(compareEntries));
+    return this.cachedSnapshot;
+  }
+
+  facets(): VaultAnnotationFacets {
+    if (this.cachedFacets !== null) {
+      return this.cachedFacets;
+    }
+    const folders = new Set<string>();
+    const noteIds = new Set<string>();
+    const notes = new Map<string, string>();
+    const statuses = new Set<AnnotationIndexStatus>();
+    const styleIds = new Set<string>();
+    const styles = new Map<string, string>();
+    const tags = new Set<string>();
+    const types = new Set<AnnotationIndexEntry['type']>();
+    for (const entry of this.snapshot()) {
+      const folder = entry.filePath.slice(0, Math.max(0, entry.filePath.lastIndexOf('/')));
+      if (folder.length > 0) folders.add(folder);
+      noteIds.add(entry.noteId);
+      notes.set(entry.noteId, entry.filePath);
+      statuses.add(entry.status);
+      if (entry.styleId !== undefined) {
+        styleIds.add(entry.styleId);
+        styles.set(entry.styleId, entry.styleName ?? entry.styleId);
+      }
+      entry.tags.forEach((tag) => tags.add(tag));
+      types.add(entry.type);
+    }
+    this.cachedFacets = Object.freeze({
+      folders: sorted(folders),
+      noteIds: sorted(noteIds),
+      notes: Object.freeze(
+        [...notes]
+          .map(([noteId, filePath]) => Object.freeze({ filePath, noteId }))
+          .sort((left, right) => left.filePath.localeCompare(right.filePath)),
+      ),
+      statuses: sorted(statuses),
+      styleIds: sorted(styleIds),
+      styles: Object.freeze(
+        [...styles]
+          .map(([id, name]) => Object.freeze({ id, name }))
+          .sort((left, right) => left.name.localeCompare(right.name)),
+      ),
+      tags: sorted(tags),
+      types: sorted(types),
+    });
+    return this.cachedFacets;
+  }
+
+  private cacheQuery(key: string, result: VaultAnnotationQueryResult): VaultAnnotationQueryResult {
+    const cached = freezeQueryResult(result);
+    this.cachedQuery = { key, result: cached };
+    return cached;
+  }
+
+  private invalidate(): void {
+    this.cachedFacets = null;
+    this.cachedQuery = null;
+    this.cachedSearchableSnapshot = null;
+    this.cachedSnapshot = null;
+    this.currentVersion += 1;
+    this.listeners.forEach((listener) => listener());
+  }
+
+  private searchText(entry: AnnotationIndexEntry): string {
+    const key = entryKey(entry);
+    const cached = this.cachedSearchText.get(key);
+    if (cached !== undefined) return cached;
+    const value = searchableText(entry);
+    this.cachedSearchText.set(key, value);
+    return value;
+  }
+
+  private searchableSnapshot(): readonly {
+    readonly entry: AnnotationIndexEntry;
+    readonly text: string;
+  }[] {
+    this.cachedSearchableSnapshot ??= this.snapshot().map((entry) => ({
+      entry,
+      text: this.searchText(entry),
+    }));
+    return this.cachedSearchableSnapshot;
   }
 }
 
@@ -210,6 +354,32 @@ function compareEntries(left: AnnotationIndexEntry, right: AnnotationIndexEntry)
 
 function normalizeSearch(value: string): string {
   return value.normalize('NFKC').toLocaleLowerCase();
+}
+
+function queryKey(input: {
+  readonly filters?: VaultAnnotationFilters;
+  readonly text?: string;
+}): string {
+  return JSON.stringify({
+    filters: input.filters ?? null,
+    text: normalizeSearch(input.text ?? ''),
+  });
+}
+
+function sorted<T extends string>(values: ReadonlySet<T>): readonly T[] {
+  return Object.freeze([...values].sort((left, right) => left.localeCompare(right)));
+}
+
+function freezeQueryResult(result: VaultAnnotationQueryResult): VaultAnnotationQueryResult {
+  return Object.freeze({
+    groups: Object.freeze(
+      result.groups.map((group) =>
+        Object.freeze({ filePath: group.filePath, rows: Object.freeze([...group.rows]) }),
+      ),
+    ),
+    state: result.state,
+    total: result.total,
+  });
 }
 
 function searchableText(entry: AnnotationIndexEntry): string {

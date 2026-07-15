@@ -4,7 +4,13 @@ import {
   LocalInkToolPreferenceStore,
   type InkToolPreference,
 } from '../storage/local-ink-tool-preference';
-import { decorateIconButton } from './icon-button';
+import { InkToolbarApp, type InkToolbarAppProps } from './ink/ink-toolbar-app';
+import { createPreactIsland, type UiIsland } from './runtime/mount-preact-island';
+import {
+  createInkToolbarStore,
+  type InkToolbarState,
+  type InkToolbarStore,
+} from './stores/ink-toolbar-store';
 
 interface InkSessionLike {
   addStroke(stroke: InkStroke): void;
@@ -38,19 +44,14 @@ export class InkCanvasController {
   private readonly committedCanvas: HTMLCanvasElement;
   private readonly committedContext: CanvasRenderingContext2D;
   private readonly controls: HTMLElement;
-  private readonly controlsHost: HTMLElement;
   private controlsDragState: InkControlsDragState | null = null;
-  private color = '#4f46d8';
-  private readonly colorInput: HTMLInputElement;
   private disposed = false;
   private readonly document: Document;
   private readonly dragHandle: HTMLButtonElement;
-  private readonly exitButton: HTMLButtonElement;
   private readonly extentProbeTimeouts = new Set<number>();
   private frame: number | null = null;
   private hintShown: boolean;
   private layoutRoot: HTMLElement;
-  private readonly moreButton: HTMLButtonElement;
   private readonly onExitRequested: () => Promise<void>;
   private readonly onLayoutExtentChanged: (minimumHeight: number) => void;
   private readonly onPreferenceChanged: (preference: InkToolPreference) => void;
@@ -58,25 +59,30 @@ export class InkCanvasController {
   private readonly overlay: HTMLElement;
   private pendingInputStartedAt: number | null = null;
   private previousPosition: string;
-  private readonly retryButton: HTMLButtonElement;
   private readonly recordInputToPaint: (durationMs: number) => void;
   private reportedLayoutExtent = 0;
   private renderedStrokes: readonly InkStroke[] = [];
-  private readonly redoButton: HTMLButtonElement;
   private resizeObserver: ResizeObserver | null = null;
   private root: HTMLElement;
   private readonly scrollContainer: HTMLElement | null;
   private readonly session: InkSessionLike;
-  private readonly status: HTMLElement;
-  private tool: InkStroke['tool'] = 'pen';
-  private toolOptionsVisible = true;
-  private readonly toolButtons = new Map<InkStroke['tool'], HTMLButtonElement>();
-  private readonly undoButton: HTMLButtonElement;
+  private readonly toolbarHost: HTMLElement;
+  private readonly toolbarIsland: UiIsland<InkToolbarAppProps> = createPreactIsland(InkToolbarApp);
+  private readonly toolbarStore: InkToolbarStore;
   private viewportHeight: number;
   private viewportTop: number;
-  private width = 4;
-  private readonly widthControl: HTMLElement;
-  private readonly widthInput: HTMLSelectElement;
+
+  private get color(): string {
+    return this.toolbarStore.state.value.color;
+  }
+
+  private get tool(): InkStroke['tool'] {
+    return this.toolbarStore.state.value.tool;
+  }
+
+  private get width(): number {
+    return this.toolbarStore.state.value.width;
+  }
 
   constructor(input: {
     readonly controlsHost?: HTMLElement;
@@ -93,7 +99,6 @@ export class InkCanvasController {
     readonly session: InkSessionLike;
   }) {
     this.document = input.document;
-    this.controlsHost = input.controlsHost ?? input.root;
     this.root = input.root;
     this.layoutRoot = input.layoutRoot ?? input.root;
     this.scrollContainer = input.scrollContainer ?? null;
@@ -103,10 +108,8 @@ export class InkCanvasController {
     this.onLayoutExtentChanged = input.onLayoutExtentChanged ?? (() => undefined);
     this.recordInputToPaint = input.recordInputToPaint ?? (() => undefined);
     const preference = input.preference ?? LocalInkToolPreferenceStore.DEFAULT;
-    this.color = preference.color;
     this.hintShown = preference.hintShown;
-    this.tool = preference.tool;
-    this.width = preference.width;
+    this.toolbarStore = createInkToolbarStore(preference);
     this.onPreferenceChanged = input.onPreferenceChanged ?? (() => undefined);
     this.previousPosition = input.root.style.position;
     if (getComputedStyle(input.root).position === 'static') {
@@ -135,138 +138,20 @@ export class InkCanvasController {
     this.committedContext = requireContext(this.committedCanvas);
     this.activeContext = requireContext(this.activeCanvas);
 
-    this.controls = input.document.createElement('div');
-    this.controls.className = 'inkstone-ink-controls';
-    this.controls.setAttribute('aria-label', 'Ink tools');
-    this.controls.setAttribute('role', 'toolbar');
-    this.controls.style.display = 'none';
-    this.status = input.document.createElement('span');
-    this.status.dataset.inkstoneInkStatus = 'true';
-    this.status.setAttribute('aria-live', 'polite');
-    this.status.setAttribute('role', 'status');
-    this.status.hidden = true;
-    this.dragHandle = input.document.createElement('button');
-    this.dragHandle.type = 'button';
-    decorateIconButton(this.dragHandle, {
-      icon: 'grip-vertical',
-      label: 'Move Ink toolbar',
-    });
-    this.dragHandle.classList.add('inkstone-ink-controls__drag-handle');
-    this.dragHandle.dataset.inkstoneInkDragHandle = 'true';
-    this.dragHandle.addEventListener('pointerdown', this.onControlsDragStart);
-    this.dragHandle.addEventListener('keydown', this.onControlsDragKeyDown);
-    this.exitButton = input.document.createElement('button');
-    this.exitButton.type = 'button';
-    decorateIconButton(this.exitButton, { icon: 'circle-check', label: 'Done drawing' });
-    this.exitButton.classList.add('inkstone-ink-controls__done');
-    this.exitButton.addEventListener('click', () => {
-      void this.onExitRequested().catch(() => undefined);
-    });
-    this.retryButton = input.document.createElement('button');
-    this.retryButton.type = 'button';
-    decorateIconButton(this.retryButton, {
-      icon: 'refresh-cw',
-      label: 'Retry local Ink save',
-      text: 'Retry',
-    });
-    this.retryButton.dataset.inkstoneInkRetry = 'true';
-    this.retryButton.hidden = true;
-    this.retryButton.addEventListener('click', () => {
-      void this.session
-        .retry()
-        .then(() => {
-          this.sync(this.session.snapshot());
-          if (this.session.snapshot().state.kind === 'reading') {
-            this.deactivate();
-          }
-        })
-        .catch(() => this.sync(this.session.snapshot()));
-    });
-    const pen = this.createToolButton('pen', 'Pen');
-    const highlighter = this.createToolButton('highlighter', 'Highlighter');
-    const eraser = this.createToolButton('eraser', 'Eraser');
-    this.colorInput = input.document.createElement('input');
-    this.colorInput.type = 'color';
-    this.colorInput.value = this.color;
-    this.colorInput.hidden = false;
-    this.colorInput.dataset.inkstoneInkColor = 'true';
-    this.colorInput.setAttribute('aria-label', 'Ink color');
-    this.colorInput.addEventListener('input', () => {
-      this.color = this.colorInput.value;
-      this.persistPreference();
-    });
-    this.widthControl = input.document.createElement('label');
-    this.widthControl.className = 'inkstone-ink-controls__width';
-    this.widthControl.dataset.inkstoneInkWidthControl = 'true';
-    this.widthControl.title = 'Ink width';
-    for (const sample of [2, 4, 8]) {
-      const line = input.document.createElement('span');
-      line.dataset.inkstoneInkWidthSample = String(sample);
-      line.setAttribute('aria-hidden', 'true');
-      this.widthControl.append(line);
-    }
-    this.widthInput = input.document.createElement('select');
-    this.widthInput.dataset.inkstoneInkWidth = 'true';
-    this.widthInput.setAttribute('aria-label', 'Ink width');
-    this.widthInput.hidden = true;
-    for (const value of [2, 4, 8, 12, 16]) {
-      const option = input.document.createElement('option');
-      option.value = String(value);
-      option.textContent = `${value}px`;
-      this.widthInput.append(option);
-    }
-    this.widthInput.value = String(this.width);
-    this.widthInput.addEventListener('change', () => {
-      this.width = Number.parseInt(this.widthInput.value, 10);
-      this.syncWidthSamples();
-      this.persistPreference();
-    });
-    this.undoButton = input.document.createElement('button');
-    this.undoButton.type = 'button';
-    decorateIconButton(this.undoButton, { icon: 'undo-2', label: 'Undo Ink change' });
-    this.undoButton.dataset.inkstoneInkUndo = 'true';
-    this.undoButton.addEventListener('click', () => {
-      if (this.session.undo()) this.sync(this.session.snapshot());
-    });
-    this.redoButton = input.document.createElement('button');
-    this.redoButton.type = 'button';
-    decorateIconButton(this.redoButton, { icon: 'redo-2', label: 'Redo Ink change' });
-    this.redoButton.dataset.inkstoneInkRedo = 'true';
-    this.redoButton.addEventListener('click', () => {
-      if (this.session.redo()) this.sync(this.session.snapshot());
-    });
-    this.widthControl.append(this.widthInput);
-    this.syncWidthSamples();
-    this.moreButton = input.document.createElement('button');
-    this.moreButton.type = 'button';
-    decorateIconButton(this.moreButton, {
-      icon: 'ellipsis',
-      label: 'Show or hide Ink color and width',
-    });
-    this.moreButton.setAttribute('aria-expanded', 'true');
-    this.moreButton.addEventListener('click', () => {
-      const visible = !this.toolOptionsVisible;
-      this.setToolOptionsVisible(visible);
-      if (visible) this.colorInput.focus({ preventScroll: true });
-    });
-    this.controls.append(
-      this.dragHandle,
-      pen,
-      highlighter,
-      eraser,
-      this.colorInput,
-      this.widthControl,
-      this.undoButton,
-      this.redoButton,
-      this.moreButton,
-      this.exitButton,
-      this.retryButton,
-      this.status,
+    this.toolbarHost = input.document.createElement('div');
+    this.toolbarHost.dataset.inkstoneInkToolbarHost = '';
+    (input.controlsHost ?? input.root).append(this.toolbarHost);
+    this.toolbarIsland.mount(this.toolbarHost, this.toolbarProps());
+    const controls = this.toolbarHost.querySelector<HTMLElement>('.inkstone-ink-controls');
+    const dragHandle = this.toolbarHost.querySelector<HTMLButtonElement>(
+      '[data-inkstone-ink-drag-handle]',
     );
+    if (controls === null || dragHandle === null) throw new Error('Ink toolbar failed to mount.');
+    this.controls = controls;
+    this.dragHandle = dragHandle;
     this.overlay.append(this.committedCanvas, this.activeCanvas);
     this.positionOverlay();
     input.root.append(this.overlay);
-    this.controlsHost.append(this.controls);
 
     this.activeCanvas.addEventListener('pointerdown', this.onPointerDown);
     this.activeCanvas.addEventListener('pointermove', this.onPointerMove);
@@ -293,13 +178,14 @@ export class InkCanvasController {
     this.active = true;
     this.root.classList.add('is-ink-mode');
     this.activeCanvas.style.pointerEvents = 'auto';
-    this.controls.style.display = 'flex';
+    this.updateToolbar({ active: true });
     this.positionControlsDefault();
-    this.exitButton.hidden = false;
     this.sync(this.session.snapshot());
     if (!this.hintShown) {
       this.hintShown = true;
-      this.status.textContent = 'Ink Mode · Draw with mouse or pen. Exit returns to reading.';
+      this.updateToolbar({
+        statusText: 'Ink Mode · Draw with mouse or pen. Exit returns to reading.',
+      });
       this.persistPreference();
     }
   }
@@ -357,18 +243,19 @@ export class InkCanvasController {
       return;
     }
     this.renderCommitted(snapshot.surface.strokes);
-    this.undoButton.disabled = !this.session.canUndo();
-    this.redoButton.disabled = !this.session.canRedo();
     const error = snapshot.persistence.kind === 'error';
-    this.retryButton.hidden = !error;
-    this.status.hidden = !error;
-    this.status.textContent = error
-      ? `Ink Mode · ${snapshot.persistence.message}`
-      : snapshot.persistence.kind === 'saving'
-        ? 'Ink Mode · Saving locally…'
-        : snapshot.persistence.kind === 'saved-locally'
-          ? 'Ink Mode · Saved locally'
-          : 'Ink Mode';
+    this.updateToolbar({
+      canRedo: this.session.canRedo(),
+      canUndo: this.session.canUndo(),
+      saveError: error ? snapshot.persistence.message : null,
+      statusText: error
+        ? `Ink Mode · ${snapshot.persistence.message}`
+        : snapshot.persistence.kind === 'saving'
+          ? 'Ink Mode · Saving locally…'
+          : snapshot.persistence.kind === 'saved-locally'
+            ? 'Ink Mode · Saved locally'
+            : 'Ink Mode',
+    });
   }
 
   dispose(): void {
@@ -381,8 +268,6 @@ export class InkCanvasController {
     this.activeCanvas.removeEventListener('pointermove', this.onPointerMove);
     this.activeCanvas.removeEventListener('pointerup', this.onPointerEnd);
     this.activeCanvas.removeEventListener('pointercancel', this.onPointerCancel);
-    this.dragHandle.removeEventListener('pointerdown', this.onControlsDragStart);
-    this.dragHandle.removeEventListener('keydown', this.onControlsDragKeyDown);
     this.stopControlsDrag();
     this.scrollContainer?.removeEventListener('scroll', this.onViewportChanged);
     this.document.defaultView?.removeEventListener('resize', this.onViewportChanged);
@@ -393,7 +278,8 @@ export class InkCanvasController {
     }
     this.extentProbeTimeouts.clear();
     this.overlay.remove();
-    this.controls.remove();
+    this.toolbarIsland.unmount();
+    this.toolbarHost.remove();
     this.root.classList.remove('inkstone-ink-host', 'is-ink-mode');
     this.root.style.position = this.previousPosition;
   }
@@ -450,7 +336,7 @@ export class InkCanvasController {
       startY: event.clientY,
       top: bounds.top,
     };
-    this.dragHandle.classList.add('is-dragging');
+    this.updateToolbar({ dragging: true });
     this.dragHandle.setPointerCapture?.(event.pointerId);
     this.document.addEventListener('pointermove', this.onControlsDragMove);
     this.document.addEventListener('pointerup', this.onControlsDragEnd);
@@ -708,59 +594,88 @@ export class InkCanvasController {
     }
   }
 
-  private createToolButton(tool: InkStroke['tool'], label: string): HTMLButtonElement {
-    const button = this.document.createElement('button');
-    button.type = 'button';
-    decorateIconButton(button, {
-      icon: tool === 'pen' ? 'pen-line' : tool === 'highlighter' ? 'highlighter' : 'eraser',
-      label,
-    });
-    button.dataset.inkstoneInkTool = tool;
-    button.setAttribute('aria-pressed', String(this.tool === tool));
-    button.addEventListener('click', () => {
-      if (this.tool === tool && tool !== 'eraser') {
-        this.setToolOptionsVisible(!this.toolOptionsVisible);
-        return;
-      }
-      this.tool = tool;
-      if (tool === 'pen') this.width = 4;
-      if (tool === 'highlighter') this.width = 12;
-      if (tool === 'eraser') this.width = 16;
-      this.widthInput.value = String(this.width);
-      this.syncWidthSamples();
-      this.setToolOptionsVisible(false);
-      for (const [candidate, candidateButton] of this.toolButtons) {
-        candidateButton.setAttribute('aria-pressed', String(candidate === tool));
-      }
-      this.persistPreference();
-    });
-    this.toolButtons.set(tool, button);
-    return button;
-  }
-
   private setToolOptionsVisible(visible: boolean): void {
-    this.toolOptionsVisible = visible;
-    this.colorInput.hidden = !visible;
-    this.widthControl.hidden = !visible;
-    this.moreButton.setAttribute('aria-expanded', String(visible));
+    this.updateToolbar({ optionsVisible: visible });
   }
 
-  private syncWidthSamples(): void {
-    const samples = [
-      ...this.widthControl.querySelectorAll<HTMLElement>('[data-inkstone-ink-width-sample]'),
-    ];
-    const selected = samples.reduce<HTMLElement | null>((closest, sample) => {
-      if (closest === null) return sample;
-      const sampleWidth = Number(sample.dataset.inkstoneInkWidthSample);
-      const closestWidth = Number(closest.dataset.inkstoneInkWidthSample);
-      return Math.abs(sampleWidth - this.width) < Math.abs(closestWidth - this.width)
-        ? sample
-        : closest;
-    }, null);
-    for (const sample of samples) {
-      sample.toggleAttribute('data-selected', sample === selected);
+  private readonly onToolbarColor = (color: string): void => {
+    this.updateToolbar({ color });
+    this.persistPreference();
+  };
+
+  private readonly onToolbarDone = (): void => {
+    void this.onExitRequested().catch(() => undefined);
+  };
+
+  private readonly onToolbarRedo = (): void => {
+    if (this.session.redo()) this.sync(this.session.snapshot());
+  };
+
+  private readonly onToolbarRetry = (): void => {
+    void this.session
+      .retry()
+      .then(() => {
+        this.sync(this.session.snapshot());
+        if (this.session.snapshot().state.kind === 'reading') this.deactivate();
+      })
+      .catch(() => this.sync(this.session.snapshot()));
+  };
+
+  private readonly onToolbarToggleOptions = (): void => {
+    const visible = !this.toolbarStore.state.value.optionsVisible;
+    this.setToolOptionsVisible(visible);
+    if (visible) {
+      this.controls
+        .querySelector<HTMLInputElement>('[data-inkstone-ink-color]')
+        ?.focus({ preventScroll: true });
     }
-    this.widthControl.title = `Ink width: ${this.width} px`;
+  };
+
+  private readonly onToolbarTool = (tool: InkStroke['tool']): void => {
+    const state = this.toolbarStore.state.value;
+    if (state.tool === tool && tool !== 'eraser') {
+      this.setToolOptionsVisible(!state.optionsVisible);
+      return;
+    }
+    this.updateToolbar(
+      {
+        optionsVisible: false,
+        tool,
+        width: tool === 'pen' ? 4 : tool === 'highlighter' ? 12 : 16,
+      },
+      false,
+    );
+    this.persistPreference();
+  };
+
+  private readonly onToolbarUndo = (): void => {
+    if (this.session.undo()) this.sync(this.session.snapshot());
+  };
+
+  private readonly onToolbarWidth = (width: number): void => {
+    this.updateToolbar({ width });
+    this.persistPreference();
+  };
+
+  private toolbarProps(): InkToolbarAppProps {
+    return {
+      onColor: this.onToolbarColor,
+      onDone: this.onToolbarDone,
+      onDragKeyDown: this.onControlsDragKeyDown,
+      onDragStart: this.onControlsDragStart,
+      onRedo: this.onToolbarRedo,
+      onRetry: this.onToolbarRetry,
+      onToggleOptions: this.onToolbarToggleOptions,
+      onTool: this.onToolbarTool,
+      onUndo: this.onToolbarUndo,
+      onWidth: this.onToolbarWidth,
+      state: this.toolbarStore.state,
+    };
+  }
+
+  private updateToolbar(update: Partial<InkToolbarState>, render = true): void {
+    this.toolbarStore.state.value = { ...this.toolbarStore.state.value, ...update };
+    if (render) this.toolbarIsland.update(this.toolbarProps());
   }
 
   private moveControls(left: number, top: number, markDragged = true): void {
@@ -770,15 +685,17 @@ export class InkCanvasController {
     const height = bounds.height || this.controls.offsetHeight;
     const maxLeft = Math.max(8, viewport.clientWidth - width - 8);
     const maxTop = Math.max(8, viewport.clientHeight - height - 8);
-    this.controls.style.left = `${Math.round(clamp(left, 8, maxLeft))}px`;
-    this.controls.style.top = `${Math.round(clamp(top, 8, maxTop))}px`;
-    this.controls.style.right = 'auto';
-    this.controls.style.bottom = 'auto';
-    if (markDragged) this.controls.dataset.inkstoneInkDragged = 'true';
+    this.updateToolbar({
+      position: {
+        dragged: markDragged || this.toolbarStore.state.value.position?.dragged === true,
+        left: Math.round(clamp(left, 8, maxLeft)),
+        top: Math.round(clamp(top, 8, maxTop)),
+      },
+    });
   }
 
   private positionControlsDefault(): void {
-    if (this.controls.dataset.inkstoneInkDragged === 'true') return;
+    if (this.toolbarStore.state.value.position?.dragged === true) return;
     if (this.document.documentElement.clientWidth <= 600) return;
     const hostBounds = this.root.getBoundingClientRect();
     const controlsBounds = this.controls.getBoundingClientRect();
@@ -792,7 +709,7 @@ export class InkCanvasController {
   }
 
   private clampDraggedControls(): void {
-    if (this.controls.dataset.inkstoneInkDragged !== 'true') return;
+    if (this.toolbarStore.state.value.position?.dragged !== true) return;
     const bounds = this.controls.getBoundingClientRect();
     this.moveControls(bounds.left, bounds.top);
   }
@@ -803,27 +720,27 @@ export class InkCanvasController {
       this.dragHandle.releasePointerCapture(pointerId);
     }
     this.controlsDragState = null;
-    this.dragHandle.classList.remove('is-dragging');
+    if (!this.disposed) this.updateToolbar({ dragging: false });
     this.document.removeEventListener('pointermove', this.onControlsDragMove);
     this.document.removeEventListener('pointerup', this.onControlsDragEnd);
     this.document.removeEventListener('pointercancel', this.onControlsDragEnd);
   }
 
   private persistPreference(): void {
+    const state = this.toolbarStore.state.value;
     this.onPreferenceChanged({
-      color: this.color,
+      color: state.color,
       hintShown: this.hintShown,
-      tool: this.tool,
-      width: this.width,
+      tool: state.tool,
+      width: state.width,
     });
   }
 
   private deactivate(): void {
     this.active = false;
     this.activeCanvas.style.pointerEvents = 'none';
-    this.controls.style.display = 'none';
+    this.updateToolbar({ active: false });
     this.root.classList.remove('is-ink-mode');
-    this.exitButton.hidden = true;
   }
 
   private cancelFrame(): void {

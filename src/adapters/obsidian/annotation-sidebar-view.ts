@@ -2,11 +2,11 @@ import { ItemView, type WorkspaceLeaf } from 'obsidian';
 
 import type { AnnotationService } from '../../application/annotation-service';
 import type { VaultIndexBuilder } from '../../application/vault-index-builder';
-import type {
-  AnnotationIndexEntry,
-  VaultAnnotationIndex,
+import type { VaultAnnotationIndex } from '../../domain/vault-annotation-index';
+import {
+  inkSummaryToIndexEntry,
+  textRecordToIndexEntry,
 } from '../../domain/vault-annotation-index';
-import { textRecordToIndexEntry } from '../../domain/vault-annotation-index';
 import type { TextAnnotationRecord } from '../../domain/text-annotation';
 import type { StylePreset } from '../../domain/style-preset';
 import type { CurrentFileAnnotationList } from '../../domain/current-file-annotation-list';
@@ -22,6 +22,13 @@ import {
   AnnotationConflictDialog,
   type AnnotationConflictReviewView,
 } from '../../ui/annotation-conflict-dialog';
+import {
+  AnnotationSidebarApp,
+  type AnnotationSidebarAppProps,
+} from '../../ui/sidebar/annotation-sidebar-app';
+import { createPreactIsland, type UiIsland } from '../../ui/runtime/mount-preact-island';
+import { AnnotationSidebarStore } from '../../ui/stores/annotation-sidebar-store';
+import type { AnnotationSidebarCommands } from './annotation-sidebar-commands';
 
 export const ANNOTATION_SIDEBAR_VIEW_TYPE = 'inkstone-annotation-sidebar';
 
@@ -35,54 +42,16 @@ export class AnnotationSidebarView extends ItemView {
   private currentComponent: CurrentFileSidebar | null = null;
   private currentConflicts: readonly RepositoryConflict[] = [];
   private currentInkConflicts: readonly InkSurfaceConflict[] = [];
+  private currentContentEl: HTMLElement | null = null;
+  private currentFileStale = false;
+  private currentHeaderActionsEl: HTMLElement | null = null;
+  private readonly sidebarIsland: UiIsland<AnnotationSidebarAppProps> =
+    createPreactIsland(AnnotationSidebarApp);
+  private readonly sidebarStore = new AnnotationSidebarStore();
+  private readonly commands: Required<Pick<AnnotationSidebarCommands, 'closed' | 'issue'>> &
+    Omit<AnnotationSidebarCommands, 'closed' | 'issue'>;
   private readonly conflictDialog: AnnotationConflictDialog;
-  private readonly getCurrentFilePath: () => string | null;
-  private readonly navigateToAnnotation: (annotationId: string) => boolean;
-  private readonly navigateToVaultAnnotation: (entry: AnnotationIndexEntry) => void;
-  private readonly inspectAnnotation: (annotationId: string, invoker: HTMLElement) => void;
   private readonly inkRepository: InkSurfaceRepository;
-  private readonly onDeleteInk: (filePath: string, surfaceId: string) => Promise<void>;
-  private readonly onDeleteAnnotation: (filePath: string, annotationId: string) => Promise<void>;
-  private readonly onBulkDeleteInk: (
-    selection: readonly {
-      readonly expectedRevision: number;
-      readonly filePath: string;
-      readonly id: string;
-      readonly noteId: string;
-      readonly type: AnnotationIndexEntry['type'];
-    }[],
-  ) => Promise<{
-    readonly failed: readonly {
-      readonly expectedRevision: number;
-      readonly filePath: string;
-      readonly id: string;
-      readonly noteId: string;
-      readonly type: AnnotationIndexEntry['type'];
-    }[];
-  }>;
-  private readonly onEditInk: (filePath: string, surfaceId: string) => void;
-  private readonly onExportInkPng: (filePath: string, surfaceId: string) => Promise<void>;
-  private readonly onExportInkReport: (filePath: string) => Promise<void>;
-  private readonly onExportInkSvg: (filePath: string, surfaceId: string) => Promise<void>;
-  private readonly onRepairInkConflict: (
-    filePath: string,
-    conflict: InkSurfaceConflict,
-    candidatePath: string,
-  ) => Promise<void>;
-  private readonly onNavigateInk: (summary: InkSurfaceSummary) => void;
-  private readonly onRestoreInk: (filePath: string, surfaceId: string) => Promise<void>;
-  private readonly onRestoreAnnotation: (
-    filePath: string,
-    annotationId: string,
-    expectedRevision: number,
-  ) => Promise<void>;
-  private readonly onClosed: () => void;
-  private readonly onExportCurrentFile: (filePath: string, invoker: HTMLElement) => void;
-  private readonly onExportVaultEntries: (
-    entries: readonly AnnotationIndexEntry[],
-    invoker: HTMLElement,
-  ) => void;
-  private readonly onIssue: (error: unknown) => void;
   private readonly service: AnnotationService;
   private readonly stylePresets: readonly StylePreset[];
   private readonly vaultIndex: VaultAnnotationIndex;
@@ -91,33 +60,14 @@ export class AnnotationSidebarView extends ItemView {
   private vaultComponent: VaultAnnotationSidebar | null = null;
   private vaultIndexFresh = false;
   private vaultRestoreAttempted = false;
+  private vaultContentEl: HTMLElement | null = null;
+  private vaultHeaderActionsEl: HTMLElement | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
     input: {
-      readonly getCurrentFilePath: () => string | null;
-      readonly inspectAnnotation: (annotationId: string, invoker: HTMLElement) => void;
+      readonly commands: AnnotationSidebarCommands;
       readonly inkRepository: InkSurfaceRepository;
-      readonly navigateToAnnotation: (annotationId: string) => boolean;
-      readonly navigateToVaultAnnotation: (entry: AnnotationIndexEntry) => void;
-      readonly onClosed?: () => void;
-      readonly onBulkDeleteInk: AnnotationSidebarView['onBulkDeleteInk'];
-      readonly onDeleteAnnotation: AnnotationSidebarView['onDeleteAnnotation'];
-      readonly onDeleteInk: (filePath: string, surfaceId: string) => Promise<void>;
-      readonly onEditInk: (filePath: string, surfaceId: string) => void;
-      readonly onExportInkPng: (filePath: string, surfaceId: string) => Promise<void>;
-      readonly onExportInkReport: (filePath: string) => Promise<void>;
-      readonly onExportInkSvg: (filePath: string, surfaceId: string) => Promise<void>;
-      readonly onNavigateInk: (summary: InkSurfaceSummary) => void;
-      readonly onExportCurrentFile: (filePath: string, invoker: HTMLElement) => void;
-      readonly onExportVaultEntries: (
-        entries: readonly AnnotationIndexEntry[],
-        invoker: HTMLElement,
-      ) => void;
-      readonly onIssue?: (error: unknown) => void;
-      readonly onRepairInkConflict: AnnotationSidebarView['onRepairInkConflict'];
-      readonly onRestoreInk: (filePath: string, surfaceId: string) => Promise<void>;
-      readonly onRestoreAnnotation: AnnotationSidebarView['onRestoreAnnotation'];
       readonly service: AnnotationService;
       readonly stylePresets: readonly StylePreset[];
       readonly vaultIndex: VaultAnnotationIndex;
@@ -125,27 +75,13 @@ export class AnnotationSidebarView extends ItemView {
     },
   ) {
     super(leaf);
-    this.getCurrentFilePath = input.getCurrentFilePath;
+    this.commands = {
+      ...input.commands,
+      closed: input.commands.closed ?? (() => undefined),
+      issue: input.commands.issue ?? (() => undefined),
+    };
     this.conflictDialog = new AnnotationConflictDialog({ document: this.contentEl.ownerDocument });
-    this.inspectAnnotation = input.inspectAnnotation;
     this.inkRepository = input.inkRepository;
-    this.navigateToAnnotation = input.navigateToAnnotation;
-    this.navigateToVaultAnnotation = input.navigateToVaultAnnotation;
-    this.onClosed = input.onClosed ?? (() => undefined);
-    this.onBulkDeleteInk = input.onBulkDeleteInk;
-    this.onDeleteAnnotation = input.onDeleteAnnotation;
-    this.onDeleteInk = input.onDeleteInk;
-    this.onEditInk = input.onEditInk;
-    this.onExportInkPng = input.onExportInkPng;
-    this.onExportInkReport = input.onExportInkReport;
-    this.onExportInkSvg = input.onExportInkSvg;
-    this.onNavigateInk = input.onNavigateInk;
-    this.onExportCurrentFile = input.onExportCurrentFile;
-    this.onExportVaultEntries = input.onExportVaultEntries;
-    this.onIssue = input.onIssue ?? (() => undefined);
-    this.onRepairInkConflict = input.onRepairInkConflict;
-    this.onRestoreInk = input.onRestoreInk;
-    this.onRestoreAnnotation = input.onRestoreAnnotation;
     this.service = input.service;
     this.stylePresets = input.stylePresets;
     this.vaultIndex = input.vaultIndex;
@@ -165,6 +101,36 @@ export class AnnotationSidebarView extends ItemView {
   }
 
   override async onOpen(): Promise<void> {
+    this.contentEl.classList.add('inkstone-annotation-sidebar-view');
+    this.sidebarIsland.mount(this.contentEl, {
+      onCurrentContentMount: (host) => {
+        this.currentContentEl = host;
+      },
+      onCurrentHeaderActionsMount: (host) => {
+        this.currentHeaderActionsEl = host;
+      },
+      onRetryCurrent: () => {
+        void this.refreshCurrentFile();
+      },
+      onRetryVault: () => {
+        this.vaultIndexFresh = false;
+        void this.refreshVaultIndex();
+      },
+      onScopeChange: (scope) => {
+        if (scope === 'current-file') {
+          void this.showCurrentFile();
+        } else {
+          void this.showEntireVault();
+        }
+      },
+      onVaultContentMount: (host) => {
+        this.vaultContentEl = host;
+      },
+      onVaultHeaderActionsMount: (host) => {
+        this.vaultHeaderActionsEl = host;
+      },
+      store: this.sidebarStore,
+    });
     await this.showCurrentFile();
   }
 
@@ -173,18 +139,27 @@ export class AnnotationSidebarView extends ItemView {
     this.vaultBuildAbort = null;
     this.currentComponent?.dispose();
     this.currentComponent = null;
+    this.vaultComponent?.dispose();
     this.vaultComponent = null;
     this.currentConflicts = [];
     this.currentInkConflicts = [];
     this.conflictDialog.close(false);
-    this.contentEl.empty();
-    this.onClosed();
+    this.sidebarIsland.unmount();
+    this.contentEl.classList.remove('inkstone-annotation-sidebar-view');
+    this.currentContentEl = null;
+    this.currentHeaderActionsEl = null;
+    this.vaultContentEl = null;
+    this.vaultHeaderActionsEl = null;
+    this.commands.closed();
     return Promise.resolve();
   }
 
   async refresh(): Promise<void> {
-    if (this.vaultComponent !== null) {
-      this.vaultComponent.showReady();
+    if (this.sidebarStore.scope.value === 'entire-vault') {
+      if (this.sidebarStore.current.filePath.peek() !== this.commands.getCurrentFilePath()) {
+        this.currentFileStale = true;
+      }
+      this.vaultComponent?.showReady();
       return;
     }
     if (this.currentComponent === null) {
@@ -194,8 +169,9 @@ export class AnnotationSidebarView extends ItemView {
   }
 
   async refreshAfterCanonicalSidecarChange(): Promise<void> {
+    this.currentFileStale = true;
     this.vaultIndexFresh = false;
-    if (this.vaultComponent !== null) {
+    if (this.sidebarStore.scope.value === 'entire-vault') {
       await this.refreshVaultIndex();
       return;
     }
@@ -212,82 +188,159 @@ export class AnnotationSidebarView extends ItemView {
   }
 
   private async showCurrentFile(): Promise<void> {
-    if (this.currentComponent !== null) return;
-    this.vaultBuildAbort?.abort();
-    this.vaultBuildAbort = null;
-    this.vaultComponent = null;
+    this.sidebarStore.setScope('current-file');
+    if (this.currentComponent !== null) {
+      if (
+        this.currentFileStale ||
+        this.sidebarStore.current.filePath.peek() !== this.commands.getCurrentFilePath()
+      ) {
+        await this.refreshCurrentFile();
+      }
+      return;
+    }
     this.currentConflicts = [];
     this.currentInkConflicts = [];
     this.currentComponent = new CurrentFileSidebar({
-      container: this.contentEl,
+      container: this.getCurrentContentEl(),
       document: this.contentEl.ownerDocument,
+      headerContainer: this.getCurrentHeaderActionsEl(),
+      onBulkAddTags: async (selection, tags) => {
+        const outcome = await this.service.bulkAddTags(selection, tags);
+        await this.refreshCurrentFile();
+        return {
+          failed: selection.filter((item) =>
+            outcome.failed.some(
+              (candidate) => candidate.filePath === item.filePath && candidate.id === item.id,
+            ),
+          ),
+        };
+      },
+      onBulkChangeStyle: async (selection, styleId) => {
+        const outcome = await this.service.bulkChangeStyle(selection, styleId);
+        await this.refreshCurrentFile();
+        return {
+          failed: selection.filter((item) =>
+            outcome.failed.some(
+              (candidate) => candidate.filePath === item.filePath && candidate.id === item.id,
+            ),
+          ),
+        };
+      },
+      onBulkCopy: async (selection) => {
+        const clipboard = globalThis.navigator.clipboard;
+        if (clipboard === undefined) throw new Error('Clipboard API is unavailable.');
+        await clipboard.writeText(
+          `${selection
+            .map(
+              (entry) =>
+                `- ${entry.quote} — ${entry.filePath}${entry.body === undefined ? '' : `\n  ${entry.body}`}`,
+            )
+            .join('\n')}\n`,
+        );
+      },
+      onBulkDelete: async (selection) => {
+        const textSelection = selection.filter((item) => item.type !== 'ink');
+        const inkSelection = selection.filter((item) => item.type === 'ink');
+        const [textOutcome, inkOutcome] = await Promise.all([
+          this.service.bulkDelete(textSelection),
+          this.commands.bulkDeleteInk(inkSelection),
+        ]);
+        await this.refreshCurrentFile();
+        const failed = [...textOutcome.failed, ...inkOutcome.failed];
+        return {
+          failed: selection.filter((item) =>
+            failed.some(
+              (candidate) => candidate.filePath === item.filePath && candidate.id === item.id,
+            ),
+          ),
+        };
+      },
+      onBulkExport: async (selection, invoker) => {
+        const entries = await Promise.all(
+          selection.map(async (item) => {
+            if (item.type !== 'ink') {
+              const [record] = await this.service.getAnnotationsById(item.filePath, [item.id]);
+              return record === undefined ? [] : [textRecordToIndexEntry(record)];
+            }
+            const surface = await this.inkRepository.readSurface(item.filePath, item.id);
+            return surface === null
+              ? []
+              : [inkSummaryToIndexEntry(summarizeInkSurface(surface), surface.noteId)];
+          }),
+        );
+        this.commands.exportVaultEntries(entries.flat(), invoker);
+      },
       onEntireVault: () => this.showEntireVault(),
       onDeleteAnnotation: (annotationId) => {
-        const filePath = this.getCurrentFilePath();
+        const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
-          void this.onDeleteAnnotation(filePath, annotationId).catch(this.onIssue);
+          void this.commands.deleteAnnotation(filePath, annotationId).catch(this.commands.issue);
         }
       },
       onDeleteInk: (surfaceId) => {
-        const filePath = this.getCurrentFilePath();
+        const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
-          void this.onDeleteInk(filePath, surfaceId).then(
-            () => this.refreshCurrentFile(),
-            this.onIssue,
-          );
+          void this.commands
+            .deleteInk(filePath, surfaceId)
+            .then(() => this.refreshCurrentFile(), this.commands.issue);
         }
       },
       onEditInk: (surfaceId) => {
-        const filePath = this.getCurrentFilePath();
-        if (filePath !== null) this.onEditInk(filePath, surfaceId);
+        const filePath = this.commands.getCurrentFilePath();
+        if (filePath !== null) this.commands.editInk(filePath, surfaceId);
       },
       onExportCurrentFile: (invoker) => {
-        const filePath = this.getCurrentFilePath();
+        const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
-          this.onExportCurrentFile(filePath, invoker);
+          this.commands.exportCurrentFile(filePath, invoker);
         }
       },
       onExportInkPng: (surfaceId) => {
-        const filePath = this.getCurrentFilePath();
-        if (filePath !== null) void this.onExportInkPng(filePath, surfaceId).catch(this.onIssue);
+        const filePath = this.commands.getCurrentFilePath();
+        if (filePath !== null)
+          void this.commands.exportInkPng(filePath, surfaceId).catch(this.commands.issue);
       },
       onExportInkReport: () => {
-        const filePath = this.getCurrentFilePath();
-        if (filePath !== null) void this.onExportInkReport(filePath).catch(this.onIssue);
+        const filePath = this.commands.getCurrentFilePath();
+        if (filePath !== null)
+          void this.commands.exportInkReport(filePath).catch(this.commands.issue);
       },
       onExportInkSvg: (surfaceId) => {
-        const filePath = this.getCurrentFilePath();
-        if (filePath !== null) void this.onExportInkSvg(filePath, surfaceId).catch(this.onIssue);
+        const filePath = this.commands.getCurrentFilePath();
+        if (filePath !== null)
+          void this.commands.exportInkSvg(filePath, surfaceId).catch(this.commands.issue);
       },
-      onInspect: this.inspectAnnotation,
+      onInspect: this.commands.inspectAnnotation,
       onRetry: () => void this.refreshCurrentFile(),
       onReviewConflicts: (invoker) => this.showConflictDialog(invoker),
       onRestoreInk: (surfaceId) => {
-        const filePath = this.getCurrentFilePath();
+        const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
-          void this.onRestoreInk(filePath, surfaceId).then(
-            () => this.refreshCurrentFile(),
-            this.onIssue,
-          );
+          void this.commands
+            .restoreInk(filePath, surfaceId)
+            .then(() => this.refreshCurrentFile(), this.commands.issue);
         }
       },
       onRestoreAnnotation: (annotationId, expectedRevision) => {
-        const filePath = this.getCurrentFilePath();
+        const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
-          void this.onRestoreAnnotation(filePath, annotationId, expectedRevision).catch(
-            this.onIssue,
-          );
+          void this.commands
+            .restoreAnnotation(filePath, annotationId, expectedRevision)
+            .catch(this.commands.issue);
         }
       },
       onSelect: (annotationId) => {
-        if (!this.navigateToAnnotation(annotationId)) {
+        if (!this.commands.navigateToAnnotation(annotationId)) {
           this.currentComponent?.selectAnnotation(annotationId);
         }
       },
-      onSelectInk: this.onNavigateInk,
+      onSelectInk: this.commands.navigateToInk,
+      showScope: false,
+      state: this.sidebarStore.current,
+      styleOptions: this.stylePresets.map((preset) => [preset.id, preset.name ?? preset.id]),
     });
     const cached = this.currentCache;
-    if (cached !== null && cached.filePath === this.getCurrentFilePath()) {
+    if (cached !== null && cached.filePath === this.commands.getCurrentFilePath()) {
       this.currentComponent.render(cached.model, cached.health, cached.inkSummaries);
     }
     await this.refreshCurrentFile();
@@ -298,9 +351,11 @@ export class AnnotationSidebarView extends ItemView {
     if (component === null) {
       return;
     }
-    const filePath = this.getCurrentFilePath();
+    const filePath = this.commands.getCurrentFilePath();
+    this.sidebarStore.current.filePath.value = filePath;
     if (filePath === null) {
       this.currentCache = null;
+      this.currentFileStale = false;
       this.currentConflicts = [];
       this.currentInkConflicts = [];
       if (this.currentComponent === component) {
@@ -308,6 +363,7 @@ export class AnnotationSidebarView extends ItemView {
       }
       return;
     }
+    this.sidebarStore.current.status.value = 'loading';
     try {
       const [loaded, inkSummaries] = await Promise.all([
         this.service.listCurrentFile(filePath),
@@ -316,7 +372,7 @@ export class AnnotationSidebarView extends ItemView {
       if (this.currentComponent !== component) {
         return;
       }
-      loaded.issues.forEach(this.onIssue);
+      loaded.issues.forEach(this.commands.issue);
       this.currentConflicts = loaded.conflicts.filter(
         (conflict) => conflict.kind === 'same-revision-divergence',
       );
@@ -332,25 +388,29 @@ export class AnnotationSidebarView extends ItemView {
         readIssueCount: loaded.issues.filter((issue) => issue.kind === 'corrupt-record').length,
       };
       this.currentCache = { filePath, health, inkSummaries, model: loaded.model };
+      this.currentFileStale = false;
       component.render(loaded.model, health, inkSummaries);
     } catch (error) {
       if (this.currentComponent !== component) {
         return;
       }
-      this.onIssue(error);
+      this.commands.issue(error);
+      this.currentFileStale = false;
       component.renderFailure(storageFailureMessage(error));
     }
   }
 
   private async showEntireVault(): Promise<void> {
-    if (this.vaultComponent !== null) return;
+    this.sidebarStore.setScope('entire-vault');
+    if (this.vaultComponent !== null) {
+      await this.refreshVaultIndex();
+      return;
+    }
     this.conflictDialog.close(false);
     this.currentConflicts = [];
     this.currentInkConflicts = [];
     this.vaultBuildAbort?.abort();
     this.vaultBuildAbort = null;
-    this.currentComponent?.dispose();
-    this.currentComponent = null;
     const retainFailures = <T extends { readonly filePath: string; readonly id: string }>(
       selection: readonly T[],
       failed: readonly { readonly filePath: string; readonly id: string }[],
@@ -375,8 +435,9 @@ export class AnnotationSidebarView extends ItemView {
       }
     };
     const component = new VaultAnnotationSidebar({
-      container: this.contentEl,
+      container: this.getVaultContentEl(),
       document: this.contentEl.ownerDocument,
+      headerContainer: this.getVaultHeaderActionsEl(),
       index: this.vaultIndex,
       onBulkAddTags: async (selection, tags) => {
         const outcome = await this.service.bulkAddTags(selection, tags);
@@ -407,7 +468,7 @@ export class AnnotationSidebarView extends ItemView {
         const inkSelection = selection.filter((item) => item.type === 'ink');
         const [textOutcome, inkOutcome] = await Promise.all([
           this.service.bulkDelete(textSelection),
-          this.onBulkDeleteInk(inkSelection),
+          this.commands.bulkDeleteInk(inkSelection),
         ]);
         for (const record of textOutcome.succeeded) {
           this.vaultIndex.remove({
@@ -417,19 +478,24 @@ export class AnnotationSidebarView extends ItemView {
           });
         }
         return {
-          failed: [...retainFailures(textSelection, textOutcome.failed), ...inkOutcome.failed],
+          failed: [
+            ...retainFailures(textSelection, textOutcome.failed),
+            ...retainFailures(inkSelection, inkOutcome.failed),
+          ],
         };
       },
       onCurrentFile: () => this.showCurrentFile(),
       onEdit: (entry, invoker) => {
         if (entry.type === 'ink') {
-          this.onEditInk(entry.filePath, entry.id);
+          this.commands.editInk(entry.filePath, entry.id);
           return;
         }
-        this.inspectAnnotation(entry.id, invoker);
+        this.commands.inspectAnnotation(entry.id, invoker);
       },
-      onExport: this.onExportVaultEntries,
-      onOpen: (entry) => this.navigateToVaultAnnotation(entry),
+      onExport: this.commands.exportVaultEntries,
+      onOpen: (entry) => this.commands.navigateToVaultAnnotation(entry),
+      state: this.sidebarStore.vault,
+      showScope: false,
       styleOptions: this.stylePresets.map((preset) => [preset.id, preset.name ?? preset.id]),
     });
     this.vaultComponent = component;
@@ -439,6 +505,34 @@ export class AnnotationSidebarView extends ItemView {
       component.showBuilding({ completed: 0, total: 0 });
     }
     await this.refreshVaultIndex();
+  }
+
+  private getCurrentContentEl(): HTMLElement {
+    if (this.currentContentEl === null) {
+      throw new Error('The annotation sidebar shell is not mounted.');
+    }
+    return this.currentContentEl;
+  }
+
+  private getCurrentHeaderActionsEl(): HTMLElement {
+    if (this.currentHeaderActionsEl === null) {
+      throw new Error('The annotation sidebar header is not mounted.');
+    }
+    return this.currentHeaderActionsEl;
+  }
+
+  private getVaultContentEl(): HTMLElement {
+    if (this.vaultContentEl === null) {
+      throw new Error('The annotation sidebar shell is not mounted.');
+    }
+    return this.vaultContentEl;
+  }
+
+  private getVaultHeaderActionsEl(): HTMLElement {
+    if (this.vaultHeaderActionsEl === null) {
+      throw new Error('The annotation sidebar header is not mounted.');
+    }
+    return this.vaultHeaderActionsEl;
   }
 
   private async refreshVaultIndex(): Promise<void> {
@@ -473,7 +567,7 @@ export class AnnotationSidebarView extends ItemView {
       }
     } catch (error) {
       if (!abort.signal.aborted && this.vaultComponent === component) {
-        this.onIssue(error);
+        this.commands.issue(error);
         if (hasUsableIndex) {
           component.showReady();
         } else {
@@ -527,7 +621,7 @@ export class AnnotationSidebarView extends ItemView {
       conflicts: views,
       invoker,
       onResolve: async (annotationId, candidatePath, kind) => {
-        const filePath = this.getCurrentFilePath();
+        const filePath = this.commands.getCurrentFilePath();
         if (filePath === null) {
           throw new Error('The annotation conflict is no longer available.');
         }
@@ -536,7 +630,7 @@ export class AnnotationSidebarView extends ItemView {
           if (conflict === undefined) {
             throw new Error('The Ink conflict is no longer available.');
           }
-          await this.onRepairInkConflict(filePath, conflict, candidatePath);
+          await this.commands.repairInkConflict(filePath, conflict, candidatePath);
         } else {
           const conflict = conflicts.find((candidate) => candidate.annotationId === annotationId);
           if (conflict === undefined) {

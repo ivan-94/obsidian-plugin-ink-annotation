@@ -467,6 +467,31 @@ describe('annotation inspector', () => {
     expect(note.value).toBe('Do not lose me');
   });
 
+  it('keeps an explicit failed save open and focuses the Retry action', async () => {
+    const inspector = new AnnotationInspector({
+      document,
+      onDelete: (item) => Promise.resolve(item),
+      onNavigate: () => undefined,
+      onSave: () => Promise.reject(new Error('disk unavailable')),
+      onUndo: (item) => Promise.resolve(item),
+      presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
+      writeClipboard: () => Promise.resolve(),
+    });
+    inspector.show({ anchorRect: new DOMRect(), records: [record('retry', 'Retry save')] });
+
+    document.querySelector<HTMLButtonElement>('button[aria-label="Save annotation"]')?.click();
+
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-inkstone-inspector-status]')?.textContent).toContain(
+        "Couldn't save locally",
+      ),
+    );
+    const retry = document.querySelector<HTMLButtonElement>('button[aria-label="Retry save"]');
+    expect(document.querySelector('[data-inkstone-annotation-inspector]')).not.toBeNull();
+    expect(retry?.textContent).toBe('Retry');
+    expect(document.activeElement).toBe(retry);
+  });
+
   it('keeps an unanchored record editable and exportable before repair', async () => {
     const saved: string[] = [];
     const copied: string[] = [];

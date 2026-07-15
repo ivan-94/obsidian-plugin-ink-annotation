@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_STYLE_PRESETS } from '../domain/style-preset';
 import { QuickHighlightToolbar, type QuickToolbarAction } from './quick-highlight-toolbar';
@@ -145,6 +145,29 @@ describe('quick highlight toolbar', () => {
     document.dispatchEvent(new Event('scroll'));
     expect(document.querySelector('[data-inkstone-quick-toolbar]')).toBeNull();
     expect(dismissals).toBe(2);
+  });
+
+  it('uses the owner-document dismiss stack for Escape and releases it on close', () => {
+    let dismissals = 0;
+    const remove = vi.spyOn(document, 'removeEventListener');
+    const toolbar = new QuickHighlightToolbar({
+      document,
+      onAction: () => Promise.resolve(),
+      onDismiss: () => {
+        dismissals += 1;
+      },
+    });
+    toolbar.show({
+      anchorRect: new DOMRect(100, 120, 80, 20),
+      presets: DEFAULT_STYLE_PRESETS,
+      recentStyleId: 'highlight-sun',
+    });
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Escape' }));
+
+    expect(dismissals).toBe(1);
+    expect(document.querySelector('[data-inkstone-quick-toolbar]')).toBeNull();
+    expect(remove).toHaveBeenCalledWith('keydown', expect.any(Function), true);
   });
 
   it('shows a concise non-destructive reason for an unsupported selection', () => {

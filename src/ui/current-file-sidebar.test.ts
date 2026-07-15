@@ -110,7 +110,7 @@ describe('current-file sidebar', () => {
     expect(annotationToggle?.getAttribute('aria-expanded')).toBe('false');
   });
 
-  it('deletes a text annotation from its row menu and exposes a short Restore action', () => {
+  it('deletes a text annotation from its row menu and exposes a short Restore action', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-15T13:42:00.000Z'));
     const deleted: string[] = [];
@@ -158,6 +158,7 @@ describe('current-file sidebar', () => {
     expect(restored).toEqual(['active-1:2']);
 
     vi.advanceTimersByTime(5_000);
+    await Promise.resolve();
     expect(container.querySelector('[data-inkstone-annotation-restore="active-1"]')).toBeNull();
     sidebar.dispose();
   });
@@ -203,7 +204,7 @@ describe('current-file sidebar', () => {
     sidebar.render(fixture());
 
     expect(original?.id).not.toBe('');
-    expect(document.getElementById(original?.id ?? '')).not.toBe(original);
+    expect(document.getElementById(original?.id ?? '')).toBe(original);
     expect(document.getElementById(original?.id ?? '')?.dataset.inkstoneAnnotationActions).toBe(
       'active-1',
     );
@@ -276,6 +277,136 @@ describe('current-file sidebar', () => {
     expect(scopes).toEqual([]);
     container.querySelector<HTMLButtonElement>('button[aria-label="Show Entire Vault"]')?.click();
     expect(scopes).toEqual(['vault']);
+  });
+
+  it('uses the same row, search and header behavior in Current file selection mode', async () => {
+    const navigated: string[] = [];
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onSelect: (id) => navigated.push(id),
+      onSelectInk: (summary) => navigated.push(summary.id),
+    });
+    sidebar.render(fixture(), undefined, [inkSummary()]);
+
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Search current file annotations"]')
+      ?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="More actions"]')?.click();
+    const enterSelection = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Enter selection mode"]',
+    );
+    expect(enterSelection).not.toBeNull();
+    enterSelection?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('button[aria-label="Done selecting"]')).not.toBeNull(),
+    );
+
+    expect(
+      container.querySelector<HTMLInputElement>(
+        'input[aria-label="Search current file annotations"]',
+      )?.disabled,
+    ).toBe(true);
+    expect(container.querySelector('[data-inkstone-annotation-actions]')).toBeNull();
+    expect(container.querySelector('[data-inkstone-ink-actions]')).toBeNull();
+
+    container.querySelector<HTMLButtonElement>('[data-annotation-id="active-1"]')?.click();
+    container.querySelector<HTMLButtonElement>('[data-inkstone-ink-row="surface-1"]')?.click();
+    expect(navigated).toEqual([]);
+    await vi.waitFor(() => {
+      expect(
+        container
+          .querySelector('[data-annotation-id="active-1"]')
+          ?.closest('.inkstone-sidebar-row')
+          ?.getAttribute('aria-selected'),
+      ).toBe('true');
+      expect(
+        container
+          .querySelector('[data-inkstone-ink-row="surface-1"]')
+          ?.closest('.inkstone-sidebar-ink-row')
+          ?.getAttribute('aria-selected'),
+      ).toBe('true');
+    });
+
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Select all annotations"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(
+        [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].every(
+          (checkbox) => checkbox.checked,
+        ),
+      ).toBe(true),
+    );
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Deselect all annotations"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(
+        [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].every(
+          (checkbox) => !checkbox.checked,
+        ),
+      ).toBe(true),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Done selecting"]')?.click();
+    await vi.waitFor(() => {
+      expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+      expect(container.querySelector('button[aria-label="More actions"]')).not.toBeNull();
+    });
+  });
+
+  it('offers Current file selections the same five bulk actions', async () => {
+    const copied: unknown[] = [];
+    let finishCopy: (() => void) | undefined;
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onBulkCopy: (entries) => {
+        copied.push(entries);
+        return new Promise<void>((resolve) => {
+          finishCopy = resolve;
+        });
+      },
+      onSelect: () => undefined,
+    });
+    sidebar.render(fixture(), undefined, [inkSummary()]);
+
+    container.querySelector<HTMLButtonElement>('button[aria-label="More actions"]')?.click();
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Enter selection mode"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('button[aria-label="Done selecting"]')).not.toBeNull(),
+    );
+    container.querySelector<HTMLButtonElement>('[data-annotation-id="active-1"]')?.click();
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('.inkstone-bulk-action-dock')?.textContent).toContain(
+        '1 selected',
+      );
+    });
+    const actions = [
+      ...container.querySelectorAll<HTMLButtonElement>('.inkstone-bulk-action-dock button'),
+    ];
+    expect(actions.map((button) => button.title)).toEqual([
+      'Add tags',
+      'Change style',
+      'Copy',
+      'Export',
+      'Delete',
+    ]);
+
+    container.querySelector<HTMLButtonElement>('button[aria-label="Copy selected"]')?.click();
+    await vi.waitFor(() => expect(copied).toHaveLength(1));
+    expect(container.querySelector('[role="status"]')?.textContent).toBe('Copying…');
+    expect(container.querySelector('button[aria-label="Copying…"]')).not.toBeNull();
+    finishCopy?.();
+    await vi.waitFor(() => {
+      expect(container.querySelector('[role="status"]')?.textContent).toBe('Copied');
+      expect(container.querySelector('button[aria-label="Copied"]')).not.toBeNull();
+    });
   });
 
   it('restores keyboard focus to the active scope after an asynchronous scope switch', async () => {
@@ -399,7 +530,7 @@ describe('current-file sidebar', () => {
     ]);
   });
 
-  it('removes a deleted Ink restore row five seconds after its tombstone time', () => {
+  it('removes a deleted Ink restore row five seconds after its tombstone time', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-14T12:01:00.000Z'));
     const container = document.createElement('div');
@@ -415,6 +546,7 @@ describe('current-file sidebar', () => {
     vi.advanceTimersByTime(4_999);
     expect(container.querySelector('[data-inkstone-ink-restore="surface-2"]')).not.toBeNull();
     vi.advanceTimersByTime(1);
+    await Promise.resolve();
 
     expect(container.querySelector('[data-inkstone-ink-restore="surface-2"]')).toBeNull();
     expect(container.textContent).toContain('No annotations yet');

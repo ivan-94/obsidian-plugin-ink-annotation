@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { TextAnnotationRecord } from './text-annotation';
 import type { InkSurfaceSummary } from './ink-surface-summary';
@@ -179,6 +179,69 @@ describe('Vault annotation derived index', () => {
     expect(index.query({ filters: { statuses: ['needs-rebase'] } }).total).toBe(1);
     expect(JSON.stringify(index.snapshot())).not.toContain('svg');
     expect(JSON.stringify(index.snapshot())).not.toContain('points');
+  });
+
+  it('publishes one versioned change for applied mutations only', () => {
+    const index = new VaultAnnotationIndex();
+    const listener = vi.fn();
+    const unsubscribe = index.subscribe(listener);
+    const original = textRecordToIndexEntry(
+      record({ exact: 'Original', filePath: 'Note.md', id: 'same-id', position: 1 }),
+    );
+
+    expect(index.version).toBe(0);
+    index.rebuild([original]);
+    expect(index.version).toBe(1);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    expect(index.upsert(original)).toBe('unchanged');
+    expect(index.remove({ expectedRevision: 99, id: original.id, noteId: original.noteId })).toBe(
+      'stale',
+    );
+    expect(index.version).toBe(1);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    expect(index.upsert({ ...original, quote: 'Updated', revision: 2 })).toBe('applied');
+    expect(index.version).toBe(2);
+    expect(listener).toHaveBeenCalledTimes(2);
+    unsubscribe();
+    expect(index.remove({ expectedRevision: 2, id: original.id, noteId: original.noteId })).toBe(
+      'removed',
+    );
+    expect(index.version).toBe(3);
+    expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  it('reuses snapshots, query results and facets until an applied mutation invalidates them', () => {
+    const index = new VaultAnnotationIndex();
+    const original = textRecordToIndexEntry(
+      record({ exact: 'Original', filePath: 'Folder/Note.md', id: 'same-id', position: 1 }),
+    );
+    index.rebuild([original]);
+
+    const snapshot = index.snapshot();
+    const query = index.query({ text: 'original' });
+    const facets = index.facets();
+
+    expect(index.snapshot()).toBe(snapshot);
+    expect(index.query({ text: 'original' })).toBe(query);
+    expect(index.facets()).toBe(facets);
+    expect(facets).toMatchObject({
+      folders: ['Folder'],
+      notes: [{ filePath: 'Folder/Note.md', noteId: 'note-Folder/Note.md' }],
+      statuses: ['active'],
+      styleIds: ['highlight-sun'],
+      styles: [{ id: 'highlight-sun', name: 'highlight-sun' }],
+      tags: [],
+      types: ['highlight'],
+    });
+
+    index.upsert({ ...original, filePath: 'Other/Note.md', revision: 2, tags: ['review'] });
+
+    expect(index.snapshot()).not.toBe(snapshot);
+    expect(index.query({ text: 'original' })).not.toBe(query);
+    expect(index.facets()).not.toBe(facets);
+    expect(index.facets()).toMatchObject({ folders: ['Other'], tags: ['review'] });
   });
 });
 

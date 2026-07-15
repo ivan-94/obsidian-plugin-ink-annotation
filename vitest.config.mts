@@ -9,8 +9,8 @@ export default defineConfig({
   },
   test: {
     coverage: {
-      exclude: ['src/**/*.test.ts'],
-      include: ['src/**/*.ts'],
+      exclude: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+      include: ['src/**/*.ts', 'src/**/*.tsx'],
       provider: 'v8',
       reporter: ['text', 'html', 'json-summary'],
       thresholds: {
@@ -21,7 +21,7 @@ export default defineConfig({
       },
     },
     environment: 'node',
-    include: ['src/**/*.test.ts', 'scripts/**/*.test.mts'],
+    include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'scripts/**/*.test.mts'],
     restoreMocks: true,
   },
 });

@@ -1,0 +1,208 @@
+import type { Signal } from '@preact/signals';
+
+import type { InkStroke } from '../../domain/ink-surface';
+import { ObsidianIcon } from '../primitives/obsidian-icon';
+import type { InkToolbarState } from '../stores/ink-toolbar-store';
+
+export interface InkToolbarAppProps {
+  readonly onColor: (color: string) => void;
+  readonly onDone: () => void;
+  readonly onDragKeyDown: (event: KeyboardEvent) => void;
+  readonly onDragStart: (event: PointerEvent) => void;
+  readonly onRedo: () => void;
+  readonly onRetry: () => void;
+  readonly onToggleOptions: () => void;
+  readonly onTool: (tool: InkStroke['tool']) => void;
+  readonly onUndo: () => void;
+  readonly onWidth: (width: number) => void;
+  readonly state: Signal<InkToolbarState>;
+}
+
+export function InkToolbarApp(props: InkToolbarAppProps) {
+  const state = props.state.value;
+  const position = state.position;
+  return (
+    <div
+      aria-label="Ink tools"
+      className="inkstone-ink-controls"
+      data-inkstone-ink-dragged={position?.dragged === true ? 'true' : undefined}
+      data-inkstone-ink-toolbar-app=""
+      role="toolbar"
+      style={{
+        ...(position === null
+          ? {}
+          : {
+              bottom: 'auto',
+              left: `${position.left}px`,
+              right: 'auto',
+              top: `${position.top}px`,
+            }),
+        display: state.active ? 'flex' : 'none',
+      }}
+    >
+      <ToolbarButton
+        className={`inkstone-ink-controls__drag-handle${state.dragging ? ' is-dragging' : ''}`}
+        data={{ inkstoneInkDragHandle: 'true' }}
+        icon="grip-vertical"
+        label="Move Ink toolbar"
+        onKeyDown={props.onDragKeyDown}
+        onPointerDown={props.onDragStart}
+      />
+      {(['pen', 'highlighter', 'eraser'] as const).map((tool) => (
+        <ToolbarButton
+          data={{ inkstoneInkTool: tool }}
+          icon={tool === 'pen' ? 'pen-line' : tool === 'highlighter' ? 'highlighter' : 'eraser'}
+          key={tool}
+          label={tool === 'pen' ? 'Pen' : tool === 'highlighter' ? 'Highlighter' : 'Eraser'}
+          onClick={(event) => {
+            const toolbar = (event.currentTarget as HTMLElement).closest('[role="toolbar"]');
+            for (const button of toolbar?.querySelectorAll<HTMLElement>(
+              '[data-inkstone-ink-tool]',
+            ) ?? []) {
+              button.setAttribute('aria-pressed', String(button.dataset.inkstoneInkTool === tool));
+            }
+            props.onTool(tool);
+          }}
+          pressed={state.tool === tool}
+        />
+      ))}
+      <input
+        aria-label="Ink color"
+        data-inkstone-ink-color="true"
+        hidden={!state.optionsVisible}
+        onInput={(event) => props.onColor(event.currentTarget.value)}
+        type="color"
+        value={state.color}
+      />
+      <label
+        className="inkstone-ink-controls__width"
+        data-inkstone-ink-width-control="true"
+        hidden={!state.optionsVisible}
+        title={`Ink width: ${state.width} px`}
+      >
+        {[2, 4, 8].map((sample) => (
+          <span
+            aria-hidden="true"
+            data-inkstone-ink-width-sample={sample}
+            data-selected={nearestSample(state.width) === sample ? '' : undefined}
+            key={sample}
+          />
+        ))}
+        <select
+          aria-label="Ink width"
+          data-inkstone-ink-width="true"
+          hidden
+          onChange={(event) => props.onWidth(Number.parseInt(event.currentTarget.value, 10))}
+          value={state.width}
+        >
+          {[2, 4, 8, 12, 16].map((width) => (
+            <option key={width} value={width}>
+              {width}px
+            </option>
+          ))}
+        </select>
+      </label>
+      <ToolbarButton
+        data={{ inkstoneInkUndo: 'true' }}
+        disabled={!state.canUndo}
+        icon="undo-2"
+        label="Undo Ink change"
+        onClick={props.onUndo}
+      />
+      <ToolbarButton
+        data={{ inkstoneInkRedo: 'true' }}
+        disabled={!state.canRedo}
+        icon="redo-2"
+        label="Redo Ink change"
+        onClick={props.onRedo}
+      />
+      <ToolbarButton
+        expanded={state.optionsVisible}
+        icon="ellipsis"
+        label="Show or hide Ink color and width"
+        onClick={props.onToggleOptions}
+      />
+      <ToolbarButton
+        className="inkstone-ink-controls__done"
+        hidden={!state.active}
+        icon="circle-check"
+        label="Done drawing"
+        onClick={props.onDone}
+      />
+      <ToolbarButton
+        data={{ inkstoneInkRetry: 'true' }}
+        hidden={state.saveError === null}
+        icon="refresh-cw"
+        label="Retry local Ink save"
+        onClick={props.onRetry}
+        text="Retry"
+      />
+      <span
+        aria-live="polite"
+        data-inkstone-ink-status="true"
+        hidden={state.saveError === null}
+        role="status"
+      >
+        {state.statusText}
+      </span>
+    </div>
+  );
+}
+
+function ToolbarButton({
+  className = '',
+  data = {},
+  disabled = false,
+  expanded,
+  hidden = false,
+  icon,
+  label,
+  onClick,
+  onKeyDown,
+  onPointerDown,
+  pressed,
+  text,
+}: {
+  readonly className?: string;
+  readonly data?: Readonly<Record<string, string>>;
+  readonly disabled?: boolean;
+  readonly expanded?: boolean;
+  readonly hidden?: boolean;
+  readonly icon: string;
+  readonly label: string;
+  readonly onClick?: (event: MouseEvent) => void;
+  readonly onKeyDown?: (event: KeyboardEvent) => void;
+  readonly onPointerDown?: (event: PointerEvent) => void;
+  readonly pressed?: boolean;
+  readonly text?: string;
+}) {
+  return (
+    <button
+      aria-expanded={expanded}
+      aria-label={label}
+      aria-pressed={pressed}
+      className={`inkstone-icon-button ${className}`.trim()}
+      data-inkstone-icon={icon}
+      disabled={disabled}
+      hidden={hidden}
+      onClick={onClick}
+      onKeyDown={onKeyDown}
+      onPointerDown={onPointerDown}
+      ref={(button) => {
+        if (button === null) return;
+        for (const [key, value] of Object.entries(data)) button.dataset[key] = value;
+      }}
+      title={label}
+      type="button"
+    >
+      <ObsidianIcon icon={icon} />
+      {text === undefined ? null : <span className="inkstone-icon-button__label">{text}</span>}
+    </button>
+  );
+}
+
+function nearestSample(width: number): number {
+  return [2, 4, 8].reduce((closest, sample) =>
+    Math.abs(sample - width) < Math.abs(closest - width) ? sample : closest,
+  );
+}

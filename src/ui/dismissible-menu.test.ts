@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { createDismissibleMenu } from './dismissible-menu';
+import { createDismissibleMenuController } from './runtime/dismissible-layer';
 
 describe('dismissible menu', () => {
   afterEach(() => document.body.replaceChildren());
@@ -15,8 +15,16 @@ describe('dismissible menu', () => {
     const secondMenu = document.createElement('div');
     secondMenu.hidden = true;
     document.body.append(firstTrigger, firstMenu, secondTrigger, secondMenu);
-    const first = createDismissibleMenu({ document, menu: firstMenu, trigger: firstTrigger });
-    const second = createDismissibleMenu({ document, menu: secondMenu, trigger: secondTrigger });
+    const first = createDismissibleMenuController({
+      document,
+      menu: firstMenu,
+      trigger: firstTrigger,
+    });
+    const second = createDismissibleMenuController({
+      document,
+      menu: secondMenu,
+      trigger: secondTrigger,
+    });
 
     first.open();
     expect(firstMenu.hidden).toBe(false);

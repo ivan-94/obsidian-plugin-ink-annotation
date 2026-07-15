@@ -3,15 +3,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { VaultAnnotationIndex, type AnnotationIndexEntry } from '../domain/vault-annotation-index';
+import { createVaultSidebarStore } from './stores/annotation-sidebar-store';
 import { VaultAnnotationSidebar } from './vault-annotation-sidebar';
 
 describe('Entire Vault annotation sidebar', () => {
-  afterEach(() => document.body.replaceChildren());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    document.body.replaceChildren();
+  });
 
   it('distinguishes building, empty and no-matching-result states', () => {
+    vi.useFakeTimers();
     const container = document.createElement('div');
     const index = new VaultAnnotationIndex();
-    const sidebar = new VaultAnnotationSidebar({ container, document, index });
+    const state = createVaultSidebarStore();
+    const sidebar = new VaultAnnotationSidebar({ container, document, index, state });
 
     sidebar.showBuilding({ completed: 2, total: 10 });
     expect(container.textContent).toContain('Index building 2 of 10');
@@ -20,6 +27,7 @@ describe('Entire Vault annotation sidebar', () => {
     expect(container.textContent).toContain('No annotations');
 
     index.rebuild([entry('one', 'Searchable quote')]);
+    const query = vi.spyOn(index, 'query');
     sidebar.showReady();
     const search = container.querySelector<HTMLInputElement>(
       'input[aria-label="Search annotations"]',
@@ -29,7 +37,75 @@ describe('Entire Vault annotation sidebar', () => {
     }
     search.value = 'does not exist';
     search.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(state.searchInput.value).toBe('does not exist');
+    expect(state.searchQuery.value).toBe('');
+    expect(query).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(99);
+    expect(state.searchQuery.value).toBe('');
+    expect(query).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+    expect(state.searchQuery.value).toBe('does not exist');
+    expect(query).toHaveBeenCalledTimes(2);
     expect(container.textContent).toContain('No matching results');
+    expect(
+      container.querySelector<HTMLInputElement>('input[aria-label="Search annotations"]')?.value,
+    ).toBe('does not exist');
+
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Clear search and filters"]')
+      ?.click();
+
+    expect(state.searchInput.value).toBe('');
+    expect(state.searchQuery.value).toBe('');
+    expect(container.textContent).not.toContain('No matching results');
+    expect(container.querySelector('[data-annotation-id="one"]')).not.toBeNull();
+  });
+
+  it('coalesces rapid search input and runs only the final one-character query', () => {
+    vi.useFakeTimers();
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([entry('one', 'Quote')]);
+    const query = vi.spyOn(index, 'query');
+    const state = createVaultSidebarStore();
+    const sidebar = new VaultAnnotationSidebar({ container, document, index, state });
+    sidebar.showReady();
+    const search = container.querySelector<HTMLInputElement>(
+      'input[aria-label="Search annotations"]',
+    );
+    if (search === null) throw new Error('Expected Vault search input.');
+
+    for (const value of ['q', 'qu', 'quo']) {
+      search.value = value;
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+      vi.advanceTimersByTime(50);
+    }
+
+    expect(state.searchInput.value).toBe('quo');
+    expect(state.searchQuery.value).toBe('');
+    expect(query).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(49);
+    expect(query).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+    expect(state.searchQuery.value).toBe('quo');
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it('reflects applied index mutations while the Vault view stays open', () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([entry('first', 'First')]);
+    const sidebar = new VaultAnnotationSidebar({ container, document, index });
+    sidebar.showReady();
+
+    index.upsert(entry('second', 'Second'));
+
+    expect(
+      [...container.querySelectorAll<HTMLElement>('[data-annotation-id]')].map(
+        (row) => row.dataset.annotationId,
+      ),
+    ).toEqual(['first', 'second']);
+    sidebar.dispose();
   });
 
   it('restores keyboard focus to the active scope after returning to Current file', async () => {
@@ -220,16 +296,21 @@ describe('Entire Vault annotation sidebar', () => {
     expect(container.querySelectorAll('[data-annotation-id]').length).toBeLessThan(30);
     expect(
       container.querySelector('[data-inkstone-virtual-total]')?.getAttribute('style'),
-    ).toContain('calc(1320042px + var(--inkstone-vault-bottom-safe-area))');
+    ).toContain('calc(1440042px + var(--inkstone-vault-bottom-safe-area))');
     const bottomSpacer = container.querySelector<HTMLElement>(
       '[data-inkstone-vault-bottom-spacer]',
     );
-    expect(bottomSpacer?.style.top).toBe('1320042px');
+    expect(bottomSpacer?.style.top).toBe('1440042px');
     expect(bottomSpacer?.style.height).toBe('var(--inkstone-vault-bottom-safe-area)');
     expect(container.querySelector<HTMLElement>('.inkstone-vault-group-header')?.style.height).toBe(
       '42px',
     );
     expect(container.querySelector<HTMLElement>('.inkstone-vault-row')?.style.height).toBe('66px');
+    expect(
+      container
+        .querySelector<HTMLElement>('.inkstone-vault-row')
+        ?.closest<HTMLElement>('[data-inkstone-virtual-item]')?.style.height,
+    ).toBe('72px');
     expect(container.classList.contains('inkstone-sidebar--vault')).toBe(true);
     expect(container.querySelector<HTMLElement>('.inkstone-vault-virtual-list')?.style.height).toBe(
       '100%',
@@ -323,15 +404,46 @@ describe('Entire Vault annotation sidebar', () => {
 
     expect(container.querySelector('input[type="checkbox"]')).toBeNull();
     container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
-    const checkboxes = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+    expect(
+      [...container.querySelectorAll<HTMLElement>('.inkstone-vault-row')].every(
+        (row) => row.dataset.inkstoneBulkSelection === 'true',
+      ),
+    ).toBe(true);
+    const bulkActions = [
+      ...container.querySelectorAll<HTMLButtonElement>('.inkstone-bulk-action-dock button'),
+    ];
+    expect(bulkActions).toHaveLength(5);
+    expect(
+      bulkActions.every((button) => button.querySelector('.inkstone-icon-button__label') === null),
+    ).toBe(true);
+    expect(bulkActions.map((button) => button.title)).toEqual([
+      'Add tags',
+      'Change style',
+      'Copy',
+      'Export',
+      'Delete',
+    ]);
+    const checkboxes = [
+      ...container.querySelectorAll<HTMLInputElement>('.inkstone-vault-row input[type="checkbox"]'),
+    ];
     expect(checkboxes).toHaveLength(2);
     for (const checkbox of checkboxes) {
       checkbox.click();
     }
     container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.click();
-    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+    const dialog = container.querySelector('[role="dialog"]');
+    expect(dialog?.querySelector('.inkstone-bulk-dialog__title')?.textContent).toBe(
       'Delete 2 annotations?',
     );
+    expect(dialog?.querySelector('.inkstone-bulk-dialog__description')?.textContent).toBe(
+      'This action cannot be undone.',
+    );
+    expect(dialog?.querySelector('.inkstone-bulk-dialog__actions')).not.toBeNull();
+    expect(
+      dialog
+        ?.querySelector('button[aria-label="Confirm bulk delete"]')
+        ?.classList.contains('inkstone-bulk-dialog__confirm--danger'),
+    ).toBe(true);
     container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
 
     await vi.waitFor(() => expect(deleted).toHaveLength(1));
@@ -339,6 +451,192 @@ describe('Entire Vault annotation sidebar', () => {
       { expectedRevision: 1, id: 'one' },
       { expectedRevision: 1, id: 'two' },
     ]);
+  });
+
+  it('shows visible feedback after copying a bulk selection', async () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([entry('one', 'First')]);
+    const sidebar = new VaultAnnotationSidebar({
+      container,
+      document,
+      index,
+      onBulkCopy: () => Promise.resolve(),
+    });
+    sidebar.showReady();
+
+    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    container
+      .querySelector<HTMLInputElement>('.inkstone-vault-row input[type="checkbox"]')
+      ?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Copy selected"]')?.click();
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('[role="status"]')?.textContent).toBe('Copied');
+      expect(container.querySelector('button[aria-label="Copied"]')).not.toBeNull();
+    });
+  });
+
+  it('turns each Vault row into a selection target while selection mode is active', () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([entry('one', 'First')]);
+    const opened: string[] = [];
+    const sidebar = new VaultAnnotationSidebar({
+      container,
+      document,
+      index,
+      onOpen: (selected) => opened.push(selected.id),
+    });
+    sidebar.showReady();
+
+    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    const row = container.querySelector<HTMLElement>('.inkstone-vault-row');
+    const summary = row?.querySelector<HTMLButtonElement>('[data-annotation-id="one"]');
+
+    expect(row?.querySelector('[data-inkstone-vault-actions="one"]')).toBeNull();
+    summary?.click();
+    expect(opened).toEqual([]);
+    expect(row?.getAttribute('aria-selected')).toBe('true');
+    expect(
+      row?.querySelector<HTMLInputElement>('input[aria-label="Select annotation one"]')?.checked,
+    ).toBe(true);
+
+    row?.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter' }));
+    expect(row?.getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('keeps the Vault selection checkbox at the trailing edge of each item', () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([entry('one', 'First')]);
+    const sidebar = new VaultAnnotationSidebar({ container, document, index });
+    sidebar.showReady();
+
+    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    const row = container.querySelector<HTMLElement>('.inkstone-vault-row');
+    const checkbox = row?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    const summary = row?.querySelector<HTMLElement>('.inkstone-sidebar-row__summary');
+
+    expect(checkbox).not.toBeNull();
+    expect(summary).not.toBeNull();
+    if (checkbox === undefined || checkbox === null || summary === undefined || summary === null) {
+      throw new Error('Expected a summary followed by a selection checkbox.');
+    }
+    expect(summary.compareDocumentPosition(checkbox) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
+      0,
+    );
+    expect(row?.lastElementChild).toBe(checkbox);
+  });
+
+  it('selects and deselects only one file from its group header', async () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([
+      entry('one', 'First'),
+      entry('two', 'Second'),
+      { ...entry('other', 'Other'), filePath: 'Notes/Other.md', noteId: 'note-other' },
+    ]);
+    const sidebar = new VaultAnnotationSidebar({ container, document, index });
+    sidebar.showReady();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+
+    const fileToggle = container.querySelector<HTMLInputElement>(
+      'input[aria-label="Select all annotations in Notes/Search.md"]',
+    );
+    expect(fileToggle).not.toBeNull();
+    fileToggle?.click();
+
+    await vi.waitFor(() => {
+      expect(
+        [
+          ...container.querySelectorAll<HTMLInputElement>(
+            '.inkstone-vault-row[data-note-group="Notes/Search.md"] input',
+          ),
+        ].every((checkbox) => checkbox.checked),
+      ).toBe(true);
+      expect(
+        container.querySelector<HTMLInputElement>(
+          '.inkstone-vault-row[data-note-group="Notes/Other.md"] input',
+        )?.checked,
+      ).toBe(false);
+    });
+    container
+      .querySelector<HTMLInputElement>(
+        '.inkstone-vault-row[data-note-group="Notes/Search.md"] input',
+      )
+      ?.click();
+    await vi.waitFor(() => {
+      const partial = container.querySelector<HTMLInputElement>(
+        'input[aria-label="Select all annotations in Notes/Search.md"]',
+      );
+      expect(partial?.checked).toBe(false);
+      expect(partial?.indeterminate).toBe(true);
+    });
+    container
+      .querySelector<HTMLInputElement>(
+        'input[aria-label="Select all annotations in Notes/Search.md"]',
+      )
+      ?.click();
+    await vi.waitFor(() => {
+      expect(
+        [
+          ...container.querySelectorAll<HTMLInputElement>(
+            '.inkstone-vault-row[data-note-group="Notes/Search.md"] input',
+          ),
+        ].every((checkbox) => checkbox.checked),
+      ).toBe(true);
+    });
+    const deselect = container.querySelector<HTMLInputElement>(
+      'input[aria-label="Deselect all annotations in Notes/Search.md"]',
+    );
+    expect(deselect?.checked).toBe(true);
+    deselect?.click();
+
+    await vi.waitFor(() => {
+      expect(
+        [...container.querySelectorAll<HTMLInputElement>('.inkstone-vault-row input')].every(
+          (checkbox) => !checkbox.checked,
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it('moves Vault selection controls into the header and disables search', () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([entry('one', 'First'), entry('two', 'Second')]);
+    const sidebar = new VaultAnnotationSidebar({ container, document, index });
+    sidebar.showReady();
+
+    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+
+    expect(
+      container.querySelector<HTMLInputElement>('input[aria-label="Search annotations"]')?.disabled,
+    ).toBe(true);
+    expect(container.querySelector('button[aria-label="More actions"]')).toBeNull();
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Select all annotations"]')
+      ?.click();
+    expect(
+      [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].every(
+        (checkbox) => checkbox.checked,
+      ),
+    ).toBe(true);
+    expect(container.textContent).toContain('2 selected');
+
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Deselect all annotations"]')
+      ?.click();
+    expect(
+      [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].every(
+        (checkbox) => !checkbox.checked,
+      ),
+    ).toBe(true);
+
+    container.querySelector<HTMLButtonElement>('button[aria-label="Done selecting"]')?.click();
+    expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="More actions"]')).not.toBeNull();
   });
 
   it('builds tag filters from the index and exposes a removable chip', () => {
@@ -498,6 +796,68 @@ describe('Entire Vault annotation sidebar', () => {
       ),
     );
     expect(container.textContent).toContain('1 selected');
+  });
+
+  it('keeps a failed bulk action open with retryable feedback', async () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([entry('retry-tags', 'Retry tags')]);
+    let attempts = 0;
+    const sidebar = new VaultAnnotationSidebar({
+      container,
+      document,
+      index,
+      onBulkAddTags: () => {
+        attempts += 1;
+        return attempts === 1
+          ? Promise.reject(new Error('Local sidecar write failed'))
+          : Promise.resolve({ failed: [] });
+      },
+    });
+    sidebar.showReady();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Tag selected"]')?.click();
+    const tags = container.querySelector<HTMLInputElement>('input[aria-label="Bulk tags"]');
+    if (tags === null) throw new Error('Expected bulk tag input.');
+    tags.value = 'retry';
+    container.querySelector<HTMLButtonElement>('button[aria-label="Apply bulk tags"]')?.click();
+
+    await vi.waitFor(() =>
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+        'Local sidecar write failed',
+      ),
+    );
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(container.textContent).toContain('1 selected');
+
+    container.querySelector<HTMLButtonElement>('button[aria-label="Apply bulk tags"]')?.click();
+    await vi.waitFor(() => expect(container.querySelector('[role="dialog"]')).toBeNull());
+    expect(attempts).toBe(2);
+  });
+
+  it('coalesces repeated virtual scroll work into one animation frame', () => {
+    const callbacks: FrameRequestCallback[] = [];
+    const request = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callbacks.push(callback);
+      return callbacks.length;
+    });
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild(Array.from({ length: 100 }, (_, position) => entry(`row-${position}`, 'Row')));
+    const sidebar = new VaultAnnotationSidebar({ container, document, index });
+    sidebar.showReady();
+    const viewport = container.querySelector<HTMLElement>('.inkstone-vault-virtual-list');
+    if (viewport === null) throw new Error('Expected Vault viewport.');
+
+    viewport.scrollTop = 120;
+    viewport.dispatchEvent(new Event('scroll'));
+    viewport.scrollTop = 180;
+    viewport.dispatchEvent(new Event('scroll'));
+
+    expect(request).toHaveBeenCalledTimes(1);
+    callbacks[0]?.(0);
+    sidebar.dispose();
   });
 
   it('exports the current filtered results or only the explicit bulk selection', () => {

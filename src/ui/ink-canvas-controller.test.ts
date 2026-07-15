@@ -242,6 +242,7 @@ describe('Ink canvas controller', () => {
     const controls = root.querySelector<HTMLElement>('.inkstone-ink-controls');
     const buttons = [...(controls?.querySelectorAll<HTMLButtonElement>('button') ?? [])];
 
+    expect(controls?.hasAttribute('data-inkstone-ink-toolbar-app')).toBe(true);
     expect(controls?.getAttribute('role')).toBe('toolbar');
     expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
       'Move Ink toolbar',

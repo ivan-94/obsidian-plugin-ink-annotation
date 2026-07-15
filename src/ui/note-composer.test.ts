@@ -159,6 +159,35 @@ describe('note composer', () => {
     expect(document.activeElement).toBe(textarea);
   });
 
+  it('keeps the composer open and focuses Retry when Escape cannot save locally', async () => {
+    vi.useFakeTimers();
+    const fixture = await createDraftFixture();
+    const composer = new NoteComposer({
+      anchorRect: new DOMRect(100, 120, 80, 20),
+      document,
+      draft: fixture.draft,
+      layout: 'anchored',
+      service: fixture.service,
+    });
+    composer.show();
+    fixture.store.failNextWrite();
+    setInput(
+      document.querySelector<HTMLTextAreaElement>('[data-inkstone-note-composer] textarea'),
+      'Do not lose this draft.',
+    );
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Escape' }));
+
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-inkstone-save-state]')?.textContent).toBe(
+        "Couldn't save locally. Retry.",
+      ),
+    );
+    const retry = document.querySelector<HTMLButtonElement>('.inkstone-note-composer__retry');
+    expect(document.querySelector('[data-inkstone-note-composer]')).not.toBeNull();
+    expect(document.activeElement).toBe(retry);
+  });
+
   it('starts a final local flush when the host unloads the composer', async () => {
     vi.useFakeTimers();
     const fixture = await createDraftFixture();
