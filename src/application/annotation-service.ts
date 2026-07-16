@@ -23,6 +23,7 @@ const TEXT_RESTORE_WINDOW_MS = 5_000;
 export interface CreateHighlightInput {
   readonly filePath: string;
   readonly selection: {
+    readonly displayText?: string;
     readonly end: number;
     readonly scope: TextStructuralScope;
     readonly start: number;
@@ -94,6 +95,9 @@ export class AnnotationService {
   ): Promise<PendingTextSelection> {
     const filePath = normalizeVaultPath(input.filePath);
     const target = await createTextAnchor({
+      ...(input.selection.displayText === undefined
+        ? {}
+        : { displayText: input.selection.displayText }),
       end: input.selection.end,
       scope: input.selection.scope,
       source: input.source,
@@ -412,6 +416,9 @@ export class AnnotationService {
       const needsRebase = resolution.method !== 'position';
       const target = needsRebase
         ? await createTextAnchor({
+            ...(record.target.displayText === undefined
+              ? {}
+              : { displayText: record.target.displayText }),
             end: resolution.end,
             scope: lineScopeAt(input.source, resolution.start),
             source: input.source,

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   decodeInkSurfaceRecord,
   encodeInkSurfaceRecord,
+  inkSurfaceVisibleBounds,
   type InkSurfaceRecord,
 } from './ink-surface';
 
@@ -41,9 +42,57 @@ describe('Ink surface canonical schema', () => {
     expect(decodeInkSurfaceRecord(JSON.stringify(surface))).toEqual(surface);
   });
 
+  it('round-trips schema-v2 note-global chunk origins', () => {
+    const legacy = fixture();
+    const surface: InkSurfaceRecord = {
+      ...legacy,
+      layout: { ...legacy.layout, originY: 240 },
+      schemaVersion: 2,
+    };
+
+    expect(decodeInkSurfaceRecord(encodeInkSurfaceRecord(surface))).toEqual(surface);
+  });
+
+  it('round-trips document-relative Ink in visible workspace margins', () => {
+    const surface = mutateX(fixture(), -120);
+    const acrossBothMargins = {
+      ...surface,
+      strokes: surface.strokes.map((stroke) => {
+        const first = stroke.points[0];
+        const second = stroke.points[1];
+        if (first === undefined || second === undefined) throw new Error('Missing fixture points.');
+        return { ...stroke, points: [first, { ...second, x: 1_080 }] };
+      }),
+    };
+
+    expect(decodeInkSurfaceRecord(encodeInkSurfaceRecord(acrossBothMargins))).toEqual(
+      acrossBothMargins,
+    );
+  });
+
+  it('expands visible bounds to retain stroke width outside the document', () => {
+    const surface = fixture();
+    const stroke = surface.strokes[0];
+    if (stroke === undefined) throw new Error('Missing fixture stroke.');
+
+    expect(
+      inkSurfaceVisibleBounds({
+        ...surface,
+        strokes: [
+          {
+            ...stroke,
+            points: stroke.points.map((point, index) => ({
+              ...point,
+              x: index === 0 ? -20 : surface.layout.logicalWidth + 20,
+            })),
+            width: 4,
+          },
+        ],
+      }),
+    ).toEqual({ height: 1200, minX: -22, minY: 0, width: 1004 });
+  });
+
   it.each([
-    ['point outside logical width', (surface: InkSurfaceRecord) => mutateX(surface, 961)],
-    ['negative point', (surface: InkSurfaceRecord) => mutateX(surface, -1)],
     ['pressure above one', (surface: InkSurfaceRecord) => mutatePressure(surface, 1.1)],
     ['non-increasing revision', (surface: InkSurfaceRecord) => ({ ...surface, revision: 0 })],
     [
@@ -78,9 +127,9 @@ describe('Ink surface canonical schema', () => {
   });
 
   it('rejects unknown schema versions without guessing a migration', () => {
-    const encoded = JSON.stringify({ ...fixture(), schemaVersion: 2 });
+    const encoded = JSON.stringify({ ...fixture(), schemaVersion: 3 });
 
-    expect(() => decodeInkSurfaceRecord(encoded)).toThrow('does not match schema version 1');
+    expect(() => decodeInkSurfaceRecord(encoded)).toThrow('does not match a supported schema');
   });
 });
 

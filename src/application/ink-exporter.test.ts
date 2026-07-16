@@ -19,6 +19,28 @@ describe('Ink portability exports', () => {
     );
   });
 
+  it('expands SVG and PNG mapping for Ink outside the document width', () => {
+    const base = surface();
+    const first = base.strokes[0];
+    if (first === undefined) throw new Error('Missing Ink fixture stroke.');
+    const outside = {
+      ...base,
+      strokes: [
+        {
+          ...first,
+          points: [point(-20, 10), point(120, 40)],
+        },
+      ],
+    };
+
+    const svg = new DOMParser().parseFromString(exportInkSvg(outside), 'image/svg+xml');
+    expect(svg.documentElement.getAttribute('viewBox')).toBe('-21 0 142 50');
+    const png = exportInkPng(outside, { background: 'transparent', height: 50, width: 142 });
+    expect(decodeUncompressedPng(png).some((value, index) => index % 4 === 3 && value > 0)).toBe(
+      true,
+    );
+  });
+
   it('exports a valid RGBA PNG with requested dimensions and background', () => {
     const png = exportInkPng(surface(), { background: '#ffffff', height: 100, width: 200 });
 

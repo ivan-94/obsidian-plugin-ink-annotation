@@ -7,12 +7,14 @@ import type {
 } from '../../domain/vault-annotation-index';
 import { mapVaultAnnotation } from '../models/annotation-list-item-model';
 import { EmptyState } from '../primitives/empty-state';
+import { EllipsisMenuTrigger } from '../primitives/ellipsis-menu-trigger';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
 import { ExternalRoot } from '../runtime/external-root';
 import type { VaultSidebarStore } from '../stores/annotation-sidebar-store';
 import { BulkActionDock } from './bulk-action-dock';
 import { BulkActionDialog } from './bulk-action-dialog';
 import { GroupedVirtualList } from './grouped-virtual-list';
+import { ListItemFrame } from './list-item-frame';
 import { SelectionModeHeaderActions } from './selection-mode-header-actions';
 import { useDismissibleMenu } from './use-dismissible-menu';
 import {
@@ -23,7 +25,8 @@ import {
   vaultEntryKey,
 } from './vault-sidebar-types';
 
-const VAULT_GROUP_HEIGHT = 42;
+const VAULT_GROUP_HEADER_HEIGHT = 36;
+const VAULT_GROUP_ITEM_HEIGHT = 42;
 const VAULT_ROW_HEIGHT = 72;
 const VAULT_ROW_CARD_HEIGHT = 66;
 
@@ -128,7 +131,7 @@ function VaultReadyApp(props: VaultAnnotationSidebarAppProps) {
       ) : (
         <ExternalRoot host={props.headerContainer}>{header}</ExternalRoot>
       )}
-      <VaultToolbar {...props} />
+      <VaultToolbar visibleGroupPaths={result.groups.map((group) => group.filePath)} {...props} />
       <FilterChips {...props} />
       <div className="inkstone-vault-results" data-inkstone-vault-results="">
         {result.state === 'ready' ? (
@@ -185,7 +188,6 @@ function VaultReadyApp(props: VaultAnnotationSidebarAppProps) {
 }
 
 function VaultHeader({
-  document,
   entries,
   onExport,
   onRenderNow,
@@ -193,7 +195,6 @@ function VaultHeader({
   state,
   ...props
 }: VaultAnnotationSidebarAppProps & { readonly entries: readonly AnnotationIndexEntry[] }) {
-  const dismissible = useDismissibleMenu(document);
   const actions = state.bulkSelectionMode.value ? (
     <SelectionModeHeaderActions
       onDeselectAll={() => {
@@ -227,49 +228,29 @@ function VaultHeader({
         >
           <ObsidianIcon icon="refresh-cw" />
         </button>
-        <button
-          aria-expanded="false"
-          aria-haspopup="menu"
-          aria-label="More actions"
-          className="inkstone-icon-button"
-          onClick={() => dismissible.controller.current?.toggle()}
-          ref={dismissible.trigger}
-          type="button"
-        >
-          <ObsidianIcon icon="ellipsis" />
-        </button>
-      </div>
-      <div className="inkstone-sidebar__overflow-menu" hidden ref={dismissible.menu} role="menu">
-        <button
-          aria-label={state.bulkSelectionMode.value ? 'Exit bulk mode' : 'Enter bulk mode'}
-          className="inkstone-icon-button"
-          onClick={() => {
-            dismissible.controller.current?.close();
-            state.bulkSelectionMode.value = !state.bulkSelectionMode.value;
-            if (!state.bulkSelectionMode.value) state.selectedKeys.value = new Set();
-            onRenderNow();
-          }}
-          role="menuitem"
-          type="button"
-        >
-          <ObsidianIcon icon="list-checks" />
-          <span className="inkstone-icon-button__label">
-            {state.bulkSelectionMode.value ? 'Done selecting' : 'Select multiple…'}
-          </span>
-        </button>
-        <button
-          aria-label="Export current results"
-          className="inkstone-icon-button"
-          onClick={(event) => {
-            dismissible.controller.current?.close();
-            onExport(entries, event.currentTarget);
-          }}
-          role="menuitem"
-          type="button"
-        >
-          <ObsidianIcon icon="share" />
-          <span className="inkstone-icon-button__label">Export results…</span>
-        </button>
+        <EllipsisMenuTrigger
+          items={(trigger) => [
+            {
+              icon: 'list-checks',
+              id: 'select-multiple',
+              onSelect: () => {
+                state.bulkSelectionMode.value = true;
+                state.selectedKeys.value = new Set();
+                onRenderNow();
+              },
+              section: 'selection',
+              title: 'Select multiple…',
+            },
+            {
+              icon: 'share',
+              id: 'export-results',
+              onSelect: () => onExport(entries, trigger),
+              section: 'export',
+              title: 'Export results…',
+            },
+          ]}
+          label="More actions"
+        />
       </div>
     </>
   );
@@ -286,6 +267,7 @@ function VaultScope({ onCurrentFile }: { readonly onCurrentFile: () => void | Pr
   return (
     <div aria-label="Annotation scope" className="inkstone-sidebar__scope" role="tablist">
       <button
+        aria-label="Current file"
         aria-pressed="false"
         aria-selected="false"
         onClick={(event) => {
@@ -301,20 +283,33 @@ function VaultScope({ onCurrentFile }: { readonly onCurrentFile: () => void | Pr
         role="tab"
         type="button"
       >
-        Current file
+        <ObsidianIcon className="inkstone-sidebar__scope-icon" icon="file-text" />
+        <span className="inkstone-sidebar__scope-label">Current file</span>
       </button>
-      <button aria-pressed="true" aria-selected="true" role="tab" type="button">
-        Entire Vault
+      <button
+        aria-label="Entire Vault"
+        aria-pressed="true"
+        aria-selected="true"
+        role="tab"
+        type="button"
+      >
+        <ObsidianIcon className="inkstone-sidebar__scope-icon" icon="library" />
+        <span className="inkstone-sidebar__scope-label">Entire Vault</span>
       </button>
     </div>
   );
 }
 
-function VaultToolbar(props: VaultAnnotationSidebarAppProps) {
+function VaultToolbar(
+  props: VaultAnnotationSidebarAppProps & { readonly visibleGroupPaths: readonly string[] },
+) {
   const { index, onRenderNow, onSearch, state } = props;
   const facets = index.facets();
   const dismissible = useDismissibleMenu(props.document);
   const activeFilters = filterChips(state.filters.value, facets);
+  const allGroupsCollapsed =
+    props.visibleGroupPaths.length > 0 &&
+    props.visibleGroupPaths.every((filePath) => state.collapsedGroups.value.has(filePath));
   return (
     <>
       <div className="inkstone-vault-toolbar">
@@ -362,6 +357,25 @@ function VaultToolbar(props: VaultAnnotationSidebarAppProps) {
           type="button"
         >
           <ObsidianIcon icon="arrow-up-down" />
+        </button>
+        <button
+          aria-label={allGroupsCollapsed ? 'Expand all groups' : 'Collapse all groups'}
+          className="inkstone-icon-button"
+          disabled={props.visibleGroupPaths.length === 0}
+          onClick={() => {
+            const collapsedGroups = new Set(state.collapsedGroups.value);
+            for (const filePath of props.visibleGroupPaths) {
+              if (allGroupsCollapsed) collapsedGroups.delete(filePath);
+              else collapsedGroups.add(filePath);
+            }
+            state.collapsedGroups.value = collapsedGroups;
+            state.scrollOffset.value = 0;
+            onRenderNow();
+          }}
+          title={allGroupsCollapsed ? 'Expand all groups' : 'Collapse all groups'}
+          type="button"
+        >
+          <ObsidianIcon icon={allGroupsCollapsed ? 'unfold-vertical' : 'fold-vertical'} />
         </button>
       </div>
       <VaultFilterMenu dismissible={dismissible} facets={facets} {...props} />
@@ -491,6 +505,7 @@ function FilterSelect({
 
 function FilterChips({ index, onRenderNow, state }: VaultAnnotationSidebarAppProps) {
   const chips = filterChips(state.filters.value, index.facets());
+  if (chips.length === 0) return null;
   return (
     <div className="inkstone-vault-filter-chips">
       {chips.map((chip) => (
@@ -538,7 +553,7 @@ function VaultGroupHeader({
       aria-expanded={expanded}
       className="inkstone-vault-group-header"
       data-note-group={filePath}
-      style={{ height: `${VAULT_GROUP_HEIGHT}px` }}
+      style={{ height: `${VAULT_GROUP_HEADER_HEIGHT}px` }}
     >
       <button
         aria-expanded={expanded}
@@ -610,11 +625,9 @@ function VaultAnnotationRow(
     readonly entry: AnnotationIndexEntry;
   },
 ) {
-  const { document, entry, onEdit, onExport, onOpen, onRenderNow, state } = props;
-  const dismissible = useDismissibleMenu(document);
+  const { entry, onEdit, onExport, onOpen, onRenderNow, state } = props;
   const model = mapVaultAnnotation(entry);
   const selected = state.selectedKeys.value.has(vaultEntryKey(entry));
-  const metadata = model.metadata;
   const toggleSelection = (): void => {
     const key = vaultEntryKey(entry);
     const keys = new Set(state.selectedKeys.value);
@@ -623,164 +636,59 @@ function VaultAnnotationRow(
     state.selectedKeys.value = keys;
     onRenderNow();
   };
-  return (
-    <div
-      aria-selected={state.bulkSelectionMode.value ? selected : undefined}
-      className="inkstone-vault-row"
-      data-inkstone-bulk-selection={state.bulkSelectionMode.value ? 'true' : 'false'}
-      data-inkstone-entry-status={entry.conflict ? 'conflict' : entry.status}
-      data-inkstone-entry-type={entry.type}
-      data-note-group={entry.filePath}
-      onClick={state.bulkSelectionMode.value ? toggleSelection : undefined}
-      onKeyDown={
-        state.bulkSelectionMode.value
-          ? (event) => {
-              if (event.key !== 'Enter' && event.key !== ' ') return;
-              event.preventDefault();
-              toggleSelection();
-            }
-          : undefined
-      }
-      style={{ height: `${VAULT_ROW_CARD_HEIGHT}px` }}
-      tabIndex={state.bulkSelectionMode.value ? 0 : undefined}
-    >
-      <ObsidianIcon
-        className="inkstone-vault-row__type-icon"
-        icon={model.leading.kind === 'icon' ? model.leading.icon : 'waves'}
-      />
-      <button
-        className="inkstone-sidebar-row__summary"
-        data-annotation-id={entry.id}
-        onClick={
-          state.bulkSelectionMode.value ? undefined : (event) => onOpen(entry, event.currentTarget)
-        }
-        tabIndex={state.bulkSelectionMode.value ? -1 : undefined}
-        type="button"
-      >
-        <span className="inkstone-vault-row__quote" title={model.title}>
-          {model.title}
-        </span>
-        <span
-          className="inkstone-vault-row__metadata"
-          title={metadata.map((token) => token.label).join(' · ')}
-        >
-          {metadata.map((token, index) => (
-            <span
-              className={
-                token.tone === 'warning' ? 'inkstone-vault-row__metadata--warning' : undefined
-              }
-              key={`${token.kind}:${token.label}:${index}`}
-            >
-              {token.label}
-            </span>
-          ))}
-        </span>
-      </button>
-      {state.bulkSelectionMode.value ? (
-        <input
-          aria-label={`Select annotation ${entry.id}`}
-          checked={selected}
-          onClick={(event) => {
-            event.stopPropagation();
-            toggleSelection();
-          }}
-          type="checkbox"
-        />
-      ) : (
-        <>
-          <button
-            aria-expanded="false"
-            aria-haspopup="menu"
-            aria-label={`Open actions for ${entry.quote}`}
-            className="inkstone-icon-button"
-            data-inkstone-vault-actions={entry.id}
-            onClick={(event) => {
-              if (dismissible.controller.current?.toggle() !== true) return;
-              const viewportRect = event.currentTarget
-                .closest('.inkstone-vault-virtual-list')
-                ?.getBoundingClientRect();
-              const triggerRect = event.currentTarget.getBoundingClientRect();
-              dismissible.menu.current?.classList.toggle(
-                'inkstone-vault-row__menu--upward',
-                viewportRect !== undefined &&
-                  viewportRect.bottom - triggerRect.bottom < 132 &&
-                  triggerRect.top - viewportRect.top > 132,
-              );
-              dismissible.menu.current?.querySelector<HTMLButtonElement>('button')?.focus();
-            }}
-            ref={dismissible.trigger}
-            type="button"
-          >
-            <ObsidianIcon icon="ellipsis" />
-          </button>
-          <div
-            className="inkstone-vault-row__menu"
-            data-inkstone-vault-menu={entry.id}
-            hidden
-            ref={dismissible.menu}
-            role="menu"
-          >
-            <VaultMenuButton
-              icon="external-link"
-              label={`Open source for ${entry.quote}`}
-              onClick={() => {
-                dismissible.controller.current?.close();
-                if (dismissible.trigger.current !== null)
-                  onOpen(entry, dismissible.trigger.current);
-              }}
-              text="Open source"
-            />
-            {onEdit === undefined ? null : (
-              <VaultMenuButton
-                icon="square-pen"
-                label={`Edit ${entry.quote}`}
-                onClick={() => {
-                  dismissible.controller.current?.close();
-                  if (dismissible.trigger.current !== null)
-                    onEdit(entry, dismissible.trigger.current);
-                }}
-                text="Edit"
-              />
-            )}
-            <VaultMenuButton
-              icon="share"
-              label={`Export ${entry.quote}`}
-              onClick={() => {
-                dismissible.controller.current?.close();
-                if (dismissible.trigger.current !== null)
-                  onExport([entry], dismissible.trigger.current);
-              }}
-              text="Export"
-            />
-          </div>
-        </>
-      )}
-    </div>
+  const actions = (
+    <EllipsisMenuTrigger
+      className="inkstone-icon-button inkstone-list-item__action-trigger"
+      dataAttributes={{ 'data-inkstone-vault-actions': entry.id }}
+      items={(trigger) => [
+        {
+          icon: 'external-link',
+          id: 'open-source',
+          onSelect: () => onOpen(entry, trigger),
+          title: 'Open source',
+        },
+        ...(onEdit === undefined
+          ? []
+          : [
+              {
+                icon: 'square-pen',
+                id: 'edit',
+                onSelect: () => onEdit(entry, trigger),
+                title: 'Edit',
+              },
+            ]),
+        {
+          icon: 'share',
+          id: 'export',
+          onSelect: () => onExport([entry], trigger),
+          title: 'Export',
+        },
+      ]}
+      label={`Open actions for ${entry.quote}`}
+    />
   );
-}
-
-function VaultMenuButton({
-  icon,
-  label,
-  onClick,
-  text,
-}: {
-  readonly icon: string;
-  readonly label: string;
-  readonly onClick: () => void;
-  readonly text: string;
-}) {
   return (
-    <button
-      aria-label={label}
-      className="inkstone-icon-button"
-      onClick={onClick}
-      role="menuitem"
-      type="button"
-    >
-      <ObsidianIcon icon={icon} />
-      <span className="inkstone-icon-button__label">{text}</span>
-    </button>
+    <ListItemFrame
+      actions={actions}
+      model={model}
+      onActivate={(button) => onOpen(entry, button)}
+      presentation={{
+        context: 'vault',
+        filePath: entry.filePath,
+        fixedHeight: VAULT_ROW_CARD_HEIGHT,
+        showSecondary: false,
+        status: entry.conflict ? 'conflict' : entry.status,
+      }}
+      {...(state.bulkSelectionMode.value
+        ? {
+            selection: {
+              label: `Select annotation ${entry.id}`,
+              onToggle: toggleSelection,
+              selected,
+            },
+          }
+        : {})}
+    />
   );
 }
 
@@ -1053,7 +961,7 @@ function flattenResult(
 }
 
 function virtualItemHeight(item: VaultVirtualItem): number {
-  return item.kind === 'group' ? VAULT_GROUP_HEIGHT : VAULT_ROW_HEIGHT;
+  return item.kind === 'group' ? VAULT_GROUP_ITEM_HEIGHT : VAULT_ROW_HEIGHT;
 }
 
 function virtualItemKey(item: VaultVirtualItem): string {

@@ -51,6 +51,8 @@ export class CurrentFileSidebar {
   private readonly onExportInkReport: () => void;
   private readonly onExportInkSvg: (surfaceId: string) => void;
   private readonly onInspect: (annotationId: string, invoker: HTMLElement) => void;
+  private readonly onRepairAnnotation:
+    ((annotationId: string, invoker: HTMLElement) => void) | undefined;
   private readonly onRetry: () => void;
   private readonly onReviewConflicts: (invoker: HTMLElement) => void;
   private readonly onRestoreAnnotation: (annotationId: string, expectedRevision: number) => void;
@@ -83,6 +85,7 @@ export class CurrentFileSidebar {
     ) => Promise<void>;
     readonly onDeleteAnnotation?: (annotationId: string) => void;
     readonly onInspect?: (annotationId: string, invoker: HTMLElement) => void;
+    readonly onRepairAnnotation?: (annotationId: string, invoker: HTMLElement) => void;
     readonly onDeleteInk?: (surfaceId: string) => void;
     readonly onEditInk?: (surfaceId: string) => void;
     readonly onExportInkPng?: (surfaceId: string) => void;
@@ -117,6 +120,7 @@ export class CurrentFileSidebar {
     this.onExportInkReport = input.onExportInkReport ?? (() => undefined);
     this.onExportInkSvg = input.onExportInkSvg ?? (() => undefined);
     this.onInspect = input.onInspect ?? (() => undefined);
+    this.onRepairAnnotation = input.onRepairAnnotation;
     this.onRetry = input.onRetry ?? (() => undefined);
     this.onReviewConflicts = input.onReviewConflicts ?? (() => undefined);
     this.onRestoreAnnotation = input.onRestoreAnnotation ?? (() => undefined);
@@ -198,6 +202,9 @@ export class CurrentFileSidebar {
       onExportInkReport: this.onExportInkReport,
       onExportInkSvg: this.onExportInkSvg,
       onInspect: this.onInspect,
+      ...(this.onRepairAnnotation === undefined
+        ? {}
+        : { onRepairAnnotation: this.onRepairAnnotation }),
       onRetry: this.onRetry,
       onReviewConflicts: this.onReviewConflicts,
       onRestoreAnnotation: this.onRestoreAnnotation,

@@ -329,11 +329,21 @@ describe('annotation inspector', () => {
     await vi.waitFor(() => expect(document.activeElement).toBe(invoker));
   });
 
-  it('previews replacement context before confirming an unanchored repair', async () => {
+  it('previews only the selected replacement before confirming an unanchored repair', async () => {
     const item: TextAnnotationRecord = {
       ...record('repair-me', 'Old lost quote'),
       anchorFailure: { candidateCount: 0, reason: 'not-found' },
       status: 'unanchored',
+    };
+    const candidate = {
+      annotationId: 'repair-me',
+      baseRevision: 1,
+      contextPreview: 'before New replacement after',
+      target: {
+        position: { end: 22, start: 7, unit: 'utf16-code-unit' as const },
+        quote: { exact: 'New replacement', prefix: 'before ', suffix: ' after' },
+        scope: {},
+      },
     };
     const confirmations: string[] = [];
     const inspector = new AnnotationInspector({
@@ -351,34 +361,30 @@ describe('annotation inspector', () => {
       },
       onDelete: (value) => Promise.resolve(value),
       onNavigate: () => undefined,
-      onPreviewReattach: () =>
-        Promise.resolve({
-          annotationId: 'repair-me',
-          baseRevision: 1,
-          contextPreview: 'before New replacement after',
-          target: {
-            position: { end: 22, start: 7, unit: 'utf16-code-unit' },
-            quote: { exact: 'New replacement', prefix: 'before ', suffix: ' after' },
-            scope: {},
-          },
-        }),
       onSave: (value) => Promise.resolve(value),
       onUndo: (value) => Promise.resolve(value),
       presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
       writeClipboard: () => Promise.resolve(),
     });
-    inspector.show({ anchorRect: new DOMRect(), records: [item] });
+    inspector.showReattachmentPreview({
+      anchorRect: new DOMRect(),
+      candidate,
+      record: item,
+    });
 
-    document.querySelector<HTMLButtonElement>('button[aria-label="Preview reattachment"]')?.click();
-    await vi.waitFor(() =>
-      expect(document.querySelector('[data-inkstone-reattachment-preview]')).not.toBeNull(),
-    );
-    expect(document.querySelector('[data-inkstone-reattachment-preview]')?.textContent).toContain(
-      'Old lost quote',
-    );
-    expect(document.querySelector('[data-inkstone-reattachment-preview]')?.textContent).toContain(
-      'before New replacement after',
-    );
+    expect(document.querySelector('[data-inkstone-reattachment-preview]')).not.toBeNull();
+    const preview = document.querySelector('[data-inkstone-reattachment-preview]');
+    expect(preview?.textContent).toContain('Repair annotation');
+    expect(preview?.textContent).toContain('Current target');
+    expect(preview?.textContent).toContain('Old lost quote');
+    expect(preview?.textContent).toContain('New target');
+    expect(preview?.textContent).toContain('New replacement');
+    expect(preview?.textContent).not.toContain('before New replacement after');
+    expect(preview?.textContent).not.toContain('Replacement:');
+    expect(
+      document.querySelector<HTMLButtonElement>('button[aria-label="Confirm reattachment"]')
+        ?.textContent,
+    ).toBe('Use selection');
     expect(confirmations).toEqual([]);
 
     document.querySelector<HTMLButtonElement>('button[aria-label="Confirm reattachment"]')?.click();
@@ -517,6 +523,9 @@ describe('annotation inspector', () => {
       },
     });
     inspector.show({ anchorRect: new DOMRect(), records: [item] });
+
+    expect(document.querySelector('button[aria-label="Preview reattachment"]')).toBeNull();
+    expect(document.querySelector('.inkstone-annotation-inspector__repair')).toBeNull();
 
     setValue(
       document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Note"]'),

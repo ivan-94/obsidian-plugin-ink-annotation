@@ -82,6 +82,50 @@ describe('Reading View integration', () => {
     expect(reloadedRoot.querySelector('.inkstone-text-highlight')).toBeNull();
   });
 
+  it('restores one source span across ordinary presentation markers', async () => {
+    const source =
+      'This paragraph contains **bold text**, _italic text_, ==highlighted text==, and ~~struck text~~.';
+    const rendered =
+      'This paragraph contains bold text, italic text, highlighted text, and struck text.';
+    const store = new MemoryTextFileStore();
+    const service = new AnnotationService({
+      createId: (() => {
+        const ids = ['note-formatted', 'annotation-formatted'];
+        return () => ids.shift() ?? 'unexpected-id';
+      })(),
+      repository: new SidecarRepository(store),
+    });
+    await service.createHighlight({
+      filePath: 'Formatted restore.md',
+      selection: {
+        displayText: rendered,
+        end: source.length,
+        scope: { sectionEndLine: 0, sectionStartLine: 0 },
+        start: 0,
+      },
+      source,
+      styleId: 'highlight-sun',
+    });
+    const root = document.createElement('section');
+    root.innerHTML =
+      '<p>This paragraph contains <strong>bold text</strong>, <em>italic text</em>, <mark>highlighted text</mark>, and <del>struck text</del>.</p>';
+    const integration = new ReadingViewIntegration({ document, service });
+
+    await integration.mountSection({
+      filePath: 'Formatted restore.md',
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: source }),
+      root,
+    });
+
+    expect(
+      [...root.querySelectorAll<HTMLElement>('.inkstone-text-highlight')]
+        .map((element) => element.textContent)
+        .join(''),
+    ).toBe(rendered);
+    integration.dispose();
+  });
+
   it('releases rendered sections that Obsidian virtualizes out of the DOM', async () => {
     vi.useFakeTimers();
     try {

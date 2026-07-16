@@ -1,4 +1,4 @@
-import type { TextAnnotationRecord } from '../domain/text-annotation';
+import { annotationTargetText, type TextAnnotationRecord } from '../domain/text-annotation';
 
 export type TextAnnotationExportFormat =
   'html-mark' | 'markdown-footnote' | 'markdown-highlight' | 'markdown-report';
@@ -148,24 +148,22 @@ function renderItem(
 
 function renderHighlightItem(item: TextAnnotationExportItem): string {
   const { record } = item;
+  const quote = annotationTargetText(record.target);
   const kind = record.mark?.kind;
   let materialized: string;
-  if (
-    kind === 'highlight' &&
-    !record.target.quote.exact.includes('\n') &&
-    !record.target.quote.exact.includes('==')
-  ) {
-    materialized = `==${escapeMarkdownInline(record.target.quote.exact)}==`;
+  if (kind === 'highlight' && !quote.includes('\n') && !quote.includes('==')) {
+    materialized = `==${escapeMarkdownInline(quote)}==`;
   } else if (kind === 'underline') {
-    materialized = `${quoteBlock(record.target.quote.exact)}\n\n_Underline is preserved as metadata; plain Markdown has no portable underline syntax._`;
+    materialized = `${quoteBlock(quote)}\n\n_Underline is preserved as metadata; plain Markdown has no portable underline syntax._`;
   } else {
-    materialized = `${quoteBlock(record.target.quote.exact)}\n\n_Note-only annotation._`;
+    materialized = `${quoteBlock(quote)}\n\n_Note-only annotation._`;
   }
   return `${materialized}\n\n${markdownMetadata(item)}${markdownNote(record)}---\n\n`;
 }
 
 function renderFootnoteItem(item: TextAnnotationExportItem, index: number): string {
   const id = `inkstone-${index}`;
+  const quote = annotationTargetText(item.record.target);
   const definition = [
     annotationLabel(item),
     `source ${item.record.filePath}`,
@@ -181,13 +179,13 @@ function renderFootnoteItem(item: TextAnnotationExportItem, index: number): stri
       ? ''
       : `anchor failure ${item.record.anchorFailure.reason} (${item.record.anchorFailure.candidateCount} candidates)`,
   ].filter((part) => part.length > 0);
-  return `${quoteBlock(`${item.record.target.quote.exact}[^${id}]`)}\n\n[^${id}]: ${escapeMarkdownInline(definition.join(' · '))}\n\n`;
+  return `${quoteBlock(`${quote}[^${id}]`)}\n\n[^${id}]: ${escapeMarkdownInline(definition.join(' · '))}\n\n`;
 }
 
 function renderReportItem(item: TextAnnotationExportItem, index: number): string {
   const { record } = item;
   let output = `### ${index}. ${escapeMarkdownInline(annotationLabel(item))}\n\n`;
-  output += `${quoteBlock(record.target.quote.exact)}\n\n`;
+  output += `${quoteBlock(annotationTargetText(record.target))}\n\n`;
   output += markdownMetadata(item);
   output += markdownNote(record);
   return `${output}\n`;
@@ -196,7 +194,7 @@ function renderReportItem(item: TextAnnotationExportItem, index: number): string
 function renderHtmlItem(item: TextAnnotationExportItem): string {
   const { record } = item;
   const kind = record.mark?.kind ?? 'note';
-  const quote = escapeHtml(record.target.quote.exact).replaceAll('\n', '<br>');
+  const quote = escapeHtml(annotationTargetText(record.target)).replaceAll('\n', '<br>');
   const materialized =
     kind === 'highlight'
       ? `<mark>${quote}</mark>`

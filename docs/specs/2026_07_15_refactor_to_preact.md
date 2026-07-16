@@ -1,3 +1,5 @@
+# Inkstone UI Architecture Refactor: Preact + Signals
+
 结论：采用 **Preact + `@preact/signals` 的渐进式 UI
 Island 重构**。不重写 Domain、Application、Storage、Canvas、CodeMirror 和 Reading
 View；只重构 UI 层及其状态管理。
@@ -828,5 +830,40 @@ Store 和 View 必须在 Sidebar 真正打开后创建。[Obsidian 插件加载�
 - 最新 production bundle 仍为单一 `main.js` + `styles.css`；`styles.css`
   以 tokens、base/primitives、features 分区，Canvas 高频路径仍不进入 Preact/Signals。
 
-建议下一步是把这套内容追加到现有 Execution Plan，作为
-`R0–R9 UI Architecture Refactor`，然后先执行 R0 和 R1。
+R0–R9 的实现状态已回写到
+[`2026-07-14-obsidian-annotation-plugin-execution-plan.md`](2026-07-14-obsidian-annotation-plugin-execution-plan.md)；后续工作以该总执行计划和 R09
+HAT 为准，不再重复启动 R0/R1。
+
+## Source Manifest
+
+### Sources
+
+- `docs/specs/2026-07-14-obsidian-annotation-plugin-design.md`
+- `docs/specs/2026-07-14-obsidian-annotation-plugin-execution-plan.md`, especially S15.
+- `docs/delivery/slices/R00-preact-baseline/` through `docs/delivery/slices/R09-preact-release/`.
+- User instruction in the current Codex task on 2026-07-15 to keep all plugin plans and
+  specifications under `docs/specs/`.
+
+### Produced artifacts
+
+- `docs/specs/2026_07_15_refactor_to_preact.md`
+- Preact UI implementation and R00–R09 evidence referenced above.
+- `hats/20260715-preact-ui-architecture-refactor/`
+
+### Key decisions
+
+- Use Preact + Signals for UI islands only; Canvas, Domain, Application, Storage, CodeMirror, and
+  Reading View hot paths remain outside reactive rendering.
+- Preserve one UI implementation after each migration Slice rather than keeping a permanent dual
+  path.
+- Treat product-owner native visual acceptance as separate from automated completion.
+
+### Verification evidence
+
+- See `docs/delivery/slices/R09-preact-release/source-manifest.md` and `native-runtime-report.md`
+  for the latest automated and native evidence.
+
+### Open questions / risks
+
+- Product-owner visual acceptance, pop-out window observation, and the remaining R09 HAT items stay
+  open in the master execution plan.

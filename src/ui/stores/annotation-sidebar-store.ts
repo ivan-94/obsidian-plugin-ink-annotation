@@ -20,8 +20,8 @@ export interface CurrentFileSidebarStore {
   readonly filePath: Signal<string | null>;
   readonly inkSummaries: Signal<readonly InkSurfaceSummary[]>;
   readonly model: Signal<CurrentFileAnnotationList>;
+  readonly pendingInkDelete: Signal<{ readonly id: string; readonly title: string } | null>;
   readonly restoreDeadline: Signal<number | null>;
-  readonly searchVisible: Signal<boolean>;
   readonly scrollOffset: Signal<number>;
   readonly searchQuery: Signal<string>;
   readonly selectedKeys: Signal<ReadonlySet<string>>;
@@ -43,8 +43,8 @@ export function createCurrentFileSidebarStore(): CurrentFileSidebarStore {
     filePath: signal(null),
     inkSummaries: signal([]),
     model: signal({ groups: [], total: 0 }),
+    pendingInkDelete: signal(null),
     restoreDeadline: signal(null),
-    searchVisible: signal(false),
     scrollOffset: signal(0),
     searchQuery: signal(''),
     selectedKeys: signal(new Set()),

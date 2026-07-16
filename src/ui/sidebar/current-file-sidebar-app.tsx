@@ -6,6 +6,7 @@ import {
   mapCurrentTextAnnotation,
 } from '../models/annotation-list-item-model';
 import { EmptyState } from '../primitives/empty-state';
+import { EllipsisMenuTrigger } from '../primitives/ellipsis-menu-trigger';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
 import { StatusBanner } from '../primitives/status-banner';
 import type { CurrentFileSidebarStore } from '../stores/annotation-sidebar-store';
@@ -17,7 +18,6 @@ import type { CurrentBulkOutcome, CurrentBulkSelectionEntry } from './current-bu
 import { InkAnnotationListItem } from './ink-annotation-list-item';
 import { SelectionModeHeaderActions } from './selection-mode-header-actions';
 import { TextAnnotationListItem } from './text-annotation-list-item';
-import { useDismissibleMenu } from './use-dismissible-menu';
 import type { SelectOption } from './vault-sidebar-types';
 
 export interface CurrentFileSidebarAppProps {
@@ -48,6 +48,7 @@ export interface CurrentFileSidebarAppProps {
   readonly onExportInkReport: () => void;
   readonly onExportInkSvg: (surfaceId: string) => void;
   readonly onInspect: (annotationId: string, invoker: HTMLElement) => void;
+  readonly onRepairAnnotation?: (annotationId: string, invoker: HTMLElement) => void;
   readonly onRetry: () => void;
   readonly onReviewConflicts: (invoker: HTMLElement) => void;
   readonly onRestoreAnnotation: (annotationId: string, expectedRevision: number) => void;
@@ -163,6 +164,7 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
           health={state.storageHealth.value}
           onReviewConflicts={props.onReviewConflicts}
         />
+        <SearchField state={state} />
         {total === 0 ? (
           <div className="inkstone-sidebar__empty">
             <EmptyState
@@ -173,7 +175,6 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
           </div>
         ) : (
           <>
-            <SearchField state={state} />
             {inkSummaries.length === 0 ? null : (
               <section
                 className="inkstone-sidebar-group inkstone-sidebar-group--ink"
@@ -186,9 +187,10 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
                   return (
                     <div hidden={!matches(inkSearchText(summary))} key={model.key}>
                       <InkAnnotationListItem
-                        document={props.document}
                         model={model}
-                        onDelete={() => props.onDeleteInk(summary.id)}
+                        onDeleteRequest={() => {
+                          state.pendingInkDelete.value = { id: summary.id, title: model.title };
+                        }}
                         onEdit={() => props.onEditInk(summary.id)}
                         onExportPng={() => props.onExportInkPng(summary.id)}
                         onExportSvg={() => props.onExportInkSvg(summary.id)}
@@ -229,10 +231,15 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
                     return (
                       <div hidden={!matches(textSearchText(row))} key={model.key}>
                         <TextAnnotationListItem
-                          document={props.document}
                           model={model}
                           onDelete={() => props.onDeleteAnnotation(row.id)}
                           onInspect={(invoker) => props.onInspect(row.id, invoker)}
+                          {...(props.onRepairAnnotation === undefined
+                            ? {}
+                            : {
+                                onRepair: (invoker: HTMLElement) =>
+                                  props.onRepairAnnotation?.(row.id, invoker),
+                              })}
                           onRestore={() => props.onRestoreAnnotation(row.id, row.revision)}
                           onSelect={() => {
                             state.activeAnnotationId.value = row.id;
@@ -260,7 +267,34 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
         <CurrentBulkActionDock entries={selectedEntries} {...props} />
       ) : null}
       <CurrentBulkDialog entries={selectedEntries} {...props} />
+      <InkDeleteDialog {...props} />
     </>
+  );
+}
+
+function InkDeleteDialog({ onDeleteInk, state }: CurrentFileSidebarAppProps) {
+  const pending = state.pendingInkDelete.value;
+  if (pending === null) return null;
+  const close = (): void => {
+    state.pendingInkDelete.value = null;
+  };
+  return (
+    <BulkActionDialog
+      ariaLabel="Confirm Ink deletion"
+      confirmAriaLabel="Confirm delete Ink surface"
+      confirmLabel="Delete"
+      danger
+      description="This deletes the entire Ink surface. You can restore it briefly afterward."
+      feedback={null}
+      icon="trash-2"
+      onCancel={close}
+      onConfirm={() => {
+        close();
+        onDeleteInk(pending.id);
+      }}
+      pending={false}
+      title={`Delete ${pending.title}?`}
+    />
   );
 }
 
@@ -427,7 +461,6 @@ function CurrentHeader({
   readonly showScope: boolean;
   readonly state: CurrentFileSidebarStore;
 }) {
-  const dismissible = useDismissibleMenu(document);
   const actions = state.selectionMode.value ? (
     <SelectionModeHeaderActions
       onDeselectAll={() => {
@@ -455,24 +488,6 @@ function CurrentHeader({
           Sync status unavailable
         </span>
         <button
-          aria-label="Search current file annotations"
-          aria-pressed={state.searchVisible.value}
-          className="inkstone-icon-button"
-          disabled={annotationCount === 0}
-          onClick={() => {
-            state.searchVisible.value = !state.searchVisible.value;
-            if (state.searchVisible.value)
-              document
-                .querySelector<HTMLInputElement>(
-                  'input[aria-label="Search current file annotations"]',
-                )
-                ?.focus({ preventScroll: true });
-          }}
-          type="button"
-        >
-          <ObsidianIcon icon="search" />
-        </button>
-        <button
           aria-label="Refresh annotations"
           className="inkstone-icon-button"
           onClick={onRetry}
@@ -480,62 +495,38 @@ function CurrentHeader({
         >
           <ObsidianIcon icon="refresh-cw" />
         </button>
-        <button
-          aria-expanded="false"
-          aria-haspopup="menu"
-          aria-label="More actions"
-          className="inkstone-icon-button"
-          onClick={() => dismissible.controller.current?.toggle()}
-          ref={dismissible.trigger}
-          type="button"
-        >
-          <ObsidianIcon icon="ellipsis" />
-        </button>
-      </div>
-      <div className="inkstone-sidebar__overflow-menu" hidden ref={dismissible.menu} role="menu">
-        <button
-          aria-label="Enter selection mode"
-          className="inkstone-icon-button"
-          disabled={annotationCount === 0}
-          onClick={() => {
-            dismissible.controller.current?.close();
-            state.selectionMode.value = true;
-            state.selectedKeys.value = new Set();
-          }}
-          role="menuitem"
-          type="button"
-        >
-          <ObsidianIcon icon="list-checks" />
-          <span className="inkstone-icon-button__label">Select multiple…</span>
-        </button>
-        <button
-          aria-label="Export current file annotations"
-          className="inkstone-icon-button"
-          disabled={annotationCount === 0}
-          onClick={(event) => {
-            dismissible.controller.current?.close();
-            onExportCurrentFile(event.currentTarget);
-          }}
-          role="menuitem"
-          type="button"
-        >
-          <ObsidianIcon icon="share" />
-          <span className="inkstone-icon-button__label">Export current file…</span>
-        </button>
-        <button
-          aria-label="Export current file Ink report"
-          className="inkstone-icon-button"
-          disabled={annotationCount === 0}
-          onClick={() => {
-            dismissible.controller.current?.close();
-            onExportInkReport();
-          }}
-          role="menuitem"
-          type="button"
-        >
-          <ObsidianIcon icon="file-down" />
-          <span className="inkstone-icon-button__label">Export Ink report…</span>
-        </button>
+        <EllipsisMenuTrigger
+          items={(trigger) => [
+            {
+              disabled: annotationCount === 0,
+              icon: 'list-checks',
+              id: 'select-multiple',
+              onSelect: () => {
+                state.selectionMode.value = true;
+                state.selectedKeys.value = new Set();
+              },
+              section: 'selection',
+              title: 'Select multiple…',
+            },
+            {
+              disabled: annotationCount === 0,
+              icon: 'share',
+              id: 'export-current-file',
+              onSelect: () => onExportCurrentFile(trigger),
+              section: 'export',
+              title: 'Export current file…',
+            },
+            {
+              disabled: annotationCount === 0,
+              icon: 'file-down',
+              id: 'export-ink-report',
+              onSelect: onExportInkReport,
+              section: 'export',
+              title: 'Export Ink report…',
+            },
+          ]}
+          label="More actions"
+        />
       </div>
     </>
   );
@@ -543,11 +534,18 @@ function CurrentHeader({
   return (
     <header className="inkstone-sidebar__header">
       <div aria-label="Annotation scope" className="inkstone-sidebar__scope" role="tablist">
-        <button aria-pressed="true" aria-selected="true" role="tab" type="button">
-          Current file
+        <button
+          aria-label="Current file"
+          aria-pressed="true"
+          aria-selected="true"
+          role="tab"
+          type="button"
+        >
+          <ObsidianIcon className="inkstone-sidebar__scope-icon" icon="file-text" />
+          <span className="inkstone-sidebar__scope-label">Current file</span>
         </button>
         <button
-          aria-label="Show Entire Vault"
+          aria-label="Entire Vault"
           aria-pressed="false"
           aria-selected="false"
           onClick={() => {
@@ -562,7 +560,8 @@ function CurrentHeader({
           role="tab"
           type="button"
         >
-          Entire Vault
+          <ObsidianIcon className="inkstone-sidebar__scope-icon" icon="library" />
+          <span className="inkstone-sidebar__scope-label">Entire Vault</span>
         </button>
       </div>
       {actions}
@@ -571,12 +570,8 @@ function CurrentHeader({
 }
 
 function SearchField({ state }: { readonly state: CurrentFileSidebarStore }) {
-  const input = useRef<HTMLInputElement>(null);
   return (
-    <label
-      className="inkstone-sidebar__search"
-      hidden={!state.searchVisible.value && state.searchQuery.value.length === 0}
-    >
+    <label className="inkstone-sidebar__search">
       <ObsidianIcon icon="search" />
       <input
         aria-label="Search current file annotations"
@@ -585,7 +580,6 @@ function SearchField({ state }: { readonly state: CurrentFileSidebarStore }) {
           state.searchQuery.value = event.currentTarget.value;
         }}
         placeholder="Search annotations"
-        ref={input}
         type="search"
         value={state.searchQuery.value}
       />

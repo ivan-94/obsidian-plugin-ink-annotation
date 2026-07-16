@@ -21,6 +21,16 @@ describe('current-file sidebar', () => {
     expect(container.textContent).toContain('No annotations yet');
     expect(container.textContent).toContain('Select text in Reading View or start Ink Mode.');
     expect(container.querySelector('[data-inkstone-annotation-row]')).toBeNull();
+    expect(
+      container.querySelector<HTMLInputElement>(
+        'input[aria-label="Search current file annotations"]',
+      ),
+    ).not.toBeNull();
+    expect(
+      container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Search current file annotations"]',
+      ),
+    ).toBeNull();
   });
 
   it('renders compact heading/problem groups and marks only the active row', () => {
@@ -61,18 +71,16 @@ describe('current-file sidebar', () => {
     const actions = row?.parentElement?.querySelector<HTMLButtonElement>(
       '[data-inkstone-annotation-actions="active-1"]',
     );
-    const actionMenu = row?.parentElement?.querySelector<HTMLElement>(
-      '[data-inkstone-annotation-menu="active-1"]',
-    );
     expect(actions?.getAttribute('aria-expanded')).toBe('false');
-    expect(actionMenu?.hidden).toBe(true);
     actions?.click();
     expect(actions?.getAttribute('aria-expanded')).toBe('true');
-    actionMenu?.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Escape' }));
+    document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Escape' }));
     expect(actions?.getAttribute('aria-expanded')).toBe('false');
-    expect(actionMenu?.hidden).toBe(true);
+    expect(document.body.querySelector('[data-obsidian-test-menu]')).toBeNull();
     actions?.click();
-    row?.parentElement?.querySelector<HTMLButtonElement>('[aria-label="Edit annotation"]')?.click();
+    document.body
+      .querySelector<HTMLButtonElement>('[data-obsidian-test-menu] button[aria-label="Edit"]')
+      ?.click();
     expect(inspected).toEqual(['active-1']);
     expect(
       container.querySelector('[data-annotation-id="problem-1"]')?.hasAttribute('aria-current'),
@@ -84,6 +92,70 @@ describe('current-file sidebar', () => {
     ).toBe(false);
   });
 
+  it('opens text annotation actions in the owner-document menu layer', () => {
+    const inspected: string[] = [];
+    const container = document.createElement('div');
+    document.body.append(container);
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onInspect: (id, invoker) =>
+        inspected.push(`${id}:${invoker.dataset.inkstoneAnnotationActions}`),
+      onSelect: () => undefined,
+    });
+    sidebar.render(fixture());
+
+    container
+      .querySelector<HTMLButtonElement>('[data-inkstone-annotation-actions="active-1"]')
+      ?.click();
+
+    expect(container.querySelector('[data-obsidian-test-menu]')).toBeNull();
+    const menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    expect(menu).not.toBeNull();
+    menu?.querySelector<HTMLButtonElement>('button[aria-label="Edit"]')?.click();
+    expect(inspected).toEqual(['active-1:active-1']);
+  });
+
+  it('requests Ink deletion from the global menu and deletes only after confirmation', async () => {
+    const deleted: string[] = [];
+    const container = document.createElement('div');
+    document.body.append(container);
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onDeleteInk: (id) => deleted.push(id),
+      onSelect: () => undefined,
+    });
+    sidebar.render({ groups: [], total: 0 }, undefined, [inkSummary()]);
+
+    container.querySelector<HTMLButtonElement>('[data-inkstone-ink-actions="surface-1"]')?.click();
+    document.body
+      .querySelector<HTMLButtonElement>(
+        '[data-obsidian-test-menu] button[aria-label="Delete Ink surface…"]',
+      )
+      ?.click();
+
+    expect(deleted).toEqual([]);
+    await vi.waitFor(() => {
+      expect(container.querySelector('[aria-label="Confirm Ink deletion"]')).not.toBeNull();
+    });
+    let dialog = container.querySelector<HTMLElement>('[aria-label="Confirm Ink deletion"]');
+    dialog?.querySelector<HTMLButtonElement>('button:not([aria-label])')?.click();
+    expect(deleted).toEqual([]);
+    container.querySelector<HTMLButtonElement>('[data-inkstone-ink-actions="surface-1"]')?.click();
+    document.body
+      .querySelector<HTMLButtonElement>(
+        '[data-obsidian-test-menu] button[aria-label="Delete Ink surface…"]',
+      )
+      ?.click();
+    await vi.waitFor(() => {
+      expect(container.querySelector('[aria-label="Confirm Ink deletion"]')).not.toBeNull();
+    });
+    dialog = container.querySelector<HTMLElement>('[aria-label="Confirm Ink deletion"]');
+    dialog?.querySelector<HTMLButtonElement>('[aria-label="Confirm delete Ink surface"]')?.click();
+    expect(deleted).toEqual(['surface-1']);
+  });
+
   it('keeps Current file menus exclusive and dismisses them outside', () => {
     const container = document.createElement('div');
     document.body.append(container);
@@ -92,22 +164,52 @@ describe('current-file sidebar', () => {
     const inkToggle = container.querySelector<HTMLButtonElement>(
       '[data-inkstone-ink-actions="surface-1"]',
     );
-    const inkMenu = container.querySelector<HTMLElement>('[data-inkstone-ink-menu="surface-1"]');
     const annotationToggle = container.querySelector<HTMLButtonElement>(
       '[data-inkstone-annotation-actions="active-1"]',
     );
-    const annotationMenu = container.querySelector<HTMLElement>(
-      '[data-inkstone-annotation-menu="active-1"]',
-    );
 
     inkToggle?.click();
-    expect(inkMenu?.hidden).toBe(false);
+    expect(document.body.querySelector('[data-obsidian-test-menu]')?.textContent).toContain(
+      'Export SVG',
+    );
     annotationToggle?.click();
-    expect(inkMenu?.hidden).toBe(true);
-    expect(annotationMenu?.hidden).toBe(false);
+    expect(inkToggle?.getAttribute('aria-expanded')).toBe('false');
+    expect(document.body.querySelector('[data-obsidian-test-menu]')?.textContent).toContain('Edit');
     document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-    expect(annotationMenu?.hidden).toBe(true);
+    expect(document.body.querySelector('[data-obsidian-test-menu]')).toBeNull();
     expect(annotationToggle?.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('offers repair directly from an unanchored row menu', () => {
+    const repairs: string[] = [];
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onRepairAnnotation: (id: string, invoker: HTMLElement) =>
+        repairs.push(`${id}:${invoker.dataset.inkstoneAnnotationActions}`),
+      onSelect: () => undefined,
+    });
+    sidebar.render(fixture());
+
+    container
+      .querySelector<HTMLButtonElement>('[data-inkstone-annotation-actions="active-1"]')
+      ?.click();
+    expect(
+      document.body.querySelector('[data-obsidian-test-menu] button[aria-label="Repair target"]'),
+    ).toBeNull();
+
+    container
+      .querySelector<HTMLButtonElement>('[data-inkstone-annotation-actions="problem-1"]')
+      ?.click();
+    const repair = document.body.querySelector<HTMLButtonElement>(
+      '[data-obsidian-test-menu] button[aria-label="Repair target"]',
+    );
+    expect(repair?.textContent).toContain('Repair target');
+    repair?.click();
+
+    expect(repairs).toEqual(['problem-1:problem-1']);
+    expect(document.body.querySelector('[data-obsidian-test-menu]')).toBeNull();
   });
 
   it('deletes a text annotation from its row menu and exposes a short Restore action', async () => {
@@ -128,9 +230,8 @@ describe('current-file sidebar', () => {
     container
       .querySelector<HTMLButtonElement>('[data-inkstone-annotation-actions="active-1"]')
       ?.click();
-    container
-      .querySelector<HTMLElement>('[data-inkstone-annotation-menu="active-1"]')
-      ?.querySelector<HTMLButtonElement>('[aria-label="Delete annotation"]')
+    document.body
+      .querySelector<HTMLButtonElement>('[data-obsidian-test-menu] button[aria-label="Delete"]')
       ?.click();
     expect(deleted).toEqual(['active-1']);
 
@@ -275,7 +376,7 @@ describe('current-file sidebar', () => {
     sidebar.render(fixture());
 
     expect(scopes).toEqual([]);
-    container.querySelector<HTMLButtonElement>('button[aria-label="Show Entire Vault"]')?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Entire Vault"]')?.click();
     expect(scopes).toEqual(['vault']);
   });
 
@@ -290,15 +391,12 @@ describe('current-file sidebar', () => {
     });
     sidebar.render(fixture(), undefined, [inkSummary()]);
 
-    container
-      .querySelector<HTMLButtonElement>('button[aria-label="Search current file annotations"]')
-      ?.click();
-    container.querySelector<HTMLButtonElement>('button[aria-label="More actions"]')?.click();
-    const enterSelection = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Enter selection mode"]',
-    );
-    expect(enterSelection).not.toBeNull();
-    enterSelection?.click();
+    expect(
+      container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Search current file annotations"]',
+      ),
+    ).toBeNull();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     await vi.waitFor(() =>
       expect(container.querySelector('button[aria-label="Done selecting"]')).not.toBeNull(),
     );
@@ -373,10 +471,7 @@ describe('current-file sidebar', () => {
     });
     sidebar.render(fixture(), undefined, [inkSummary()]);
 
-    container.querySelector<HTMLButtonElement>('button[aria-label="More actions"]')?.click();
-    container
-      .querySelector<HTMLButtonElement>('button[aria-label="Enter selection mode"]')
-      ?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     await vi.waitFor(() =>
       expect(container.querySelector('button[aria-label="Done selecting"]')).not.toBeNull(),
     );
@@ -424,7 +519,7 @@ describe('current-file sidebar', () => {
     });
     sidebar.render(fixture());
 
-    container.querySelector<HTMLButtonElement>('button[aria-label="Show Entire Vault"]')?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Entire Vault"]')?.click();
     await Promise.resolve();
     await Promise.resolve();
 
@@ -442,20 +537,24 @@ describe('current-file sidebar', () => {
     });
 
     sidebar.render(fixture());
-    container
-      .querySelector<HTMLButtonElement>('button[aria-label="Export current file annotations"]')
+    container.querySelector<HTMLButtonElement>('button[aria-label="More actions"]')?.click();
+    document.body
+      .querySelector<HTMLButtonElement>(
+        '[data-obsidian-test-menu] button[aria-label="Export current file…"]',
+      )
       ?.click();
     expect(exports).toEqual(['current-file']);
 
     sidebar.render({ groups: [], total: 0 });
+    container.querySelector<HTMLButtonElement>('button[aria-label="More actions"]')?.click();
     expect(
-      container.querySelector<HTMLButtonElement>(
-        'button[aria-label="Export current file annotations"]',
+      document.body.querySelector<HTMLButtonElement>(
+        '[data-obsidian-test-menu] button[aria-label="Export current file…"]',
       )?.disabled,
     ).toBe(true);
   });
 
-  it('renders Ink thumbnail metadata and routes locate/edit/delete/restore without loading vectors', () => {
+  it('renders Ink thumbnail metadata and routes locate/edit/delete/restore without loading vectors', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-14T12:01:03.000Z'));
     const actions: string[] = [];
@@ -483,42 +582,39 @@ describe('current-file sidebar', () => {
     const menuToggle = container.querySelector<HTMLButtonElement>(
       '[data-inkstone-ink-actions="surface-1"]',
     );
-    const menu = container.querySelector<HTMLElement>('[data-inkstone-ink-menu="surface-1"]');
     expect(menuToggle).not.toBeNull();
-    expect(menu?.hidden).toBe(true);
     expect(
       container.querySelectorAll('.inkstone-sidebar-ink-row__actions > .inkstone-icon-button'),
     ).toHaveLength(2);
     menuToggle?.click();
     expect(menuToggle?.getAttribute('aria-expanded')).toBe('true');
-    expect(menu?.hidden).toBe(false);
+    let menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
     expect(menu?.textContent).toContain('Edit');
     expect(menu?.textContent).toContain('Export SVG');
     expect(menu?.textContent).toContain('Export PNG');
-    expect(menu?.textContent).toContain('Delete');
-    container.querySelector<HTMLButtonElement>('[data-inkstone-ink-edit="surface-1"]')?.click();
+    expect(menu?.textContent).toContain('Delete Ink surface');
+    menu?.querySelector<HTMLButtonElement>('button[aria-label="Edit"]')?.click();
     menuToggle?.click();
-    container.querySelector<HTMLButtonElement>('[aria-label="Export Ink as SVG"]')?.click();
+    menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    menu?.querySelector<HTMLButtonElement>('button[aria-label="Export SVG"]')?.click();
     menuToggle?.click();
-    container.querySelector<HTMLButtonElement>('[aria-label="Export Ink as PNG"]')?.click();
+    menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    menu?.querySelector<HTMLButtonElement>('button[aria-label="Export PNG"]')?.click();
     menuToggle?.click();
-    const remove = container.querySelector<HTMLButtonElement>(
-      '[data-inkstone-ink-delete="surface-1"]',
-    );
-    remove?.click();
-    expect(remove?.getAttribute('aria-label')).toBe('Confirm delete Ink surface');
+    menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    menu?.querySelector<HTMLButtonElement>('button[aria-label="Delete Ink surface…"]')?.click();
     expect(actions).toEqual([
       'select:surface-1',
       'edit:surface-1',
       'svg:surface-1',
       'png:surface-1',
     ]);
-    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-    menuToggle?.click();
-    expect(remove?.getAttribute('aria-label')).toBe('Delete Ink surface');
-    remove?.click();
-    expect(remove?.getAttribute('aria-label')).toBe('Confirm delete Ink surface');
-    remove?.click();
+    await vi.waitFor(() => {
+      expect(container.querySelector('[aria-label="Confirm Ink deletion"]')).not.toBeNull();
+    });
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Confirm delete Ink surface"]')
+      ?.click();
     container.querySelector<HTMLButtonElement>('[data-inkstone-ink-restore="surface-2"]')?.click();
     expect(actions).toEqual([
       'select:surface-1',
@@ -570,6 +666,23 @@ describe('current-file sidebar', () => {
     expect(container.textContent).toContain('No annotations yet');
   });
 });
+
+function clickActionMenuItem(
+  container: HTMLElement,
+  triggerLabel: string,
+  itemLabel: string,
+): void {
+  const trigger = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+    (button) => button.getAttribute('aria-label') === triggerLabel,
+  );
+  if (trigger === undefined) throw new Error(`Expected menu trigger: ${triggerLabel}`);
+  trigger.click();
+  const item = [
+    ...document.body.querySelectorAll<HTMLButtonElement>('[data-obsidian-test-menu] button'),
+  ].find((button) => button.getAttribute('aria-label') === itemLabel);
+  if (item === undefined) throw new Error(`Expected menu item: ${itemLabel}`);
+  item.click();
+}
 
 function fixture(): CurrentFileAnnotationList {
   return {

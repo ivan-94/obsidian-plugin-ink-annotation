@@ -107,6 +107,26 @@ describe('Vault annotation derived index', () => {
     expect(result.groups.flatMap((group) => group.rows).map((row) => row.id)).toEqual(['match']);
   });
 
+  it('indexes visible selection text when the source quote contains presentation markers', () => {
+    const index = new VaultAnnotationIndex();
+    index.rebuild([
+      textRecordToIndexEntry(
+        record({
+          displayText: 'Visible bold text',
+          exact: '**Visible bold text**',
+          filePath: 'Formatted.md',
+          id: 'formatted',
+          position: 0,
+        }),
+      ),
+    ]);
+
+    expect(index.query({ text: 'visible bold' })).toMatchObject({
+      groups: [{ rows: [{ quote: 'Visible bold text' }] }],
+      total: 1,
+    });
+  });
+
   it('applies create/update/rename/conflict events without stale overwrite or duplicate paths', () => {
     const index = new VaultAnnotationIndex();
     const original = textRecordToIndexEntry(
@@ -247,6 +267,7 @@ describe('Vault annotation derived index', () => {
 
 function record(input: {
   readonly body?: string;
+  readonly displayText?: string;
   readonly exact: string;
   readonly filePath: string;
   readonly id: string;
@@ -265,6 +286,7 @@ function record(input: {
     status: 'active',
     tags: input.tags ?? [],
     target: {
+      ...(input.displayText === undefined ? {} : { displayText: input.displayText }),
       position: {
         end: input.position + input.exact.length,
         start: input.position,

@@ -11,10 +11,15 @@ export interface InkToolbarAppProps {
   readonly onDragStart: (event: PointerEvent) => void;
   readonly onRedo: () => void;
   readonly onRetry: () => void;
+  readonly onSelectMove: () => void;
+  readonly onToggleMultiple: () => void;
   readonly onToggleOptions: () => void;
   readonly onTool: (tool: InkStroke['tool']) => void;
   readonly onUndo: () => void;
   readonly onWidth: (width: number) => void;
+  readonly onZoomFit: () => void;
+  readonly onZoomIn: () => void;
+  readonly onZoomOut: () => void;
   readonly state: Signal<InkToolbarState>;
 }
 
@@ -48,12 +53,19 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         onKeyDown={props.onDragKeyDown}
         onPointerDown={props.onDragStart}
       />
+      <ToolbarButton
+        className="inkstone-ink-controls__done"
+        hidden={!state.active}
+        icon="circle-check"
+        label="Exit Ink Mode"
+        onClick={props.onDone}
+      />
       {(['pen', 'highlighter', 'eraser'] as const).map((tool) => (
         <ToolbarButton
           data={{ inkstoneInkTool: tool }}
           icon={tool === 'pen' ? 'pen-line' : tool === 'highlighter' ? 'highlighter' : 'eraser'}
           key={tool}
-          label={tool === 'pen' ? 'Pen' : tool === 'highlighter' ? 'Highlighter' : 'Eraser'}
+          label={tool === 'pen' ? 'Pen' : tool === 'highlighter' ? 'Highlighter' : 'Stroke eraser'}
           onClick={(event) => {
             const toolbar = (event.currentTarget as HTMLElement).closest('[role="toolbar"]');
             for (const button of toolbar?.querySelectorAll<HTMLElement>(
@@ -63,9 +75,24 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
             }
             props.onTool(tool);
           }}
-          pressed={state.tool === tool}
+          pressed={state.interaction === 'draw' && state.tool === tool}
         />
       ))}
+      <ToolbarButton
+        data={{ inkstoneInkSelectMove: 'true' }}
+        icon="move"
+        label="Select and move Ink"
+        onClick={props.onSelectMove}
+        pressed={state.interaction === 'select'}
+      />
+      <ToolbarButton
+        data={{ inkstoneInkMultiple: 'true' }}
+        hidden={state.interaction !== 'select'}
+        icon="list-checks"
+        label="Select multiple Ink strokes"
+        onClick={props.onToggleMultiple}
+        pressed={state.multiple}
+      />
       <input
         aria-label="Ink color"
         data-inkstone-ink-color="true"
@@ -74,34 +101,53 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         type="color"
         value={state.color}
       />
-      <label
+      <div
+        aria-label="Ink width"
         className="inkstone-ink-controls__width"
         data-inkstone-ink-width-control="true"
         hidden={!state.optionsVisible}
+        role="group"
         title={`Ink width: ${state.width} px`}
       >
-        {[2, 4, 8].map((sample) => (
-          <span
-            aria-hidden="true"
+        {[2, 4, 8].map((sample, index) => (
+          <button
+            aria-label={`Set Ink width to ${sample} px`}
+            aria-pressed={nearestSample(state.width) === sample}
+            className="inkstone-ink-controls__width-sample"
             data-inkstone-ink-width-sample={sample}
-            data-selected={nearestSample(state.width) === sample ? '' : undefined}
             key={sample}
-          />
+            onClick={() => props.onWidth(sample)}
+            title={`Set Ink width to ${sample} px`}
+            type="button"
+          >
+            <span aria-hidden="true" style={{ height: `${index + 2}px` }} />
+          </button>
         ))}
-        <select
-          aria-label="Ink width"
-          data-inkstone-ink-width="true"
-          hidden
-          onChange={(event) => props.onWidth(Number.parseInt(event.currentTarget.value, 10))}
-          value={state.width}
-        >
-          {[2, 4, 8, 12, 16].map((width) => (
-            <option key={width} value={width}>
-              {width}px
-            </option>
-          ))}
-        </select>
-      </label>
+      </div>
+      <ToolbarButton
+        data={{ inkstoneInkZoomOut: 'true' }}
+        hidden={!state.optionsVisible}
+        icon="zoom-out"
+        label="Zoom Ink workspace out"
+        onClick={props.onZoomOut}
+      />
+      <ToolbarButton
+        className="inkstone-ink-controls__zoom-fit"
+        data={{ inkstoneInkZoomFit: 'true' }}
+        hidden={!state.optionsVisible}
+        icon="scan"
+        label={`Fit Ink workspace to pane · ${Math.round(state.zoomScale * 100)}%`}
+        onClick={props.onZoomFit}
+        pressed={state.zoomMode === 'fit'}
+        text={`${Math.round(state.zoomScale * 100)}%`}
+      />
+      <ToolbarButton
+        data={{ inkstoneInkZoomIn: 'true' }}
+        hidden={!state.optionsVisible}
+        icon="zoom-in"
+        label="Zoom Ink workspace in"
+        onClick={props.onZoomIn}
+      />
       <ToolbarButton
         data={{ inkstoneInkUndo: 'true' }}
         disabled={!state.canUndo}
@@ -119,15 +165,8 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       <ToolbarButton
         expanded={state.optionsVisible}
         icon="ellipsis"
-        label="Show or hide Ink color and width"
+        label="Show or hide Ink options"
         onClick={props.onToggleOptions}
-      />
-      <ToolbarButton
-        className="inkstone-ink-controls__done"
-        hidden={!state.active}
-        icon="circle-check"
-        label="Done drawing"
-        onClick={props.onDone}
       />
       <ToolbarButton
         data={{ inkstoneInkRetry: 'true' }}

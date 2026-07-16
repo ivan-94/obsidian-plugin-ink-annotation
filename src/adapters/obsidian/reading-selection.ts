@@ -39,32 +39,61 @@ export function captureReadingSelection(
     return { reason: 'outside-reading-view', supported: false };
   }
 
+  const selectedParts = selectedTextParts(readingRoot, range);
+  if (selectedParts.length === 0) {
+    return { reason: 'empty', supported: false };
+  }
+
   const restrictedReason =
-    restrictedContentReason(range.startContainer) ??
-    restrictedContentReason(range.endContainer) ??
-    restrictedContentReasonInRange(range);
+    selectedParts
+      .map((part) => restrictedContentReason(part.node))
+      .find((reason) => reason !== null) ?? null;
   if (restrictedReason !== null) {
     return { reason: restrictedReason, supported: false };
   }
 
-  const startBlock = findSupportedBlock(range.startContainer);
-  const endBlock = findSupportedBlock(range.endContainer);
-  if (startBlock === null || endBlock === null) {
+  if (selectedParts.some((part) => part.block === null)) {
     return { reason: 'unsupported-block', supported: false };
   }
-  const selectedBlocks = selectedSupportedBlocks(readingRoot, range);
+  const supportedParts = selectedParts as readonly (SelectedTextPart & { block: HTMLElement })[];
+  const selectedBlocks = supportedParts.reduce<HTMLElement[]>((blocks, part) => {
+    if (blocks.at(-1) !== part.block) blocks.push(part.block);
+    return blocks;
+  }, []);
+  const startBlock = selectedBlocks[0];
+  const endBlock = selectedBlocks.at(-1);
+  if (startBlock === undefined || endBlock === undefined) {
+    return { reason: 'unsupported-block', supported: false };
+  }
   const structuralKind = supportedBlockKind(startBlock);
-  if (
-    selectedBlocks[0] !== startBlock ||
-    selectedBlocks.at(-1) !== endBlock ||
-    selectedBlocks.some((block) => supportedBlockKind(block) !== structuralKind)
-  ) {
+  if (selectedBlocks.some((block) => supportedBlockKind(block) !== structuralKind)) {
     return { reason: 'cross-block', supported: false };
   }
 
-  const renderedStart = textLengthBefore(startBlock, range.startContainer, range.startOffset);
-  const renderedEnd = textLengthBefore(endBlock, range.endContainer, range.endOffset);
-  const exact = range.toString();
+  const fragments = selectedBlocks.map((block) => {
+    const parts = supportedParts.filter((part) => part.block === block);
+    const first = parts[0];
+    const last = parts.at(-1);
+    if (first === undefined || last === undefined) {
+      throw new Error('Selected block has no selected text parts.');
+    }
+    return {
+      block,
+      renderedEnd: textLengthBefore(block, last.node, last.end),
+      renderedStart: textLengthBefore(block, first.node, first.start),
+    };
+  });
+  const renderedStart = fragments[0]?.renderedStart ?? 0;
+  const renderedEnd = fragments.at(-1)?.renderedEnd ?? 0;
+  const firstPart = supportedParts[0];
+  const lastPart = supportedParts.at(-1);
+  if (firstPart === undefined || lastPart === undefined) {
+    return { reason: 'empty', supported: false };
+  }
+  const exactRange = readingRoot.ownerDocument.createRange();
+  exactRange.setStart(firstPart.node, firstPart.start);
+  exactRange.setEnd(lastPart.node, lastPart.end);
+  const exact = exactRange.toString();
   if (
     startBlock === endBlock &&
     startBlock.textContent?.slice(renderedStart, renderedEnd) !== exact
@@ -72,16 +101,6 @@ export function captureReadingSelection(
     return { reason: 'unsupported-block', supported: false };
   }
 
-  const fragments =
-    startBlock === endBlock
-      ? [{ block: startBlock, renderedEnd, renderedStart }]
-      : selectedBlocks
-          .map((block) => ({
-            block,
-            renderedEnd: block === endBlock ? renderedEnd : (block.textContent?.length ?? 0),
-            renderedStart: block === startBlock ? renderedStart : 0,
-          }))
-          .filter((fragment) => fragment.renderedEnd > fragment.renderedStart);
   if (fragments.length < (startBlock === endBlock ? 1 : 2)) {
     return { reason: 'cross-block', supported: false };
   }
@@ -97,19 +116,39 @@ export function captureReadingSelection(
   };
 }
 
-function selectedSupportedBlocks(readingRoot: HTMLElement, range: Range): readonly HTMLElement[] {
+interface SelectedTextPart {
+  readonly block: HTMLElement | null;
+  readonly end: number;
+  readonly node: Text;
+  readonly start: number;
+}
+
+function selectedTextParts(readingRoot: HTMLElement, range: Range): readonly SelectedTextPart[] {
   const nodeFilter = readingRoot.ownerDocument.defaultView?.NodeFilter.SHOW_TEXT ?? 4;
   const walker = readingRoot.ownerDocument.createTreeWalker(readingRoot, nodeFilter);
-  const blocks: HTMLElement[] = [];
+  const rangeConstructor = readingRoot.ownerDocument.defaultView?.Range;
+  const parts: SelectedTextPart[] = [];
   let node = walker.nextNode();
   while (node !== null) {
-    if (range.intersectsNode(node)) {
-      const block = findSupportedBlock(node);
-      if (block !== null && blocks.at(-1) !== block) blocks.push(block);
+    if (node.nodeType === 3) {
+      const textNode = node as Text;
+      const nodeRange = readingRoot.ownerDocument.createRange();
+      nodeRange.selectNodeContents(textNode);
+      const overlaps =
+        rangeConstructor !== undefined &&
+        range.compareBoundaryPoints(rangeConstructor.START_TO_END, nodeRange) > 0 &&
+        range.compareBoundaryPoints(rangeConstructor.END_TO_START, nodeRange) < 0;
+      if (overlaps) {
+        const start = range.startContainer === textNode ? range.startOffset : 0;
+        const end = range.endContainer === textNode ? range.endOffset : textNode.data.length;
+        if (end > start) {
+          parts.push({ block: findSupportedBlock(textNode), end, node: textNode, start });
+        }
+      }
     }
     node = walker.nextNode();
   }
-  return blocks;
+  return parts;
 }
 
 function supportedBlockKind(block: HTMLElement): string {
@@ -138,21 +177,6 @@ function restrictedContentReason(
     return 'embedded-content';
   }
   if (element?.closest('.dataview, .block-language-dataview, .mermaid, iframe') !== null) {
-    return 'generated-content';
-  }
-  return null;
-}
-
-function restrictedContentReasonInRange(
-  range: Range,
-): Extract<CapturedReadingSelection, { supported: false }>['reason'] | null {
-  const contents = range.cloneContents();
-  if (contents.querySelector('pre, code') !== null) return 'code-content';
-  if (contents.querySelector('mjx-container, .math, .math-block') !== null) return 'math-content';
-  if (contents.querySelector('.internal-embed, .markdown-embed, .embed-container') !== null) {
-    return 'embedded-content';
-  }
-  if (contents.querySelector('.dataview, .block-language-dataview, .mermaid, iframe') !== null) {
     return 'generated-content';
   }
   return null;

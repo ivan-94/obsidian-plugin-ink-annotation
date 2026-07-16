@@ -31,6 +31,66 @@ describe('Reading View selection capture', () => {
     }
   });
 
+  it('ignores a zero-width endpoint in the next block', () => {
+    const root = document.createElement('section');
+    root.innerHTML =
+      '<p>This paragraph contains <strong>bold</strong>, <em>italic</em>, <mark>highlighted</mark>, and <del>struck</del> text.</p><h2>Next section</h2>';
+    const paragraph = root.querySelector('p');
+    const first = paragraph?.firstChild;
+    const next = root.querySelector('h2')?.firstChild;
+    if (
+      !(paragraph instanceof HTMLElement) ||
+      !(first instanceof Text) ||
+      !(next instanceof Text)
+    ) {
+      throw new Error('Boundary fixture is malformed.');
+    }
+    const range = document.createRange();
+    range.setStart(first, 0);
+    range.setEnd(next, 0);
+
+    const captured = captureReadingSelection(root, range);
+
+    expect(captured).toMatchObject({
+      block: paragraph,
+      endBlock: paragraph,
+      exact: paragraph.textContent,
+      fragments: [
+        {
+          block: paragraph,
+          renderedEnd: paragraph.textContent.length,
+          renderedStart: 0,
+        },
+      ],
+      supported: true,
+    });
+  });
+
+  it('does not reject a selection for zero-width restricted content at its boundary', () => {
+    const root = document.createElement('section');
+    root.innerHTML = '<p>Visible paragraph.</p><pre><code>restricted()</code></pre>';
+    const paragraph = root.querySelector('p');
+    const first = paragraph?.firstChild;
+    const restricted = root.querySelector('code')?.firstChild;
+    if (
+      !(paragraph instanceof HTMLElement) ||
+      !(first instanceof Text) ||
+      !(restricted instanceof Text)
+    ) {
+      throw new Error('Restricted boundary fixture is malformed.');
+    }
+    const range = document.createRange();
+    range.setStart(first, 0);
+    range.setEnd(restricted, 0);
+
+    expect(captureReadingSelection(root, range)).toMatchObject({
+      block: paragraph,
+      endBlock: paragraph,
+      exact: 'Visible paragraph.',
+      supported: true,
+    });
+  });
+
   it('captures a task-list label as one supported block', () => {
     const root = document.createElement('section');
     root.innerHTML =

@@ -4,7 +4,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   resolve: {
     alias: {
-      obsidian: fileURLToPath(new URL('./test-fixtures/obsidian-runtime.ts', import.meta.url)),
+      obsidian: fileURLToPath(new URL('./test-support/obsidian-runtime.ts', import.meta.url)),
     },
   },
   test: {

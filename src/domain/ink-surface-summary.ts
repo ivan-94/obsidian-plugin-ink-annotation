@@ -1,4 +1,4 @@
-import type { InkPoint, InkSurfaceRecord } from './ink-surface';
+import { inkSurfaceVisibleBounds, type InkPoint, type InkSurfaceRecord } from './ink-surface';
 
 export interface InkSurfaceSummary {
   readonly conflict?: boolean;
@@ -63,7 +63,8 @@ export function decodeInkSurfaceSummaryIndex(contents: string): InkSurfaceSummar
 function renderInkThumbnail(record: InkSurfaceRecord): string {
   const width = 160;
   const height = 90;
-  const scale = Math.min(width / record.layout.logicalWidth, height / record.layout.logicalHeight);
+  const bounds = inkSurfaceVisibleBounds(record);
+  const scale = Math.min(width / bounds.width, height / bounds.height);
   const paths = record.strokes
     .filter((stroke) => stroke.tool !== 'eraser')
     .map((stroke) => {
@@ -71,7 +72,7 @@ function renderInkThumbnail(record: InkSurfaceRecord): string {
       const path = sampled
         .map(
           (point, index) =>
-            `${index === 0 ? 'M' : 'L'}${round(point.x * scale)} ${round(point.y * scale)}`,
+            `${index === 0 ? 'M' : 'L'}${round((point.x - bounds.minX) * scale)} ${round((point.y - bounds.minY) * scale)}`,
         )
         .join(' ');
       return `<path d="${path}" fill="none" stroke="${escapeAttribute(stroke.color)}" stroke-linecap="round" stroke-linejoin="round" stroke-width="${round(Math.max(0.5, stroke.width * scale))}"/>`;

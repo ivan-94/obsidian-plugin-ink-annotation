@@ -42,6 +42,14 @@ describe('AnnotationSidebarApp', () => {
     expect(currentHost?.hidden).toBe(false);
     expect(vaultHost?.hidden).toBe(true);
     expect(activeScope(container)).toBe('Current file');
+    const scopeTabs = container.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    expect(scopeTabs[0]?.getAttribute('aria-label')).toBe('Current file');
+    expect(scopeTabs[0]?.querySelector('[data-inkstone-icon="file-text"]')).not.toBeNull();
+    expect(scopeTabs[1]?.getAttribute('aria-label')).toBe('Entire Vault');
+    expect(scopeTabs[1]?.querySelector('[data-inkstone-icon="library"]')).not.toBeNull();
+    expect(scopeTabs[0]?.querySelector('.inkstone-sidebar__scope-label')?.textContent).toBe(
+      'Current file',
+    );
 
     await act(() => clickScope(container, 'Entire Vault'));
     expect(store.scope.value).toBe('entire-vault');

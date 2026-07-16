@@ -18,6 +18,7 @@ export interface TextStructuralScope {
 }
 
 export interface TextAnnotationTarget {
+  readonly displayText?: string;
   readonly position: TextPositionSelector;
   readonly quote: TextQuoteSelector;
   readonly scope: TextStructuralScope;
@@ -85,6 +86,14 @@ export function assertTextAnnotationInvariant(record: TextAnnotationRecord): voi
   if (record.target.quote.exact.length === 0) {
     throw new Error('Annotation quote must not be empty.');
   }
+
+  if (record.target.displayText !== undefined && record.target.displayText.length === 0) {
+    throw new Error('Annotation display text must not be empty.');
+  }
+}
+
+export function annotationTargetText(target: TextAnnotationTarget): string {
+  return target.displayText ?? target.quote.exact;
 }
 
 function isTextAnnotationRecord(value: unknown): value is TextAnnotationRecord {
@@ -135,6 +144,7 @@ function isTextAnnotationTarget(value: unknown): value is TextAnnotationTarget {
   }
 
   return (
+    (value.displayText === undefined || typeof value.displayText === 'string') &&
     typeof value.position.start === 'number' &&
     typeof value.position.end === 'number' &&
     value.position.unit === 'utf16-code-unit' &&

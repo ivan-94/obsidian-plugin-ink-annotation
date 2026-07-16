@@ -309,7 +309,12 @@ export class ReadingViewIntegration {
     if (first === undefined || last === undefined) return null;
     return this.service.prepareSelection({
       filePath: context.filePath,
-      selection: { end: last.end, scope: context.scope, start: first.start },
+      selection: {
+        displayText: captured.exact,
+        end: last.end,
+        scope: context.scope,
+        start: first.start,
+      },
       source: context.source,
     });
   }

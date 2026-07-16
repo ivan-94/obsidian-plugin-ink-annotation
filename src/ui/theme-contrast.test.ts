@@ -47,7 +47,7 @@ describe('theme contrast contract', () => {
       /\.inkstone-sidebar-group--problems\s*>\s*h3\s*\{[^}]*color:\s*var\(--text-warning,\s*var\(--color-orange\)\)[^}]*background:\s*color-mix\([^}]*var\(--color-orange\)[^}]*var\(--background-primary\)/su,
     );
     expect(styles).toMatch(
-      /\.inkstone-vault-row__metadata--warning\s*\{[^}]*color:\s*var\(--text-warning,\s*var\(--color-orange\)\)/su,
+      /\.inkstone-metadata-line__token--warning[^}]*\{[^}]*color:\s*var\(--text-warning,\s*var\(--color-orange\)\)/su,
     );
   });
 });

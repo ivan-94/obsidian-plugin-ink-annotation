@@ -72,6 +72,14 @@ describe('current-file annotation list', () => {
     });
     expect(expired).toEqual({ groups: [], total: 0 });
   });
+
+  it('shows visible selection text instead of raw presentation markers', () => {
+    const model = buildCurrentFileAnnotationList([
+      record('formatted', 0, { displayText: 'A bold selection' }),
+    ]);
+
+    expect(model.groups[0]?.rows[0]?.quote).toBe('A bold selection');
+  });
 });
 
 function record(
@@ -80,6 +88,7 @@ function record(
   options: {
     readonly body?: string;
     readonly deletedAt?: string;
+    readonly displayText?: string;
     readonly heading?: string;
     readonly kind?: 'highlight' | 'underline';
     readonly mark?: boolean;
@@ -102,6 +111,7 @@ function record(
     status: options.status ?? 'active',
     tags: options.tags ?? [],
     target: {
+      ...(options.displayText === undefined ? {} : { displayText: options.displayText }),
       position: { end: start + id.length, start, unit: 'utf16-code-unit' },
       quote: { exact: `Quote ${id}`, prefix: '', suffix: '' },
       scope: { ...(options.heading === undefined ? {} : { headingPath: [options.heading] }) },

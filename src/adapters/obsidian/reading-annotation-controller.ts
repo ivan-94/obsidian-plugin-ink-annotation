@@ -182,7 +182,12 @@ export class ReadingAnnotationController {
 
     const selection = await this.service.prepareSelection({
       filePath: input.filePath,
-      selection: { end: mapped.end, scope: input.scope, start: mapped.start },
+      selection: {
+        displayText: captured.exact,
+        end: mapped.end,
+        scope: input.scope,
+        start: mapped.start,
+      },
       source: input.fullSource,
     });
     this.pending = {

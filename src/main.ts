@@ -39,7 +39,7 @@ import {
   applyCanonicalRecordRemoved,
 } from './application/vault-index-events';
 import { StylePresetCatalog } from './domain/style-preset';
-import type { TextAnnotationRecord } from './domain/text-annotation';
+import { annotationTargetText, type TextAnnotationRecord } from './domain/text-annotation';
 import { VaultAnnotationIndex, type AnnotationIndexEntry } from './domain/vault-annotation-index';
 import { AnnotationInspector } from './ui/annotation-inspector';
 import { AnnotationExportDialog } from './ui/annotation-export-dialog';
@@ -53,11 +53,13 @@ import { SidecarRepository } from './storage/sidecar-repository';
 import { InkSurfaceRepository } from './storage/ink-surface-repository';
 import { VaultIndexCache } from './storage/vault-index-cache';
 import { LocalInkToolPreferenceStore } from './storage/local-ink-tool-preference';
+import { LocalInkRecoveryStore } from './storage/local-ink-recovery';
 
 export default class InkstoneAnnotationsPlugin extends Plugin {
   private readonly diagnostics = new Diagnostics(false);
   private readonly runtime = new PluginRuntime();
   private pluginSettings: InkstoneSettings = DEFAULT_SETTINGS;
+  private inkModeManager: ObsidianInkModeManager | null = null;
   private inspector: AnnotationInspector | null = null;
   private readingView: ReadingViewIntegration | null = null;
   private sidebarView: AnnotationSidebarView | null = null;
@@ -90,7 +92,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     const inkRepository = new InkSurfaceRepository(sidecarStore, {
       onSurfaceChanged: (record) => {
         applyCanonicalInkSurfaceChanged(vaultIndex, record);
-        void this.sidebarView?.refresh();
+        this.sidebarView?.applyInkSurfaceChanged(record);
       },
     });
     const annotationService = new AnnotationService({
@@ -260,7 +262,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             showExportDialog({
               invoker,
               items: () => selected,
-              title: `Annotation - ${record.target.quote.exact.slice(0, 48)}`,
+              title: `Annotation - ${annotationTargetText(record.target).slice(0, 48)}`,
             });
           })
           .catch((error) => console.warn('[Inkstone Annotations]', error));
@@ -269,13 +271,6 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         void navigateToSource(record).catch((error) =>
           console.warn('[Inkstone Annotations]', error),
         );
-      },
-      onPreviewReattach: async (record) => {
-        const replacement = await this.readingView?.captureCurrentSelection();
-        if (replacement === null || replacement === undefined) {
-          throw new Error('Select replacement text in Reading View first.');
-        }
-        return annotationService.previewReattachment(record.filePath, record.id, replacement);
       },
       onConfirmReattach: async (record, candidate) => {
         const repaired = await annotationService.confirmReattachment(record.filePath, candidate);
@@ -390,6 +385,43 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
               .getAnnotationsById(entry.filePath, [entry.id])
               .then(([record]) => (record === undefined ? undefined : navigateToSource(record)))
               .catch((error) => console.warn('[Inkstone Annotations]', error));
+          },
+          repairAnnotation: async (filePath, annotationId, invoker) => {
+            try {
+              const [record] = await annotationService.getAnnotationsById(filePath, [annotationId]);
+              if (record === undefined) {
+                new Notice('This annotation is no longer available for repair.');
+                return;
+              }
+              if (record.status !== 'unanchored') {
+                new Notice('This annotation no longer needs repair.');
+                return;
+              }
+              const replacement = await this.readingView?.captureCurrentSelection();
+              if (replacement === null || replacement === undefined) {
+                new Notice('Select supported replacement text in Reading View first.');
+                return;
+              }
+              const candidate = await annotationService.previewReattachment(
+                filePath,
+                annotationId,
+                replacement,
+              );
+              inspector.showReattachmentPreview({
+                anchorRect: invoker.getBoundingClientRect(),
+                candidate,
+                invoker,
+                record,
+              });
+            } catch (error) {
+              console.warn('[Inkstone Annotations]', error);
+              new Notice(
+                error instanceof Error &&
+                  error.message === 'Replacement selection belongs to a different file.'
+                  ? 'Select replacement text in the same note as this annotation.'
+                  : "Couldn't prepare this repair. The original target is unchanged.",
+              );
+            }
           },
           closed: () => {
             if (this.sidebarView === view) {
@@ -624,10 +656,17 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         this.app.vault.getName(),
         this.pluginSettings.deviceId,
       ),
+      recoveryStore: new LocalInkRecoveryStore(
+        globalThis.localStorage,
+        this.app.vault.getName(),
+        this.pluginSettings.deviceId,
+      ),
       recordInputToPaint: (durationMs) =>
         this.diagnostics.recordLatency('ink-input-to-paint', durationMs),
+      showInkPreviewByDefault: this.pluginSettings.showInkPreviewByDefault,
       textRepository: repository,
     });
+    this.inkModeManager = inkMode;
     this.runtime.registerDisposer(() => inkMode.dispose());
 
     this.registerMarkdownPostProcessor(async (element, context) => {
@@ -785,6 +824,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
           file.path,
         );
       if (!canonical) return;
+      if (sidecarStore.wasRecentlyWritten(file.path)) return;
       if (file.path.includes('/surfaces/')) {
         void inkRepository
           .rebuildSummariesForSidecarPath(file.path)
@@ -848,6 +888,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     this.sidebarView = null;
     this.inspector?.close(false);
     this.inspector = null;
+    this.inkModeManager = null;
 
     this.diagnostics.recordDuration('plugin-shutdown', performance.now() - startedAt);
 
@@ -864,6 +905,12 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     this.pluginSettings = { ...this.pluginSettings, diagnosticsEnabled: enabled };
     this.diagnostics.setEnabled(enabled);
     await this.saveData(this.pluginSettings);
+  }
+
+  async setShowInkPreviewByDefault(enabled: boolean): Promise<void> {
+    this.pluginSettings = { ...this.pluginSettings, showInkPreviewByDefault: enabled };
+    await this.saveData(this.pluginSettings);
+    await this.inkModeManager?.setPreviewByDefault(enabled);
   }
 
   async updateStylePreset(

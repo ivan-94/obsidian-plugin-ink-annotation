@@ -111,6 +111,7 @@ class LargeSession {
   eraseStrokeAt(): string | null {
     return null;
   }
+  enter(): void {}
   exit(): Promise<void> {
     return Promise.resolve();
   }
@@ -145,7 +146,10 @@ function contextFixture(): CanvasRenderingContext2D {
     lineJoin: 'round',
     lineTo: vi.fn(),
     moveTo: vi.fn(),
+    restore: vi.fn(),
+    save: vi.fn(),
     scale: vi.fn(),
+    setTransform: vi.fn(),
     stroke: vi.fn(),
     strokeStyle: '#000',
     lineWidth: 1,

@@ -14,6 +14,9 @@ import {
 import { normalizeVaultPath, type TextFileStore } from './sidecar-repository';
 
 const SIDECAR_ROOT = '.obsidian-annotations/v1/notes';
+const SHARED_WRITE_COORDINATOR = Symbol.for(
+  'inkstone.annotations.ink-surface-write-coordinator.v1',
+);
 
 export interface InkSurfaceCandidate {
   readonly path: string;
@@ -33,6 +36,17 @@ export interface InkSurfaceRepositoryIssue {
   readonly path: string;
 }
 
+interface InkSurfaceBatchJournal {
+  readonly entries: readonly {
+    readonly nextContents: string;
+    readonly path: string;
+    readonly previousContents: string;
+  }[];
+  readonly filePath: string;
+  readonly phase: 'committed' | 'prepared';
+  readonly schemaVersion: 1;
+}
+
 export class InkSurfaceConflictError extends Error {
   constructor(readonly conflict: InkSurfaceConflict) {
     super(`Ink surface ${conflict.surfaceId} has divergent candidates that require repair.`);
@@ -43,7 +57,7 @@ export class InkSurfaceConflictError extends Error {
 /** Canonical per-surface persistence with the same conservative iCloud rules as text records. */
 export class InkSurfaceRepository {
   private readonly onSurfaceChanged: (record: InkSurfaceRecord) => void;
-  private readonly writes = new Map<string, Promise<void>>();
+  private readonly writes: Map<string, Promise<void>>;
 
   constructor(
     private readonly store: TextFileStore,
@@ -52,74 +66,190 @@ export class InkSurfaceRepository {
     } = {},
   ) {
     this.onSurfaceChanged = events.onSurfaceChanged ?? (() => undefined);
+    this.writes = sharedVaultWrites(store.coordinationScope ?? store);
   }
 
   async writeSurface(record: InkSurfaceRecord): Promise<void> {
     const key = surfaceWriteKey(record.filePath, record.id);
-    await this.enqueueWrite(key, async () => {
-      await this.assertNoteIdentity(record);
-      const candidates = await this.readCandidates(record.filePath, record.id);
-      if (candidates.length > 0) {
-        throw new Error(`Cannot create existing ink surface ${record.id}.`);
-      }
-      const path = await this.surfacePath(record.filePath, record.id);
-      await this.store.mkdir(path.slice(0, path.lastIndexOf('/')));
-      try {
-        await this.store.write(path, encodeInkSurfaceRecord(record));
-      } catch (error) {
-        await this.store.remove?.(path).catch(() => undefined);
-        throw error;
-      }
-      await this.refreshSummaryIndex(record);
-      this.onSurfaceChanged(record);
-    });
+    await this.withNoteBatchLock(record.filePath, () =>
+      this.enqueueWrite(key, async () => {
+        await this.assertNoteIdentity(record);
+        const candidates = await this.readCandidates(record.filePath, record.id);
+        if (candidates.length > 0) {
+          throw new Error(`Cannot create existing ink surface ${record.id}.`);
+        }
+        const path = await this.surfacePath(record.filePath, record.id);
+        await this.store.mkdir(path.slice(0, path.lastIndexOf('/')));
+        try {
+          await this.store.write(path, encodeInkSurfaceRecord(record));
+        } catch (error) {
+          await this.store.remove?.(path).catch(() => undefined);
+          throw error;
+        }
+        await this.refreshSummaryIndex(record);
+        this.onSurfaceChanged(record);
+      }),
+    );
   }
 
   async readSurface(filePath: string, surfaceId: string): Promise<InkSurfaceRecord | null> {
-    const candidates = await this.readCandidates(filePath, surfaceId);
-    return candidates.length === 0 ? null : selectLatestCandidate(candidates, surfaceId).record;
+    return this.withNoteBatchLock(filePath, async () => {
+      const candidates = await this.readCandidates(filePath, surfaceId);
+      return candidates.length === 0 ? null : selectLatestCandidate(candidates, surfaceId).record;
+    });
   }
 
-  async updateSurface(record: InkSurfaceRecord): Promise<void> {
+  async updateSurface(record: InkSurfaceRecord, expectedBase?: InkSurfaceRecord): Promise<void> {
     const key = surfaceWriteKey(record.filePath, record.id);
-    await this.enqueueWrite(key, async () => {
-      await this.assertNoteIdentity(record);
-      const candidates = await this.readCandidates(record.filePath, record.id);
-      if (candidates.length === 0) {
-        throw new Error(`Cannot update missing ink surface ${record.id}.`);
-      }
-      const existing = selectLatestCandidate(candidates, record.id).record;
-      if (existing.noteId !== record.noteId || record.revision <= existing.revision) {
-        throw new Error('Ink surface update must preserve note identity and increase revision.');
-      }
-
-      const path = await this.surfacePath(record.filePath, record.id);
-      const previousContents = await this.store.read(path);
-      try {
-        await this.store.write(path, encodeInkSurfaceRecord(record));
-      } catch (error) {
-        try {
-          if (previousContents === null) {
-            if (this.store.remove === undefined) {
-              throw new Error('The text file store cannot remove the partial surface file.', {
-                cause: error,
-              });
-            }
-            await this.store.remove(path);
-          } else {
-            await this.store.write(path, previousContents);
-          }
-        } catch (restoreError) {
-          throw new AggregateError(
-            [error, restoreError],
-            `Ink surface ${record.id} write and rollback both failed; repair is required.`,
-            { cause: restoreError },
+    await this.withNoteBatchLock(record.filePath, () =>
+      this.enqueueWrite(key, async () => {
+        await this.assertNoteIdentity(record);
+        const candidates = await this.readCandidates(record.filePath, record.id);
+        if (candidates.length === 0) {
+          throw new Error(`Cannot update missing ink surface ${record.id}.`);
+        }
+        const existing = selectLatestCandidate(candidates, record.id).record;
+        if (sameSurfaceRecord(existing, record)) {
+          await this.refreshSummaryIndex(record);
+          this.onSurfaceChanged(record);
+          return;
+        }
+        if (expectedBase !== undefined && !sameSurfaceRecord(existing, expectedBase)) {
+          throw new Error('Ink surface changed since the expected base was read.');
+        }
+        const base = expectedBase ?? existing;
+        if (existing.noteId !== record.noteId || record.revision !== base.revision + 1) {
+          throw new Error(
+            'Ink surface update must preserve note identity and advance exactly one revision.',
           );
         }
+
+        const path = await this.surfacePath(record.filePath, record.id);
+        const previousContents = await this.store.read(path);
+        try {
+          await this.store.write(path, encodeInkSurfaceRecord(record));
+        } catch (error) {
+          try {
+            if (previousContents === null) {
+              if (this.store.remove === undefined) {
+                throw new Error('The text file store cannot remove the partial surface file.', {
+                  cause: error,
+                });
+              }
+              await this.store.remove(path);
+            } else {
+              await this.store.write(path, previousContents);
+            }
+          } catch (restoreError) {
+            throw new AggregateError(
+              [error, restoreError],
+              `Ink surface ${record.id} write and rollback both failed; repair is required.`,
+              { cause: restoreError },
+            );
+          }
+          throw error;
+        }
+        await this.refreshSummaryIndex(record);
+        this.onSurfaceChanged(record);
+      }),
+    );
+  }
+
+  /** Commits a cross-surface document mutation as all-old or all-new canonical bytes. */
+  async updateSurfacesAtomically(
+    records: readonly InkSurfaceRecord[],
+    expectedBases?: readonly InkSurfaceRecord[],
+  ): Promise<void> {
+    if (records.length === 0) return;
+    if (new Set(records.map((record) => record.id)).size !== records.length) {
+      throw new Error('Atomic Ink update contains duplicate surface IDs.');
+    }
+    const expectedById = alignExpectedBases(records, expectedBases);
+    const filePath = normalizeVaultPath(records[0]?.filePath ?? '');
+    if (records.some((record) => normalizeVaultPath(record.filePath) !== filePath)) {
+      throw new Error('Atomic Ink update must stay within one note.');
+    }
+    await this.withNoteBatchLock(filePath, async () => {
+      const prepared: Array<{
+        readonly path: string;
+        readonly previousContents: string;
+        readonly record: InkSurfaceRecord;
+      }> = [];
+      for (const record of records) {
+        await this.assertNoteIdentity(record);
+        const candidates = await this.readCandidates(record.filePath, record.id);
+        if (candidates.length === 0) {
+          throw new Error(`Cannot update missing ink surface ${record.id}.`);
+        }
+        const existing = selectLatestCandidate(candidates, record.id).record;
+        if (sameSurfaceRecord(existing, record)) {
+          continue;
+        }
+        const expectedBase = expectedById?.get(record.id);
+        if (expectedBase !== undefined && !sameSurfaceRecord(existing, expectedBase)) {
+          throw new Error(`Ink surface ${record.id} changed since the expected base was read.`);
+        }
+        const base = expectedBase ?? existing;
+        if (existing.noteId !== record.noteId || record.revision !== base.revision + 1) {
+          throw new Error(
+            'Ink surface update must preserve note identity and advance exactly one revision.',
+          );
+        }
+        const path = await this.surfacePath(record.filePath, record.id);
+        const previousContents = await this.store.read(path);
+        if (previousContents === null) {
+          throw new Error(`Canonical Ink surface ${record.id} disappeared during batch update.`);
+        }
+        prepared.push({ path, previousContents, record });
+      }
+
+      if (prepared.length === 0) {
+        for (const record of records) await this.refreshSummaryIndex(record);
+        for (const record of records) this.onSurfaceChanged(record);
+        return;
+      }
+      if (prepared.length !== records.length) {
+        throw new Error('Atomic Ink update cannot mix idempotent and advancing surfaces.');
+      }
+
+      const journalPath = await this.batchJournalPath(filePath);
+      const journal: InkSurfaceBatchJournal = {
+        entries: prepared.map((item) => ({
+          nextContents: encodeInkSurfaceRecord(item.record),
+          path: item.path,
+          previousContents: item.previousContents,
+        })),
+        filePath,
+        phase: 'prepared',
+        schemaVersion: 1,
+      };
+      await this.store.write(journalPath, JSON.stringify(journal));
+      try {
+        for (const item of prepared) {
+          await this.store.write(item.path, encodeInkSurfaceRecord(item.record));
+        }
+        await this.store.write(journalPath, JSON.stringify({ ...journal, phase: 'committed' }));
+      } catch (error) {
+        const restoreResults = await Promise.allSettled(
+          prepared.map((item) => this.store.write(item.path, item.previousContents)),
+        );
+        const restoreFailure = restoreResults.find(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        if (restoreFailure !== undefined) {
+          throw new AggregateError(
+            [error, restoreFailure.reason],
+            'Atomic Ink update and rollback both failed; manual repair is required.',
+            { cause: error },
+          );
+        }
+        await this.clearBatchJournal(journalPath).catch(() => undefined);
         throw error;
       }
-      await this.refreshSummaryIndex(record);
-      this.onSurfaceChanged(record);
+
+      await this.clearBatchJournal(journalPath).catch(() => undefined);
+      for (const { record } of prepared) await this.refreshSummaryIndex(record);
+      for (const { record } of prepared) this.onSurfaceChanged(record);
     });
   }
 
@@ -134,62 +264,65 @@ export class InkSurfaceRepository {
     const surfaceId = input.candidate.record.id;
     const filePath = normalizeVaultPath(input.filePath);
     const key = surfaceWriteKey(filePath, surfaceId);
-    return this.enqueueWrite(key, async () => {
-      const candidates = await this.readCandidates(filePath, surfaceId);
-      const highestRevision = Math.max(...candidates.map(({ record }) => record.revision), 0);
-      const reviewed = candidates.find(({ path }) => path === input.candidate.path);
-      const latest = candidates.filter(({ record }) => record.revision === highestRevision);
-      if (
-        reviewed === undefined ||
-        highestRevision !== input.expectedHighestRevision ||
-        encodeInkSurfaceRecord(reviewed.record) !==
-          encodeInkSurfaceRecord(input.candidate.record) ||
-        !hasDivergentRecords(latest)
-      ) {
-        throw new Error('Ink conflict changed since review; reopen the repair dialog.');
-      }
-      const resolved: InkSurfaceRecord = {
-        ...reviewed.record,
-        ...(input.deviceId === undefined ? {} : { deviceId: input.deviceId }),
-        revision: highestRevision + 1,
-        updatedAt: input.now,
-      };
-      await this.assertNoteIdentity(resolved);
-      const canonicalPath = await this.surfacePath(filePath, surfaceId);
-      const previousContents = await this.store.read(canonicalPath);
-      try {
-        await this.store.write(canonicalPath, encodeInkSurfaceRecord(resolved));
-      } catch (error) {
-        try {
-          if (previousContents === null) {
-            if (this.store.remove === undefined) {
-              throw new Error(
-                'The text file store cannot remove the partial Ink conflict repair.',
-                {
-                  cause: error,
-                },
-              );
-            }
-            await this.store.remove(canonicalPath);
-          } else {
-            await this.store.write(canonicalPath, previousContents);
-          }
-        } catch (restoreError) {
-          throw new AggregateError(
-            [error, restoreError],
-            `Ink surface ${surfaceId} conflict repair and rollback both failed; manual repair is required.`,
-            { cause: restoreError },
-          );
+    return this.withNoteBatchLock(filePath, () =>
+      this.enqueueWrite(key, async () => {
+        const candidates = await this.readCandidates(filePath, surfaceId);
+        const highestRevision = Math.max(...candidates.map(({ record }) => record.revision), 0);
+        const reviewed = candidates.find(({ path }) => path === input.candidate.path);
+        const latest = candidates.filter(({ record }) => record.revision === highestRevision);
+        if (
+          reviewed === undefined ||
+          highestRevision !== input.expectedHighestRevision ||
+          encodeInkSurfaceRecord(reviewed.record) !==
+            encodeInkSurfaceRecord(input.candidate.record) ||
+          !hasDivergentRecords(latest)
+        ) {
+          throw new Error('Ink conflict changed since review; reopen the repair dialog.');
         }
-        throw error;
-      }
-      await this.refreshSummaryIndex(resolved);
-      this.onSurfaceChanged(resolved);
-      return resolved;
-    });
+        const resolved: InkSurfaceRecord = {
+          ...reviewed.record,
+          ...(input.deviceId === undefined ? {} : { deviceId: input.deviceId }),
+          revision: highestRevision + 1,
+          updatedAt: input.now,
+        };
+        await this.assertNoteIdentity(resolved);
+        const canonicalPath = await this.surfacePath(filePath, surfaceId);
+        const previousContents = await this.store.read(canonicalPath);
+        try {
+          await this.store.write(canonicalPath, encodeInkSurfaceRecord(resolved));
+        } catch (error) {
+          try {
+            if (previousContents === null) {
+              if (this.store.remove === undefined) {
+                throw new Error(
+                  'The text file store cannot remove the partial Ink conflict repair.',
+                  {
+                    cause: error,
+                  },
+                );
+              }
+              await this.store.remove(canonicalPath);
+            } else {
+              await this.store.write(canonicalPath, previousContents);
+            }
+          } catch (restoreError) {
+            throw new AggregateError(
+              [error, restoreError],
+              `Ink surface ${surfaceId} conflict repair and rollback both failed; manual repair is required.`,
+              { cause: restoreError },
+            );
+          }
+          throw error;
+        }
+        await this.refreshSummaryIndex(resolved);
+        this.onSurfaceChanged(resolved);
+        return resolved;
+      }),
+    );
   }
 
   async listSurfaceSummaries(filePath: string): Promise<readonly InkSurfaceSummary[]> {
+    await this.recoverAtomicBatch(filePath);
     const path = await this.summaryIndexPath(filePath);
     const contents = await this.store.read(path);
     if (contents !== null) {
@@ -233,9 +366,9 @@ export class InkSurfaceRepository {
       return null;
     }
     const filePath = normalizeVaultPath(parsed.filePath);
-    const key = `${filePath}\u0000summary`;
+    const key = summaryWriteKey(filePath);
+    const loaded = await this.listSurfaces(filePath);
     await this.enqueueWrite(key, async () => {
-      const loaded = await this.listSurfaces(filePath);
       await this.writeSummaryIndex(filePath, summarizeLoadedSurfaces(loaded));
     });
     return filePath;
@@ -276,6 +409,7 @@ export class InkSurfaceRepository {
     const reclaimed: InkSurfaceRecord[] = [];
     for (const record of loaded.records) {
       if (
+        record.schemaVersion === 2 ||
         record.deletedAt !== undefined ||
         record.strokes.some((stroke) => stroke.tool !== 'eraser')
       ) {
@@ -308,6 +442,14 @@ export class InkSurfaceRepository {
   }
 
   async listSurfaces(filePath: string): Promise<{
+    readonly conflicts: readonly InkSurfaceConflict[];
+    readonly issues: readonly InkSurfaceRepositoryIssue[];
+    readonly records: readonly InkSurfaceRecord[];
+  }> {
+    return this.withNoteBatchLock(filePath, () => this.listSurfacesNow(filePath));
+  }
+
+  private async listSurfacesNow(filePath: string): Promise<{
     readonly conflicts: readonly InkSurfaceConflict[];
     readonly issues: readonly InkSurfaceRepositoryIssue[];
     readonly records: readonly InkSurfaceRecord[];
@@ -448,8 +590,97 @@ export class InkSurfaceRepository {
     return `${await this.noteRoot(filePath)}/ink-summaries.json`;
   }
 
+  private async batchJournalPath(filePath: string): Promise<string> {
+    return `${await this.noteRoot(filePath)}/ink-batch-journal.json`;
+  }
+
+  private recoverAtomicBatch(filePath: string): Promise<void> {
+    const normalized = normalizeVaultPath(filePath);
+    return this.enqueueWrite(batchWriteKey(normalized), () =>
+      this.recoverAtomicBatchNow(normalized),
+    );
+  }
+
+  private withNoteBatchLock<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+    const normalized = normalizeVaultPath(filePath);
+    return this.enqueueWrite(batchWriteKey(normalized), async () => {
+      await this.recoverAtomicBatchNow(normalized);
+      return operation();
+    });
+  }
+
+  private async recoverAtomicBatchNow(filePath: string): Promise<void> {
+    const journalPath = await this.batchJournalPath(filePath);
+    const contents = await this.store.read(journalPath);
+    if (contents === null || contents === '') return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(contents);
+    } catch (error) {
+      throw new Error('Ink batch recovery journal is corrupt; manual repair is required.', {
+        cause: error,
+      });
+    }
+    const root = `${await this.surfaceRoot(filePath)}/`;
+    if (!isInkSurfaceBatchJournal(parsed, filePath, root)) {
+      throw new Error('Ink batch recovery journal is invalid; manual repair is required.');
+    }
+    try {
+      for (const entry of parsed.entries) {
+        await this.assertNoteIdentity(decodeInkSurfaceRecord(entry.nextContents));
+      }
+    } catch (error) {
+      throw new Error('Ink batch recovery journal is invalid; manual repair is required.', {
+        cause: error,
+      });
+    }
+
+    const canonicalEntries: Array<{
+      readonly contents: string;
+      readonly path: string;
+    }> = [];
+    for (const entry of parsed.entries) {
+      const canonicalPath = normalizeVaultPath(entry.path);
+      const canonicalContents = await this.store.read(canonicalPath);
+      if (
+        canonicalContents === null ||
+        (canonicalContents !== entry.previousContents && canonicalContents !== entry.nextContents)
+      ) {
+        throw new Error(
+          'Ink batch recovery journal canonical bytes changed after the journal was prepared; manual repair is required.',
+        );
+      }
+      canonicalEntries.push({
+        contents: parsed.phase === 'committed' ? entry.nextContents : entry.previousContents,
+        path: canonicalPath,
+      });
+    }
+    for (const entry of canonicalEntries) {
+      await this.store.write(entry.path, entry.contents);
+    }
+    await this.invalidateSummaryIndex(filePath);
+    await this.clearBatchJournal(journalPath);
+  }
+
+  private async invalidateSummaryIndex(filePath: string): Promise<void> {
+    const path = await this.summaryIndexPath(filePath);
+    if (this.store.remove !== undefined) {
+      await this.store.remove(path);
+      return;
+    }
+    await this.store.write(path, '');
+  }
+
+  private async clearBatchJournal(path: string): Promise<void> {
+    if (this.store.remove !== undefined) {
+      await this.store.remove(path);
+      return;
+    }
+    await this.store.write(path, '');
+  }
+
   private async refreshSummaryIndex(record: InkSurfaceRecord): Promise<void> {
-    const key = `${normalizeVaultPath(record.filePath)}\u0000summary`;
+    const key = summaryWriteKey(record.filePath);
     await this.enqueueWrite(key, async () => {
       const path = await this.summaryIndexPath(record.filePath);
       const contents = await this.store.read(path);
@@ -502,6 +733,22 @@ export class InkSurfaceRepository {
     });
     return operation;
   }
+}
+
+function sharedVaultWrites(scope: object): Map<string, Promise<void>> {
+  const globalRecord = globalThis as unknown as Record<PropertyKey, unknown>;
+  let registry = globalRecord[SHARED_WRITE_COORDINATOR] as
+    WeakMap<object, Map<string, Promise<void>>> | undefined;
+  if (registry === undefined) {
+    registry = new WeakMap();
+    globalRecord[SHARED_WRITE_COORDINATOR] = registry;
+  }
+  let writes = registry.get(scope);
+  if (writes === undefined) {
+    writes = new Map();
+    registry.set(scope, writes);
+  }
+  return writes;
 }
 
 function sortSummaries(summaries: readonly InkSurfaceSummary[]): readonly InkSurfaceSummary[] {
@@ -567,6 +814,28 @@ function hasDivergentRecords(candidates: readonly InkSurfaceCandidate[]): boolea
   return new Set(candidates.map((candidate) => encodeInkSurfaceRecord(candidate.record))).size > 1;
 }
 
+function sameSurfaceRecord(left: InkSurfaceRecord, right: InkSurfaceRecord): boolean {
+  return encodeInkSurfaceRecord(left) === encodeInkSurfaceRecord(right);
+}
+
+function alignExpectedBases(
+  records: readonly InkSurfaceRecord[],
+  expectedBases: readonly InkSurfaceRecord[] | undefined,
+): ReadonlyMap<string, InkSurfaceRecord> | undefined {
+  if (expectedBases === undefined) return undefined;
+  const byId = new Map<string, InkSurfaceRecord>();
+  for (const expectedBase of expectedBases) {
+    if (byId.has(expectedBase.id)) {
+      throw new Error('Atomic Ink expected bases contain duplicate surface IDs.');
+    }
+    byId.set(expectedBase.id, expectedBase);
+  }
+  if (byId.size !== records.length || records.some((record) => !byId.has(record.id))) {
+    throw new Error('Atomic Ink expected bases must align exactly by surface ID.');
+  }
+  return byId;
+}
+
 function normalizeSurfaceId(surfaceId: string): string {
   if (!/^[a-zA-Z0-9-]+$/u.test(surfaceId)) {
     throw new Error('Ink surface ID contains unsupported path characters.');
@@ -575,7 +844,100 @@ function normalizeSurfaceId(surfaceId: string): string {
 }
 
 function surfaceWriteKey(filePath: string, surfaceId: string): string {
-  return `${normalizeVaultPath(filePath)}\u0000${normalizeSurfaceId(surfaceId)}`;
+  return `surface\u0000${normalizeVaultPath(filePath)}\u0000${normalizeSurfaceId(surfaceId)}`;
+}
+
+function batchWriteKey(filePath: string): string {
+  return `batch\u0000${normalizeVaultPath(filePath)}`;
+}
+
+function summaryWriteKey(filePath: string): string {
+  return `summary\u0000${normalizeVaultPath(filePath)}`;
+}
+
+function isInkSurfaceBatchJournal(
+  value: unknown,
+  filePath: string,
+  surfaceRoot: string,
+): value is InkSurfaceBatchJournal {
+  let normalizedJournalFilePath: string;
+  let normalizedRequestedFilePath: string;
+  try {
+    normalizedJournalFilePath =
+      isRecord(value) && typeof value.filePath === 'string'
+        ? normalizeVaultPath(value.filePath)
+        : '';
+    normalizedRequestedFilePath = normalizeVaultPath(filePath);
+  } catch {
+    return false;
+  }
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    (value.phase !== 'prepared' && value.phase !== 'committed') ||
+    typeof value.filePath !== 'string' ||
+    value.filePath !== normalizedJournalFilePath ||
+    normalizedJournalFilePath !== normalizedRequestedFilePath ||
+    !Array.isArray(value.entries) ||
+    value.entries.length === 0
+  ) {
+    return false;
+  }
+  const paths = value.entries.map((entry) =>
+    isRecord(entry) && typeof entry.path === 'string' ? entry.path : null,
+  );
+  if (paths.some((path) => path === null) || new Set(paths).size !== paths.length) {
+    return false;
+  }
+  return value.entries.every((entry) =>
+    isValidInkSurfaceBatchJournalEntry(entry, filePath, surfaceRoot),
+  );
+}
+
+function isValidInkSurfaceBatchJournalEntry(
+  entry: unknown,
+  filePath: string,
+  surfaceRoot: string,
+): boolean {
+  if (
+    !isRecord(entry) ||
+    typeof entry.path !== 'string' ||
+    !isCanonicalJournalSurfacePath(entry.path, surfaceRoot) ||
+    typeof entry.previousContents !== 'string' ||
+    typeof entry.nextContents !== 'string'
+  ) {
+    return false;
+  }
+  const filename = entry.path.slice(surfaceRoot.length);
+  const surfaceId = filename.slice(0, -'.json'.length);
+  try {
+    const previous = decodeInkSurfaceRecord(entry.previousContents);
+    const next = decodeInkSurfaceRecord(entry.nextContents);
+    const normalizedFilePath = normalizeVaultPath(filePath);
+    return (
+      previous.id === surfaceId &&
+      next.id === surfaceId &&
+      previous.filePath === normalizedFilePath &&
+      next.filePath === normalizedFilePath &&
+      previous.noteId === next.noteId &&
+      next.revision === previous.revision + 1
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isCanonicalJournalSurfacePath(path: string, surfaceRoot: string): boolean {
+  try {
+    const normalized = normalizeVaultPath(path);
+    return (
+      normalized === path &&
+      normalized.startsWith(surfaceRoot) &&
+      /^[a-zA-Z0-9-]+\.json$/u.test(normalized.slice(surfaceRoot.length))
+    );
+  } catch {
+    return false;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

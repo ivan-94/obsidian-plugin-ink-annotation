@@ -22,10 +22,15 @@ const JOURNAL_TEMP_SUFFIX = '.inkstone-tmp';
 
 /** Uses Obsidian's mobile-safe DataAdapter because Vault intentionally does not index dot-folders. */
 export class ObsidianVaultTextFileStore implements TextFileStore {
+  readonly coordinationScope: object;
+  private readonly recentWrites = new Map<string, number>();
+
   constructor(
     private readonly adapter: DataAdapterLike,
     private readonly readTimeoutMs = 15_000,
-  ) {}
+  ) {
+    this.coordinationScope = adapter;
+  }
 
   async list(directory: string): Promise<readonly string[]> {
     const normalized = normalizeVaultPath(directory);
@@ -124,6 +129,7 @@ export class ObsidianVaultTextFileStore implements TextFileStore {
 
   async write(path: string, contents: string): Promise<void> {
     const normalized = normalizeVaultPath(path);
+    this.recentWrites.set(normalized, Date.now());
     const separator = normalized.lastIndexOf('/');
     if (separator > 0) {
       await this.mkdir(normalized.slice(0, separator));
@@ -133,6 +139,16 @@ export class ObsidianVaultTextFileStore implements TextFileStore {
       return;
     }
     await this.writeJournaled(normalized, contents);
+  }
+
+  wasRecentlyWritten(path: string, now = Date.now()): boolean {
+    const normalized = normalizeVaultPath(path);
+    const writtenAt = this.recentWrites.get(normalized);
+    if (writtenAt === undefined) return false;
+    const age = now - writtenAt;
+    if (age >= 0 && age <= 5_000) return true;
+    this.recentWrites.delete(normalized);
+    return false;
   }
 
   async writeBinary(path: string, contents: ArrayBuffer): Promise<void> {

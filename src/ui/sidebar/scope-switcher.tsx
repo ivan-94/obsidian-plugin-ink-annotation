@@ -1,4 +1,5 @@
 import type { AnnotationSidebarStore, SidebarScope } from '../stores/annotation-sidebar-store';
+import { ObsidianIcon } from '../primitives/obsidian-icon';
 
 export function ScopeSwitcher({
   onScopeChange,
@@ -16,22 +17,26 @@ export function ScopeSwitcher({
   return (
     <div aria-label="Annotation scope" className="inkstone-sidebar__scope" role="tablist">
       <button
+        aria-label="Current file"
         aria-pressed={activeScope === 'current-file'}
         aria-selected={activeScope === 'current-file'}
         onClick={() => select('current-file')}
         role="tab"
         type="button"
       >
-        Current file
+        <ObsidianIcon className="inkstone-sidebar__scope-icon" icon="file-text" />
+        <span className="inkstone-sidebar__scope-label">Current file</span>
       </button>
       <button
+        aria-label="Entire Vault"
         aria-pressed={activeScope === 'entire-vault'}
         aria-selected={activeScope === 'entire-vault'}
         onClick={() => select('entire-vault')}
         role="tab"
         type="button"
       >
-        Entire Vault
+        <ObsidianIcon className="inkstone-sidebar__scope-icon" icon="library" />
+        <span className="inkstone-sidebar__scope-label">Entire Vault</span>
       </button>
     </div>
   );

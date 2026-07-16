@@ -44,6 +44,33 @@ describe('rendered Markdown source mapping', () => {
     expect(rendered).toEqual({ end: 16, exact: 'Markdown', start: 8 });
   });
 
+  it('maps a selection spanning ordinary presentation markers in both directions', () => {
+    const source =
+      'This paragraph contains **bold text**, _italic text_, ==highlighted text==, and ~~struck text~~.';
+    const rendered =
+      'This paragraph contains bold text, italic text, highlighted text, and struck text.';
+
+    const mapped = mapRenderedRangeToSource({
+      renderedEnd: rendered.length,
+      renderedStart: 0,
+      renderedText: rendered,
+      sectionSource: source,
+      sectionSourceStart: 0,
+    });
+
+    expect(mapped).toEqual({ end: source.length, exact: rendered, start: 0 });
+    expect(
+      mapSourceRangeToRendered({
+        exact: source,
+        renderedText: rendered,
+        sectionSource: source,
+        sectionSourceStart: 0,
+        sourceEnd: source.length,
+        sourceStart: 0,
+      }),
+    ).toEqual({ end: rendered.length, exact: rendered, start: 0 });
+  });
+
   it('locates one paragraph block when Obsidian returns the containing document section', () => {
     const sectionSource =
       '# Fixtures\n\nThis paragraph contains **bold text** and _italic text_.\n\n## Next';

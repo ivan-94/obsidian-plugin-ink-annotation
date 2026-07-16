@@ -1,4 +1,9 @@
-import type { InkPoint, InkStroke, InkSurfaceRecord } from '../domain/ink-surface';
+import {
+  inkSurfaceVisibleBounds,
+  type InkPoint,
+  type InkStroke,
+  type InkSurfaceRecord,
+} from '../domain/ink-surface';
 
 export interface InkExportBackgroundOptions {
   readonly background: string;
@@ -8,6 +13,7 @@ export function exportInkSvg(
   record: InkSurfaceRecord,
   options: InkExportBackgroundOptions = { background: 'transparent' },
 ): string {
+  const bounds = inkSurfaceVisibleBounds(record);
   const background =
     options.background === 'transparent'
       ? ''
@@ -22,7 +28,7 @@ export function exportInkSvg(
       return `<path data-ink-stroke-id="${escapeXml(stroke.linkedStrokeId ?? stroke.id)}" data-ink-tool="${stroke.tool}" d="${path}" fill="none" stroke="${escapeXml(stroke.color)}" stroke-linecap="round" stroke-linejoin="round" stroke-width="${format(stroke.width)}"${opacity}/>`;
     })
     .join('');
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${format(record.layout.logicalWidth)} ${format(record.layout.logicalHeight)}" role="img" aria-label="Ink annotation">${background}${paths}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${format(bounds.minX)} ${format(bounds.minY)} ${format(bounds.width)} ${format(bounds.height)}" role="img" aria-label="Ink annotation">${background}${paths}</svg>`;
 }
 
 export function exportInkPng(
@@ -37,13 +43,24 @@ export function exportInkPng(
       pixels.set(background, offset);
     }
   }
-  const scaleX = options.width / record.layout.logicalWidth;
-  const scaleY = options.height / record.layout.logicalHeight;
+  const bounds = inkSurfaceVisibleBounds(record);
+  const scaleX = options.width / bounds.width;
+  const scaleY = options.height / bounds.height;
   for (const stroke of record.strokes) {
     if (stroke.tool === 'eraser') continue;
     const color = parseColor(stroke.color);
     if (stroke.tool === 'highlighter') color[3] = Math.round((color[3] as number) * 0.45);
-    rasterStroke(pixels, options.width, options.height, stroke, scaleX, scaleY, color);
+    rasterStroke(
+      pixels,
+      options.width,
+      options.height,
+      stroke,
+      scaleX,
+      scaleY,
+      bounds.minX,
+      bounds.minY,
+      color,
+    );
   }
   return encodePng(options.width, options.height, pixels);
 }
@@ -72,23 +89,33 @@ function rasterStroke(
   stroke: InkStroke,
   scaleX: number,
   scaleY: number,
+  minimumX: number,
+  minimumY: number,
   color: Uint8Array,
 ): void {
   const radius = Math.max(0.5, (stroke.width * Math.min(scaleX, scaleY)) / 2);
   const points = stroke.points;
   if (points.length === 1) {
     const only = points[0] as InkPoint;
-    paintDisk(pixels, width, height, only.x * scaleX, only.y * scaleY, radius, color);
+    paintDisk(
+      pixels,
+      width,
+      height,
+      (only.x - minimumX) * scaleX,
+      (only.y - minimumY) * scaleY,
+      radius,
+      color,
+    );
     return;
   }
   for (let index = 1; index < points.length; index += 1) {
     const start = points[index - 1];
     const end = points[index];
     if (start === undefined || end === undefined) continue;
-    const startX = start.x * scaleX;
-    const startY = start.y * scaleY;
-    const endX = end.x * scaleX;
-    const endY = end.y * scaleY;
+    const startX = (start.x - minimumX) * scaleX;
+    const startY = (start.y - minimumY) * scaleY;
+    const endX = (end.x - minimumX) * scaleX;
+    const endY = (end.y - minimumY) * scaleY;
     const steps = Math.max(1, Math.ceil(Math.hypot(endX - startX, endY - startY) * 1.5));
     for (let step = 0; step <= steps; step += 1) {
       const ratio = step / steps;

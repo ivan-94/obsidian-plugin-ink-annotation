@@ -58,9 +58,6 @@ export function mapRenderedRangeToSource(input: RenderedRangeInput): MappedSourc
   const localStart = selected.start + localStartInBlock;
   const localEnd = selected.start + lastSourceOffset + 1;
   const exact = input.renderedText.slice(input.renderedStart, input.renderedEnd);
-  if (input.sectionSource.slice(localStart, localEnd) !== exact) {
-    throw new Error('Selection crosses Markdown presentation markers and is unsupported in S02.');
-  }
 
   return {
     end: input.sectionSourceStart + localEnd,
@@ -86,17 +83,26 @@ export function mapSourceRangeToRendered(input: SourceRangeInput): MappedSourceR
   const blockLocalStart = localStart - selected.start;
   const blockLocalEnd = localEnd - selected.start;
 
-  const renderedStart = projection.sourceOffsets.indexOf(blockLocalStart);
-  const renderedLast = projection.sourceOffsets.indexOf(blockLocalEnd - 1);
-  if (renderedStart < 0 || renderedLast < renderedStart) {
-    throw new Error('Persisted source range crosses unsupported Markdown presentation markers.');
+  const selectedRenderedOffsets = projection.sourceOffsets.flatMap((offset, renderedOffset) =>
+    offset >= blockLocalStart && offset < blockLocalEnd ? [renderedOffset] : [],
+  );
+  const renderedStart = selectedRenderedOffsets[0];
+  const renderedLast = selectedRenderedOffsets.at(-1);
+  if (renderedStart === undefined || renderedLast === undefined) {
+    throw new Error('Persisted source range has no visible rendered characters.');
+  }
+  if (
+    renderedLast - renderedStart + 1 !== selectedRenderedOffsets.length ||
+    projection.sourceOffsets
+      .slice(renderedStart, renderedLast + 1)
+      .some((offset) => offset < blockLocalStart || offset >= blockLocalEnd)
+  ) {
+    throw new Error('Persisted source range does not map to one contiguous rendered selection.');
   }
   const renderedEnd = renderedLast + 1;
-  if (input.renderedText.slice(renderedStart, renderedEnd) !== input.exact) {
-    throw new Error('Persisted quote does not match the rendered characters.');
-  }
+  const renderedExact = input.renderedText.slice(renderedStart, renderedEnd);
 
-  return { end: renderedEnd, exact: input.exact, start: renderedStart };
+  return { end: renderedEnd, exact: renderedExact, start: renderedStart };
 }
 
 function selectRenderedBlock(

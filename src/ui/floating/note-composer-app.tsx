@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef } from 'preact/hooks';
 
-import type { TextAnnotationRecord } from '../../domain/text-annotation';
+import { annotationTargetText, type TextAnnotationRecord } from '../../domain/text-annotation';
 import type { NoteComposerLayout } from '../note-composer';
 import { registerDismissibleLayer } from '../runtime/dismissible-layer';
 import { parseNoteTags, type NoteComposerStore } from '../stores/note-composer-store';
@@ -76,7 +76,7 @@ export function NoteComposerApp({
     >
       <div className="inkstone-note-composer__header">
         <blockquote className="inkstone-note-composer__quote">
-          {draft.target.quote.exact}
+          {annotationTargetText(draft.target)}
         </blockquote>
         <button
           aria-label="Close note"

@@ -8,6 +8,8 @@ import { hashText } from '../domain/text-anchor';
 const SIDECAR_ROOT = '.obsidian-annotations/v1/notes';
 
 export interface TextFileStore {
+  /** Stable vault-scoped object used to serialize writes across plugin/repository instances. */
+  readonly coordinationScope?: object;
   /** Returns direct child basenames, never absolute or directory-prefixed paths. */
   list(directory: string): Promise<readonly string[]>;
   mkdir(path: string): Promise<void>;

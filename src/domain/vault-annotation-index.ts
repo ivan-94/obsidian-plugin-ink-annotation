@@ -1,4 +1,4 @@
-import type { TextAnnotationRecord } from './text-annotation';
+import { annotationTargetText, type TextAnnotationRecord } from './text-annotation';
 import type { InkSurfaceSummary } from './ink-surface-summary';
 
 export type AnnotationIndexStatus = TextAnnotationRecord['status'] | 'needs-rebase';
@@ -288,7 +288,7 @@ export function textRecordToIndexEntry(
     id: record.id,
     noteId: record.noteId,
     position: record.target.position.start,
-    quote: record.target.quote.exact,
+    quote: annotationTargetText(record.target),
     revision: record.revision,
     status: record.status,
     ...(record.mark === undefined ? {} : { styleId: record.mark.styleId }),

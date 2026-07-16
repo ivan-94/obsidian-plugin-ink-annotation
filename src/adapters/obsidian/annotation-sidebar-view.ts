@@ -7,9 +7,10 @@ import {
   inkSummaryToIndexEntry,
   textRecordToIndexEntry,
 } from '../../domain/vault-annotation-index';
-import type { TextAnnotationRecord } from '../../domain/text-annotation';
+import { annotationTargetText, type TextAnnotationRecord } from '../../domain/text-annotation';
 import type { StylePreset } from '../../domain/style-preset';
 import type { CurrentFileAnnotationList } from '../../domain/current-file-annotation-list';
+import type { InkSurfaceRecord } from '../../domain/ink-surface';
 import { CurrentFileSidebar } from '../../ui/current-file-sidebar';
 import { VaultAnnotationSidebar } from '../../ui/vault-annotation-sidebar';
 import type {
@@ -178,6 +179,26 @@ export class AnnotationSidebarView extends ItemView {
     await this.refreshCurrentFile();
   }
 
+  applyInkSurfaceChanged(record: InkSurfaceRecord): void {
+    const summary = summarizeInkSurface(record);
+    if (this.currentCache?.filePath === record.filePath) {
+      this.currentCache = {
+        ...this.currentCache,
+        inkSummaries: replaceInkSummary(this.currentCache.inkSummaries, summary),
+      };
+    }
+    if (
+      this.sidebarStore.scope.value !== 'current-file' ||
+      this.sidebarStore.current.filePath.value !== record.filePath
+    ) {
+      return;
+    }
+    this.sidebarStore.current.inkSummaries.value = replaceInkSummary(
+      this.sidebarStore.current.inkSummaries.value,
+      summary,
+    );
+  }
+
   selectAnnotation(annotationIds: readonly string[]): boolean {
     for (const annotationId of annotationIds) {
       if (this.currentComponent?.selectAnnotation(annotationId) === true) {
@@ -311,6 +332,18 @@ export class AnnotationSidebarView extends ItemView {
           void this.commands.exportInkSvg(filePath, surfaceId).catch(this.commands.issue);
       },
       onInspect: this.commands.inspectAnnotation,
+      ...(this.commands.repairAnnotation === undefined
+        ? {}
+        : {
+            onRepairAnnotation: (annotationId: string, invoker: HTMLElement) => {
+              const filePath = this.commands.getCurrentFilePath();
+              if (filePath !== null) {
+                void this.commands
+                  .repairAnnotation?.(filePath, annotationId, invoker)
+                  .catch(this.commands.issue);
+              }
+            },
+          }),
       onRetry: () => void this.refreshCurrentFile(),
       onReviewConflicts: (invoker) => this.showConflictDialog(invoker),
       onRestoreInk: (surfaceId) => {
@@ -591,7 +624,7 @@ export class AnnotationSidebarView extends ItemView {
           ...(record.deviceId === undefined ? {} : { deviceId: record.deviceId }),
           ...(record.mark === undefined ? {} : { mark: record.mark }),
           path,
-          quote: record.target.quote.exact,
+          quote: annotationTargetText(record.target),
           revision: record.revision,
           tags: record.tags,
           updatedAt: record.updatedAt,
@@ -642,6 +675,15 @@ export class AnnotationSidebarView extends ItemView {
       },
     });
   }
+}
+
+function replaceInkSummary(
+  summaries: readonly InkSurfaceSummary[],
+  replacement: InkSurfaceSummary,
+): readonly InkSurfaceSummary[] {
+  const index = summaries.findIndex((summary) => summary.id === replacement.id);
+  if (index < 0) return [...summaries, replacement];
+  return summaries.map((summary, position) => (position === index ? replacement : summary));
 }
 
 function storageFailureMessage(error: unknown): string {

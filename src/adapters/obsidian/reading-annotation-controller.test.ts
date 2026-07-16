@@ -61,6 +61,63 @@ describe('Reading annotation controller', () => {
     expect(reloaded.resolved).toHaveLength(1);
   });
 
+  it('persists visible text separately when a selection spans presentation markers', async () => {
+    const source =
+      'This paragraph contains **bold text**, _italic text_, ==highlighted text==, and ~~struck text~~.';
+    const rendered =
+      'This paragraph contains bold text, italic text, highlighted text, and struck text.';
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    const ids = ['note-1', 'annotation-1'];
+    const controller = new ReadingAnnotationController({
+      collapseSelection: () => undefined,
+      document,
+      service: new AnnotationService({
+        createId: () => ids.shift() ?? 'unexpected-id',
+        repository,
+      }),
+    });
+    const root = document.createElement('section');
+    root.innerHTML =
+      '<p>This paragraph contains <strong>bold text</strong>, <em>italic text</em>, <mark>highlighted text</mark>, and <del>struck text</del>.</p>';
+    document.body.append(root);
+    const paragraph = root.querySelector('p');
+    const first = paragraph?.firstChild;
+    const last = paragraph?.lastChild;
+    if (!(first instanceof Text) || !(last instanceof Text)) {
+      throw new Error('Formatted paragraph fixture is malformed.');
+    }
+    const range = document.createRange();
+    range.setStart(first, 0);
+    range.setEnd(last, last.data.length);
+
+    await expect(
+      controller.showForRange({
+        anchorRect: new DOMRect(40, 80, 120, 20),
+        filePath: 'Formatted.md',
+        fullSource: source,
+        range,
+        readingRoot: root,
+        scope: { sectionEndLine: 0, sectionStartLine: 0 },
+        sectionSource: source,
+        sectionSourceStart: 0,
+      }),
+    ).resolves.toEqual({ supported: true });
+
+    document.querySelector<HTMLButtonElement>('button[aria-label="Highlight: Sun"]')?.click();
+    await vi.waitFor(async () => {
+      const [record] = (await repository.listAnnotations('Formatted.md')).records;
+      expect(record).toMatchObject({
+        target: { displayText: rendered, quote: { exact: source } },
+      });
+    });
+    expect(
+      [...root.querySelectorAll<HTMLElement>('.inkstone-text-highlight')]
+        .map((element) => element.textContent)
+        .join(''),
+    ).toBe(rendered);
+  });
+
   it('commits underline with the recent style and renders underline semantics', async () => {
     const store = new MemoryTextFileStore();
     const repository = new SidecarRepository(store);

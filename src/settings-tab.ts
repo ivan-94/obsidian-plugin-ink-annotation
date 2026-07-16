@@ -14,6 +14,17 @@ export class InkstoneSettingTab extends PluginSettingTab {
     this.containerEl.empty();
 
     new Setting(this.containerEl)
+      .setName('Show Ink preview by default')
+      .setDesc(
+        'Open notes with saved Ink in a read-only fixed-width preview. Turn this off to keep Obsidian Reading View raw until Ink editing starts.',
+      )
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.getSettings().showInkPreviewByDefault)
+          .onChange(async (enabled) => this.plugin.setShowInkPreviewByDefault(enabled));
+      });
+
+    new Setting(this.containerEl)
       .setName('Diagnostics')
       .setDesc(
         'Keep local timing samples. Annotation text, ink points, and file paths are never logged.',

@@ -31,6 +31,11 @@ export interface AnnotationSidebarCommands {
   readonly navigateToAnnotation: (annotationId: string) => boolean;
   readonly navigateToInk: (summary: InkSurfaceSummary) => void;
   readonly navigateToVaultAnnotation: (entry: AnnotationIndexEntry) => void;
+  readonly repairAnnotation?: (
+    filePath: string,
+    annotationId: string,
+    invoker: HTMLElement,
+  ) => Promise<void>;
   readonly repairInkConflict: (
     filePath: string,
     conflict: InkSurfaceConflict,

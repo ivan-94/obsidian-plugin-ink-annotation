@@ -3,6 +3,17 @@ import { describe, expect, it } from 'vitest';
 import { ObsidianVaultTextFileStore } from './vault-text-file-store';
 
 describe('Obsidian DataAdapter text-file store', () => {
+  it('exposes the stable adapter identity as the cross-reload write coordination scope', () => {
+    const adapter = new MemoryDataAdapter();
+
+    const first = new ObsidianVaultTextFileStore(adapter);
+    const reloaded = new ObsidianVaultTextFileStore(adapter);
+
+    expect(first).not.toBe(reloaded);
+    expect(first.coordinationScope).toBe(adapter);
+    expect(reloaded.coordinationScope).toBe(first.coordinationScope);
+  });
+
   it('creates hidden nested folders and supports read, update and direct-child listing', async () => {
     const adapter = new MemoryDataAdapter();
     const store = new ObsidianVaultTextFileStore(adapter);
@@ -70,6 +81,19 @@ describe('Obsidian DataAdapter text-file store', () => {
     await expect(store.read(target)).resolves.toBe('revision 2');
     await expect(adapter.exists(`${target}.inkstone-bak`)).resolves.toBe(false);
     await expect(adapter.exists(`${target}.inkstone-tmp`)).resolves.toBe(false);
+  });
+
+  it('identifies canonical paths recently written by this plugin for watcher deduplication', async () => {
+    const adapter = new MemoryDataAdapter();
+    const store = new ObsidianVaultTextFileStore(adapter);
+    const target = '.obsidian-annotations/v1/notes/hash/surfaces/surface-1.json';
+
+    expect(store.wasRecentlyWritten(target, 1_000)).toBe(false);
+    await store.write(target, 'revision 1');
+    const writtenAt = Date.now();
+
+    expect(store.wasRecentlyWritten(target, writtenAt)).toBe(true);
+    expect(store.wasRecentlyWritten(target, writtenAt + 5_001)).toBe(false);
   });
 });
 

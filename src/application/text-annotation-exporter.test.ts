@@ -48,6 +48,24 @@ describe('text annotation exporter', () => {
     expect(sortTextAnnotationExportItems([items[1] as TextAnnotationExportItem])).toHaveLength(1);
   });
 
+  it('exports visible selection text instead of raw presentation markers', async () => {
+    const formatted = record({
+      displayText: 'Visible formatted text',
+      filePath: 'Formatted.md',
+      id: 'formatted',
+      position: 0,
+      quote: '**Visible** ==formatted== text',
+    });
+
+    const report = await collectTextAnnotationExport([{ record: formatted }], {
+      format: 'markdown-report',
+      generatedAt: '2026-07-14T18:00:00.000Z',
+    });
+
+    expect(report).toContain('> Visible formatted text');
+    expect(report).not.toContain('**Visible** ==formatted== text');
+  });
+
   it('keeps note-only, conflict, unanchored context, overlap, CJK, emoji and special characters', async () => {
     const report = await collectTextAnnotationExport(
       sortTextAnnotationExportItems([
@@ -164,6 +182,7 @@ function fixture(): readonly TextAnnotationExportItem[] {
 function record(input: {
   readonly anchorFailure?: TextAnnotationRecord['anchorFailure'];
   readonly body?: string;
+  readonly displayText?: string;
   readonly filePath: string;
   readonly id: string;
   readonly mark?: TextAnnotationRecord['mark'];
@@ -191,6 +210,7 @@ function record(input: {
     status: input.status ?? 'active',
     tags: input.tags ?? [],
     target: {
+      ...(input.displayText === undefined ? {} : { displayText: input.displayText }),
       position: {
         end: input.position + input.quote.length,
         start: input.position,

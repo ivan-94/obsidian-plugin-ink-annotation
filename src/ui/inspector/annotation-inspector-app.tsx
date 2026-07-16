@@ -2,7 +2,7 @@ import type { Signal } from '@preact/signals';
 import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 
 import type { StylePreset } from '../../domain/style-preset';
-import type { TextAnnotationRecord } from '../../domain/text-annotation';
+import { annotationTargetText, type TextAnnotationRecord } from '../../domain/text-annotation';
 import { IconButton } from '../primitives/icon-button';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
 import { registerDismissibleLayer } from '../runtime/dismissible-layer';
@@ -10,7 +10,6 @@ import type { InspectorDraft, InspectorState } from '../stores/annotation-inspec
 
 export interface AnnotationInspectorAppProps {
   readonly anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>;
-  readonly canReattach: boolean;
   readonly document: Document;
   readonly invoker?: HTMLElement;
   readonly onCancelReattach: () => void;
@@ -20,7 +19,6 @@ export interface AnnotationInspectorAppProps {
   readonly onDelete: () => void;
   readonly onExport: (invoker: HTMLElement) => void;
   readonly onNavigate: () => void;
-  readonly onPreviewReattach: () => void;
   readonly onRequestDismiss: () => Promise<boolean>;
   readonly onSave: () => void;
   readonly onUndo: () => void;
@@ -123,7 +121,7 @@ function OverlapChooser({
           onClick={() => onChoose(record)}
           type="button"
         >
-          <span>{record.target.quote.exact}</span>
+          <span>{annotationTargetText(record.target)}</span>
           <span>{markTypeLabel(record.mark?.kind ?? 'note')}</span>
         </button>
       ))}
@@ -132,12 +130,10 @@ function OverlapChooser({
 }
 
 function AnnotationEditor({
-  canReattach,
   onCopy,
   onDelete,
   onExport,
   onNavigate,
-  onPreviewReattach,
   onSave,
   onUpdateDraft,
   presets,
@@ -162,7 +158,7 @@ function AnnotationEditor({
     <>
       <blockquote>
         <ObsidianIcon className="inkstone-annotation-inspector__quote-icon" icon="quote" />
-        <span>{state.draft.record.target.quote.exact}</span>
+        <span>{annotationTargetText(state.draft.record.target)}</span>
       </blockquote>
       <div className="inkstone-annotation-inspector__editor-controls">
         <div
@@ -223,15 +219,6 @@ function AnnotationEditor({
       <span aria-live="polite" data-inkstone-inspector-status="" role="status">
         {status}
       </span>
-      {state.draft.record.status === 'unanchored' && canReattach ? (
-        <IconButton
-          className="inkstone-annotation-inspector__repair"
-          icon="scan-text"
-          label="Preview reattachment"
-          onClick={onPreviewReattach}
-          text="Repair target"
-        />
-      ) : null}
       <div className="inkstone-annotation-inspector__footer">
         <div className="inkstone-annotation-inspector__actions">
           <InspectorAction
@@ -320,9 +307,24 @@ function ReattachmentPreview({
 }) {
   return (
     <>
-      <InspectorHeader icon="scan-text" title="Confirm replacement" />
-      <p>Original: {state.record.target.quote.exact}</p>
-      <p>Replacement: {state.candidate.contextPreview}</p>
+      <InspectorHeader icon="scan-text" title="Repair annotation" />
+      <p className="inkstone-annotation-inspector__repair-hint">
+        Replace the missing target with your current selection?
+      </p>
+      <div
+        aria-label="Target replacement preview"
+        className="inkstone-annotation-inspector__repair-comparison"
+      >
+        <section className="inkstone-annotation-inspector__repair-target">
+          <span>Current target</span>
+          <blockquote>{annotationTargetText(state.record.target)}</blockquote>
+        </section>
+        <ObsidianIcon className="inkstone-annotation-inspector__repair-arrow" icon="arrow-down" />
+        <section className="inkstone-annotation-inspector__repair-target inkstone-annotation-inspector__repair-target--new">
+          <span>New target</span>
+          <blockquote>{annotationTargetText(state.candidate.target)}</blockquote>
+        </section>
+      </div>
       <span role="alert">{state.action.kind === 'error' ? state.action.message : ''}</span>
       <div className="inkstone-annotation-inspector__decision-actions">
         <IconButton icon="x" label="Cancel reattachment" onClick={onCancel} text="Cancel" />
@@ -333,7 +335,7 @@ function ReattachmentPreview({
           icon="check"
           label="Confirm reattachment"
           onClick={onConfirm}
-          text="Confirm"
+          text="Use selection"
         />
       </div>
     </>

@@ -1,6 +1,6 @@
 import type { ReattachmentCandidate } from '../domain/annotation-reattachment';
 import type { StylePreset } from '../domain/style-preset';
-import type { TextAnnotationRecord } from '../domain/text-annotation';
+import { annotationTargetText, type TextAnnotationRecord } from '../domain/text-annotation';
 import {
   AnnotationInspectorApp,
   type AnnotationInspectorAppProps,
@@ -36,8 +36,6 @@ export class AnnotationInspector {
         candidate: ReattachmentCandidate,
       ) => Promise<TextAnnotationRecord>)
     | undefined;
-  private readonly onPreviewReattachRecord:
-    ((record: TextAnnotationRecord) => Promise<ReattachmentCandidate>) | undefined;
   private readonly onSaveRecord: (
     record: TextAnnotationRecord,
     changes: AnnotationInspectorChanges,
@@ -77,9 +75,6 @@ export class AnnotationInspector {
     this.onNavigateRecord(state.draft.record);
     this.setEditingFeedback('Source opened', 'navigate');
   };
-  private readonly handlePreviewReattach = (): void => {
-    void this.previewReattach();
-  };
   private readonly handleRequestDismiss = (): Promise<boolean> => this.requestDismiss();
   private readonly handleSave = (): void => {
     void this.performSave(true).then((saved) => {
@@ -112,7 +107,6 @@ export class AnnotationInspector {
       candidate: ReattachmentCandidate,
     ) => Promise<TextAnnotationRecord>;
     readonly onNavigate: (record: TextAnnotationRecord) => void;
-    readonly onPreviewReattach?: (record: TextAnnotationRecord) => Promise<ReattachmentCandidate>;
     readonly onSave: (
       record: TextAnnotationRecord,
       changes: AnnotationInspectorChanges,
@@ -126,7 +120,6 @@ export class AnnotationInspector {
     this.onExportRecord = input.onExport ?? (() => undefined);
     this.onConfirmReattachRecord = input.onConfirmReattach;
     this.onNavigateRecord = input.onNavigate;
-    this.onPreviewReattachRecord = input.onPreviewReattach;
     this.onSaveRecord = input.onSave;
     this.onUndoRecord = input.onUndo;
     this.presets = input.presets;
@@ -141,13 +134,45 @@ export class AnnotationInspector {
     if (input.records.length === 0) {
       throw new Error('Annotation inspector requires at least one record.');
     }
-    this.close(false);
-    this.anchorRect = input.anchorRect;
-    this.invoker = input.invoker;
     const initial =
       input.records.length > 1
         ? ({ kind: 'choosing', records: input.records } as const)
         : inspectorEditingState(input.records[0] as TextAnnotationRecord, this.presets);
+    this.mount(initial, input.anchorRect, input.invoker);
+  }
+
+  showReattachmentPreview(input: {
+    readonly anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>;
+    readonly candidate: ReattachmentCandidate;
+    readonly invoker?: HTMLElement;
+    readonly record: TextAnnotationRecord;
+  }): void {
+    if (input.record.status !== 'unanchored') {
+      throw new Error('Only an unanchored annotation can be repaired.');
+    }
+    if (input.candidate.annotationId !== input.record.id) {
+      throw new Error('Reattachment preview does not belong to this annotation.');
+    }
+    this.mount(
+      {
+        action: { kind: 'idle' },
+        candidate: input.candidate,
+        kind: 'previewing-reattachment',
+        record: input.record,
+      },
+      input.anchorRect,
+      input.invoker,
+    );
+  }
+
+  private mount(
+    initial: InspectorState,
+    anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>,
+    invoker: HTMLElement | undefined,
+  ): void {
+    this.close(false);
+    this.anchorRect = anchorRect;
+    this.invoker = invoker;
     this.store.state.value = initial;
     const host = this.document.createElement('div');
     host.dataset.inkstoneAnnotationInspectorHost = '';
@@ -204,7 +229,7 @@ export class AnnotationInspector {
     const record = state.draft.record;
     const text =
       kind === 'quote'
-        ? record.target.quote.exact
+        ? annotationTargetText(record.target)
         : kind === 'link'
           ? `obsidian://inkstone-annotation?file=${encodeURIComponent(record.filePath)}&id=${encodeURIComponent(record.id)}`
           : `${JSON.stringify(record, null, 2)}\n`;
@@ -263,32 +288,9 @@ export class AnnotationInspector {
     }
   }
 
-  private async previewReattach(): Promise<void> {
-    const state = this.store.state.value;
-    if (state.kind !== 'editing' || this.onPreviewReattachRecord === undefined) return;
-    this.transition({
-      ...state,
-      feedback: 'Reading replacement selection…',
-      successfulAction: null,
-    });
-    try {
-      const candidate = await this.onPreviewReattachRecord(state.draft.record);
-      this.transition({
-        action: { kind: 'idle' },
-        candidate,
-        kind: 'previewing-reattachment',
-        record: state.draft.record,
-      });
-    } catch {
-      this.setEditingFeedback('Select replacement text in Reading View, then retry.', null);
-    }
-  }
-
   private props(): AnnotationInspectorAppProps {
     return {
       anchorRect: this.anchorRect,
-      canReattach:
-        this.onPreviewReattachRecord !== undefined && this.onConfirmReattachRecord !== undefined,
       document: this.document,
       ...(this.invoker === undefined ? {} : { invoker: this.invoker }),
       onCancelReattach: this.handleCancelReattach,
@@ -298,7 +300,6 @@ export class AnnotationInspector {
       onDelete: this.handleDelete,
       onExport: this.handleExport,
       onNavigate: this.handleNavigate,
-      onPreviewReattach: this.handlePreviewReattach,
       onRequestDismiss: this.handleRequestDismiss,
       onSave: this.handleSave,
       onUndo: this.handleUndo,

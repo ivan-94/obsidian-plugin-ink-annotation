@@ -27,9 +27,11 @@ describe('production CSS architecture', () => {
   });
 
   it('gives the active Scope the remaining height without adding a second content inset', () => {
-    expect(styles).toMatch(/\.inkstone-annotation-sidebar-view\s*\{[^}]*padding:\s*0/u);
     expect(styles).toMatch(
-      /\.inkstone-sidebar\s*\{[^}]*--inkstone-sidebar-edge-padding:\s*8px[^}]*padding:\s*var\(--inkstone-sidebar-edge-padding\)/u,
+      /\.inkstone-annotation-sidebar-view\s*\{[^}]*padding:\s*0\s*!important/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-sidebar\s*\{[^}]*--inkstone-sidebar-edge-padding:\s*12px[^}]*padding:\s*var\(--inkstone-sidebar-edge-padding\)/u,
     );
     expect(styles).toMatch(
       /\.inkstone-sidebar--preact\s*\{[^}]*grid-template-rows:\s*auto\s+minmax\(0,\s*1fr\)/u,
@@ -58,13 +60,74 @@ describe('production CSS architecture', () => {
     );
   });
 
+  it('aligns the compact Vault toolbar controls with the header action size', () => {
+    expect(styles).toMatch(
+      /\.inkstone-sidebar--vault\s*\{[^}]*--inkstone-vault-toolbar-height:\s*var\(--inkstone-control-height\)/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-vault-search\s*\{[^}]*min-height:\s*var\(--inkstone-vault-toolbar-height\)/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-vault-toolbar\s*>\s*\.inkstone-icon-button\s*\{[^}]*min-width:\s*var\(--inkstone-vault-toolbar-height\)[^}]*min-height:\s*var\(--inkstone-vault-toolbar-height\)/u,
+    );
+  });
+
+  it('adapts the shared sidebar by container width instead of viewport width', () => {
+    expect(styles).toMatch(
+      /\.inkstone-annotation-sidebar-view\s*\{[^}]*container-name:\s*inkstone-sidebar[^}]*container-type:\s*inline-size/u,
+    );
+    expect(styles).toContain('@container inkstone-sidebar (max-width: 380px)');
+    expect(styles).toContain('@container inkstone-sidebar (max-width: 300px)');
+    expect(styles).toMatch(
+      /@container inkstone-sidebar \(max-width:\s*300px\)[\s\S]*?\.inkstone-sidebar__scope-label\s*\{[^}]*display:\s*none/u,
+    );
+    expect(styles).toMatch(
+      /@container inkstone-sidebar \(max-width:\s*380px\)[\s\S]*?--inkstone-sidebar-compact-control-size:\s*30px/u,
+    );
+    expect(styles).toMatch(
+      /@container inkstone-sidebar \(max-width:\s*380px\)[\s\S]*?--inkstone-sidebar-row-min-height:\s*58px/u,
+    );
+    expect(styles).toMatch(
+      /@container inkstone-sidebar \(max-width:\s*380px\)[\s\S]*?\.inkstone-sidebar__search\s*\{[^}]*min-height:\s*var\(--inkstone-sidebar-compact-control-size\)/u,
+    );
+    expect(styles).toMatch(
+      /@container inkstone-sidebar \(max-width:\s*380px\)[\s\S]*?\.inkstone-sidebar-ink-row\s+img\s*\{[^}]*width:\s*44px[^}]*height:\s*34px/u,
+    );
+  });
+
+  it('keeps Vault toolbar-to-results spacing compact without an empty chip row', () => {
+    expect(styles).toMatch(/\.inkstone-sidebar--vault\s*\{[^}]*gap:\s*6px/u);
+  });
+
+  it('uses compact type for Vault file headers and count badges', () => {
+    expect(styles).toMatch(
+      /\.inkstone-vault-group-header__toggle\s+strong\s*\{[^}]*font-size:\s*var\(--font-ui-smaller\)/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-vault-group-header__count\s*\{[^}]*min-width:\s*20px[^}]*font-size:\s*var\(--font-ui-smaller\)/u,
+    );
+  });
+
   it('keeps Vault checkboxes trailing and shares Current file selection feedback', () => {
     expect(styles).toMatch(
-      /\.inkstone-vault-row\[data-inkstone-bulk-selection='true'\]\s*\{[^}]*grid-template-columns:\s*auto\s+minmax\(0,\s*1fr\)\s+auto\s*;/u,
+      /\.inkstone-vault-row\[data-inkstone-bulk-selection='true'\]\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto\s*;/u,
     );
     expect(styles).toMatch(
       /:is\(\.inkstone-sidebar-row,\s*\.inkstone-sidebar-ink-row,\s*\.inkstone-vault-row\)\[aria-selected='true'\]\s*\{[^}]*background:\s*color-mix[^}]*border-color:\s*color-mix[^}]*box-shadow:\s*inset\s+3px/u,
     );
+  });
+
+  it('uses one shared visual contract for every list-item action trigger', () => {
+    expect(styles).toMatch(
+      /\.inkstone-list-item__action-trigger\s*\{[^}]*min-width:\s*30px[^}]*min-height:\s*30px[^}]*border:\s*0\s*!important/u,
+    );
+    expect(styles).not.toContain('.inkstone-vault-row > .inkstone-icon-button');
+    expect(styles).not.toContain('.inkstone-sidebar-row__actions > .inkstone-icon-button');
+    expect(styles).not.toContain('.inkstone-sidebar-ink-row__actions .inkstone-icon-button {');
+    expect(styles).not.toContain('.inkstone-sidebar__overflow-menu');
+    expect(styles).not.toContain('.inkstone-sidebar-row__menu');
+    expect(styles).not.toContain('.inkstone-sidebar-ink-row__menu');
+    expect(styles).not.toContain('.inkstone-vault-row__menu');
   });
 
   it('keeps the floating bulk toolbar icon-only and horizontally contained', () => {

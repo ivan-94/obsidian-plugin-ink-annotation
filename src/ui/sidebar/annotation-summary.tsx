@@ -3,18 +3,22 @@ import { MetadataLine } from '../primitives/metadata-line';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
 
 export function AnnotationSummary({
+  context = 'current',
   disabled = false,
   model,
   onActivate,
   selectionMode = false,
+  showSecondary = true,
 }: {
+  readonly context?: 'current' | 'vault';
   readonly disabled?: boolean;
   readonly model: AnnotationListItemModel;
   readonly onActivate: (button: HTMLButtonElement) => void;
   readonly selectionMode?: boolean;
+  readonly showSecondary?: boolean;
 }) {
-  if (model.kind === 'ink') {
-    const source = model.leading.kind === 'thumbnail' ? model.leading.source : '';
+  if (model.leading.kind === 'thumbnail') {
+    const source = model.leading.source;
     return (
       <button
         aria-disabled={disabled || undefined}
@@ -46,20 +50,26 @@ export function AnnotationSummary({
       type="button"
     >
       <ObsidianIcon
-        className={`inkstone-sidebar-row__marker inkstone-sidebar-row__marker--${model.kind}`}
+        className={`inkstone-sidebar-row__marker inkstone-sidebar-row__marker--${model.kind}${context === 'vault' ? ' inkstone-vault-row__type-icon' : ''}`}
         icon={leading?.icon ?? 'bookmark'}
         {...(leading?.styleId === undefined ? {} : { styleId: leading.styleId })}
       />
       <span className="inkstone-sidebar-row__content">
-        <span className="inkstone-sidebar-row__quote" title={model.title}>
+        <span
+          className={`inkstone-sidebar-row__quote${context === 'vault' ? ' inkstone-vault-row__quote' : ''}`}
+          title={model.title}
+        >
           {model.title}
         </span>
-        {model.secondary === undefined ? null : (
+        {!showSecondary || model.secondary === undefined ? null : (
           <span className="inkstone-sidebar-row__note" title={model.secondary}>
             {model.secondary}
           </span>
         )}
-        <MetadataLine className="inkstone-sidebar-row__metadata" tokens={model.metadata} />
+        <MetadataLine
+          className={`inkstone-sidebar-row__metadata${context === 'vault' ? ' inkstone-vault-row__metadata' : ''}`}
+          tokens={model.metadata}
+        />
       </span>
     </button>
   );

@@ -9,7 +9,7 @@ import {
 } from './ink-surface-session';
 
 interface BoundedSession {
-  readonly endY: number;
+  endY: number;
   readonly session: InkSurfaceSession;
   readonly startY: number;
   readonly surfaceId: string;
@@ -20,6 +20,13 @@ interface InkDocumentCommand {
   readonly before: ReadonlyMap<string, readonly InkStroke[]>;
 }
 
+export interface InkDocumentRecoverySnapshot {
+  readonly expectedBases: readonly InkSurfaceRecord[];
+  readonly pendingAttempts: readonly (InkSurfaceRecord | null)[];
+  readonly records: readonly InkSurfaceRecord[];
+  readonly requiresRecovery: boolean;
+}
+
 /**
  * Adapts independently persisted bounded surfaces to the single continuous canvas contract.
  * Surface boundaries remain an internal storage detail and never become visible UI tiles.
@@ -28,6 +35,8 @@ export class InkDocumentSession {
   private readonly bounded: readonly BoundedSession[];
   private readonly onChange: (snapshot: InkSurfaceSessionSnapshot) => void;
   private readonly redoStack: InkDocumentCommand[] = [];
+  private readonly selectedStrokeIdsSet = new Set<string>();
+  private selectionMovePreview: { readonly dx: number; readonly dy: number } | null = null;
   private readonly undoStack: InkDocumentCommand[] = [];
 
   constructor(input: {
@@ -40,23 +49,33 @@ export class InkDocumentSession {
     if (input.surfaces.length === 0) {
       throw new Error('A continuous Ink document requires at least one bounded surface.');
     }
-    const logicalWidth = input.surfaces[0]?.layout.logicalWidth;
+    if (input.surfaces.length > 1 && input.writer.updateSurfacesAtomically === undefined) {
+      throw new Error('A multi-chunk Ink document requires an atomic persistence writer.');
+    }
+    const surfaces = input.surfaces.every((surface) => surface.schemaVersion === 2)
+      ? [...input.surfaces].sort(
+          (left, right) => (left.layout.originY as number) - (right.layout.originY as number),
+        )
+      : input.surfaces;
+    const logicalWidth = surfaces[0]?.layout.logicalWidth;
     if (
       logicalWidth === undefined ||
-      input.surfaces.some((surface) => surface.layout.logicalWidth !== logicalWidth)
+      surfaces.some((surface) => surface.layout.logicalWidth !== logicalWidth)
     ) {
       throw new Error('All bounded Ink surfaces must share one fixed logical width.');
     }
     this.onChange = input.onChange ?? (() => undefined);
+    const writer = new CoalescingInkSurfaceWriter(input.writer);
     let startY = 0;
-    this.bounded = input.surfaces.map((surface) => {
+    this.bounded = surfaces.map((surface) => {
+      if (surface.schemaVersion === 2) startY = surface.layout.originY as number;
       const bounded: BoundedSession = {
         endY: startY + surface.layout.logicalHeight,
         session: new InkSurfaceSession({
           ...(input.debounceMs === undefined ? {} : { debounceMs: input.debounceMs }),
           ...(input.now === undefined ? {} : { now: input.now }),
           onChange: () => this.emit(),
-          repository: input.writer,
+          repository: writer,
           surface,
         }),
         startY,
@@ -69,11 +88,46 @@ export class InkDocumentSession {
 
   snapshot(): InkSurfaceSessionSnapshot {
     const snapshots = this.bounded.map((bounded) => bounded.session.snapshot());
+    const surface = compositeSurface(this.bounded, snapshots);
     return {
       persistence: aggregatePersistence(snapshots),
       state: aggregateState(snapshots),
-      surface: compositeSurface(this.bounded, snapshots),
+      surface:
+        this.selectionMovePreview === null
+          ? surface
+          : translateSelectedStrokes(surface, this.selectedStrokeIdsSet, this.selectionMovePreview),
     };
+  }
+
+  recoverySnapshot(): InkDocumentRecoverySnapshot {
+    const recoveryStates = this.bounded.map(({ session }) => session.recoveryState());
+    return {
+      expectedBases: recoveryStates.map(({ expectedBase }) => expectedBase),
+      pendingAttempts: recoveryStates.map(({ pendingAttempt }) => pendingAttempt),
+      records: recoveryStates.map(({ record }) => record),
+      requiresRecovery: recoveryStates.some(({ pendingAttempt }) => pendingAttempt !== null),
+    };
+  }
+
+  /** Re-enters every retained bounded surface as one logical document. */
+  enter(): void {
+    if (this.bounded.some(({ session }) => session.snapshot().state.kind === 'saving')) {
+      throw new Error('Cannot enter Ink Mode while a bounded local save is still running.');
+    }
+    for (const bounded of this.bounded) bounded.session.enter();
+    this.emit();
+  }
+
+  ensureMinimumHeight(minimumHeight: number): boolean {
+    if (!Number.isFinite(minimumHeight) || minimumHeight <= 0) {
+      throw new Error('Continuous Ink canvas height must be finite and positive.');
+    }
+    const requiredHeight = Math.ceil(minimumHeight);
+    const final = this.bounded.at(-1);
+    if (final === undefined || requiredHeight <= final.endY) return false;
+    final.endY = requiredHeight;
+    final.session.extendLogicalHeightTransiently(requiredHeight - final.startY);
+    return true;
   }
 
   addStroke(stroke: InkStroke): void {
@@ -111,6 +165,129 @@ export class InkDocumentSession {
 
   canRedo(): boolean {
     return this.redoStack.length > 0;
+  }
+
+  selectStrokeAt(point: InkPoint, tolerance: number, additive = false): readonly string[] {
+    const strokeId = this.strokeIdAt(point, tolerance);
+    this.selectionMovePreview = null;
+    if (!additive) this.selectedStrokeIdsSet.clear();
+    if (strokeId === null) {
+      this.selectedStrokeIdsSet.clear();
+    } else if (additive && this.selectedStrokeIdsSet.has(strokeId)) {
+      this.selectedStrokeIdsSet.delete(strokeId);
+    } else {
+      this.selectedStrokeIdsSet.add(strokeId);
+    }
+    this.emit();
+    return this.selectedStrokeIds();
+  }
+
+  selectedStrokeIds(): readonly string[] {
+    return [...this.selectedStrokeIdsSet];
+  }
+
+  strokeIdAt(point: InkPoint, tolerance: number): string | null {
+    if (!Number.isFinite(tolerance) || tolerance < 0) {
+      throw new Error('Ink selection tolerance must be non-negative.');
+    }
+    return (
+      this.snapshot()
+        .surface.strokes.filter((candidate) => candidate.tool !== 'eraser')
+        .find(
+          (candidate) =>
+            distanceToStroke(point, candidate.points) <= tolerance + candidate.width / 2,
+        )?.id ?? null
+    );
+  }
+
+  clearSelection(): boolean {
+    if (this.selectedStrokeIdsSet.size === 0 && this.selectionMovePreview === null) return false;
+    this.selectedStrokeIdsSet.clear();
+    this.selectionMovePreview = null;
+    this.emit();
+    return true;
+  }
+
+  previewSelectionMove(dx: number, dy: number): { readonly dx: number; readonly dy: number } {
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+      throw new Error('Ink selection translation must be finite.');
+    }
+    if (this.selectedStrokeIdsSet.size === 0) {
+      throw new Error('Select at least one Ink stroke before moving it.');
+    }
+    const surface = compositeSurface(
+      this.bounded,
+      this.bounded.map((bounded) => bounded.session.snapshot()),
+    );
+    const points = surface.strokes
+      .filter((stroke) => this.selectedStrokeIdsSet.has(stroke.id))
+      .flatMap((stroke) => stroke.points);
+    if (points.length === 0) {
+      throw new Error('The selected Ink strokes are no longer available.');
+    }
+    const minY = Math.min(...points.map((point) => point.y));
+    const maxY = Math.max(...points.map((point) => point.y));
+    this.selectionMovePreview = {
+      dx,
+      dy: clamp(dy, -minY, surface.layout.logicalHeight - maxY),
+    };
+    this.emit();
+    return this.selectionMovePreview;
+  }
+
+  cancelSelectionMove(): boolean {
+    if (this.selectionMovePreview === null) return false;
+    this.selectionMovePreview = null;
+    this.emit();
+    return true;
+  }
+
+  commitSelectionMove(): boolean {
+    const delta = this.selectionMovePreview;
+    if (delta === null) return false;
+    this.selectionMovePreview = null;
+    if (delta.dx === 0 && delta.dy === 0) {
+      this.emit();
+      return false;
+    }
+
+    const before = this.captureStrokeSets();
+    const committed = compositeSurface(
+      this.bounded,
+      this.bounded.map((bounded) => bounded.session.snapshot()),
+    );
+    const translated = translateSelectedStrokes(committed, this.selectedStrokeIdsSet, delta);
+    const next = new Map<string, InkStroke[]>();
+    for (const bounded of this.bounded) {
+      const retained = bounded.session
+        .snapshot()
+        .surface.strokes.filter(
+          (stroke) => !this.selectedStrokeIdsSet.has(stroke.linkedStrokeId ?? stroke.id),
+        );
+      next.set(bounded.surfaceId, [...retained]);
+    }
+    for (const stroke of translated.strokes.filter((candidate) =>
+      this.selectedStrokeIdsSet.has(candidate.id),
+    )) {
+      const fragments = splitInkStrokeIntoSurfaceFragments({
+        color: stroke.color,
+        linkedStrokeId: stroke.id,
+        points: stroke.points,
+        surfaces: this.bounded.map(({ endY, startY, surfaceId }) => ({
+          endY,
+          id: surfaceId,
+          startY,
+        })),
+        tool: stroke.tool,
+        width: stroke.width,
+      });
+      for (const fragment of fragments) next.get(fragment.surfaceId)?.push(fragment.stroke);
+    }
+    this.applyStrokeSets(next);
+    this.undoStack.push({ after: this.captureStrokeSets(), before });
+    this.redoStack.length = 0;
+    this.emit();
+    return true;
   }
 
   undo(): boolean {
@@ -194,7 +371,97 @@ export class InkDocumentSession {
   private applyStrokeSets(strokeSets: ReadonlyMap<string, readonly InkStroke[]>): void {
     for (const bounded of this.bounded) {
       const strokes = strokeSets.get(bounded.surfaceId);
-      if (strokes !== undefined) bounded.session.replaceStrokes(strokes);
+      if (
+        strokes !== undefined &&
+        !sameStrokeSets(strokes, bounded.session.snapshot().surface.strokes)
+      ) {
+        bounded.session.replaceStrokes(strokes);
+      }
+    }
+  }
+}
+
+class CoalescingInkSurfaceWriter implements InkSurfaceWriter {
+  private draining = false;
+  private pending = new Map<
+    string,
+    {
+      expectedBase: InkSurfaceRecord | undefined;
+      record: InkSurfaceRecord;
+      readonly waiters: Array<{
+        readonly reject: (reason?: unknown) => void;
+        readonly resolve: () => void;
+      }>;
+    }
+  >();
+  private timer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(private readonly target: InkSurfaceWriter) {}
+
+  updateSurface(record: InkSurfaceRecord, expectedBase?: InkSurfaceRecord): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const existing = this.pending.get(record.id);
+      if (existing === undefined) {
+        this.pending.set(record.id, { expectedBase, record, waiters: [{ reject, resolve }] });
+      } else {
+        existing.expectedBase = expectedBase;
+        existing.record = record;
+        existing.waiters.push({ reject, resolve });
+      }
+      this.scheduleDrain();
+    });
+  }
+
+  private scheduleDrain(): void {
+    if (this.draining || this.timer !== null) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.drain();
+    }, 0);
+  }
+
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      while (this.pending.size > 0) {
+        // One macrotask is a document-level commit barrier: sessions released by the previous
+        // write can publish every fragment of their next logical command before this snapshot.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        const pending = [...this.pending.values()];
+        this.pending.clear();
+        const records = pending.map(({ record }) => record);
+        const expectedBases = pending.map(({ expectedBase }) => expectedBase);
+        const hasEveryExpectedBase = expectedBases.every(
+          (expectedBase): expectedBase is InkSurfaceRecord => expectedBase !== undefined,
+        );
+        try {
+          if (records.length > 1 && this.target.updateSurfacesAtomically !== undefined) {
+            await this.target.updateSurfacesAtomically(
+              records,
+              hasEveryExpectedBase ? expectedBases : undefined,
+            );
+          } else {
+            await Promise.all(
+              records.map((record, index) =>
+                this.target.updateSurface(record, expectedBases[index]),
+              ),
+            );
+          }
+          for (const item of pending) {
+            for (const waiter of item.waiters) waiter.resolve();
+          }
+        } catch (error) {
+          const blocked = [...this.pending.values()];
+          this.pending.clear();
+          for (const item of [...pending, ...blocked]) {
+            for (const waiter of item.waiters) waiter.reject(error);
+          }
+        }
+      }
+    } finally {
+      this.draining = false;
+      if (this.pending.size > 0) this.scheduleDrain();
     }
   }
 }
@@ -210,7 +477,7 @@ function compositeSurface(
   const strokes = joinFragments(
     bounded.flatMap((item, index) => {
       const surface = snapshots[index]?.surface;
-      if (surface === undefined || surface.status !== 'active') {
+      if (surface === undefined || (surface.schemaVersion === 1 && surface.status !== 'active')) {
         return [];
       }
       return surface.strokes.map((stroke) => ({ startY: item.startY, stroke }));
@@ -247,37 +514,68 @@ function compositeSurface(
 function joinFragments(
   fragments: readonly { readonly startY: number; readonly stroke: InkStroke }[],
 ): readonly InkStroke[] {
-  const joined = new Map<string, InkStroke>();
+  const joined = new Map<
+    string,
+    { readonly identity: string; readonly points: InkPoint[]; readonly stroke: InkStroke }
+  >();
   for (const { startY, stroke } of fragments) {
     const identity = stroke.linkedStrokeId ?? stroke.id;
     const globalPoints = stroke.points.map((point) => ({ ...point, y: point.y + startY }));
     const existing = joined.get(identity);
     if (existing === undefined) {
-      const { linkedStrokeId: _linkedStrokeId, ...unlinkedStroke } = stroke;
-      void _linkedStrokeId;
-      joined.set(identity, { ...unlinkedStroke, id: identity, points: globalPoints });
+      joined.set(identity, { identity, points: globalPoints, stroke });
       continue;
     }
-    joined.set(identity, {
-      ...existing,
-      points: appendWithoutDuplicateBoundary(existing.points, globalPoints),
-    });
+    existing.points.push(...globalPoints);
   }
-  return [...joined.values()];
+  return [...joined.values()].map(({ identity, points, stroke }) => {
+    const { linkedStrokeId: _linkedStrokeId, ...unlinkedStroke } = stroke;
+    void _linkedStrokeId;
+    const ordered = points
+      .map((point, index) => ({ index, point }))
+      .sort((left, right) => left.point.time - right.point.time || left.index - right.index)
+      .map(({ point }) => point)
+      .filter((point, index, all) => {
+        const previous = all[index - 1];
+        return (
+          previous === undefined ||
+          previous.x !== point.x ||
+          previous.y !== point.y ||
+          previous.time !== point.time
+        );
+      });
+    return { ...unlinkedStroke, id: identity, points: ordered };
+  });
 }
 
-function appendWithoutDuplicateBoundary(
-  before: readonly InkPoint[],
-  after: readonly InkPoint[],
-): readonly InkPoint[] {
-  const previous = before.at(-1);
-  const next = after[0];
-  return previous !== undefined &&
-    next !== undefined &&
-    previous.x === next.x &&
-    previous.y === next.y
-    ? [...before, ...after.slice(1)]
-    : [...before, ...after];
+function translateSelectedStrokes(
+  surface: InkSurfaceRecord,
+  selectedStrokeIds: ReadonlySet<string>,
+  delta: { readonly dx: number; readonly dy: number },
+): InkSurfaceRecord {
+  return {
+    ...surface,
+    strokes: surface.strokes.map((stroke) =>
+      selectedStrokeIds.has(stroke.id)
+        ? {
+            ...stroke,
+            points: stroke.points.map((point) => ({
+              ...point,
+              x: point.x + delta.dx,
+              y: point.y + delta.dy,
+            })),
+          }
+        : stroke,
+    ),
+  };
+}
+
+function sameStrokeSets(left: readonly InkStroke[], right: readonly InkStroke[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.max(minimum, Math.min(maximum, value));
 }
 
 function aggregatePersistence(

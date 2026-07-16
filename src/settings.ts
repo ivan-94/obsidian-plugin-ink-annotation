@@ -3,12 +3,14 @@ import { DEFAULT_STYLE_PRESETS, StylePresetCatalog, type StylePreset } from './d
 export interface InkstoneSettings {
   readonly deviceId: string;
   readonly diagnosticsEnabled: boolean;
+  readonly showInkPreviewByDefault: boolean;
   readonly stylePresets: readonly StylePreset[];
 }
 
 export const DEFAULT_SETTINGS: InkstoneSettings = Object.freeze({
   deviceId: '',
   diagnosticsEnabled: false,
+  showInkPreviewByDefault: true,
   stylePresets: DEFAULT_STYLE_PRESETS,
 });
 
@@ -26,6 +28,10 @@ export function parseSettings(value: unknown): InkstoneSettings {
   return {
     deviceId: typeof value.deviceId === 'string' ? value.deviceId : '',
     diagnosticsEnabled,
+    showInkPreviewByDefault:
+      typeof value.showInkPreviewByDefault === 'boolean'
+        ? value.showInkPreviewByDefault
+        : DEFAULT_SETTINGS.showInkPreviewByDefault,
     stylePresets: parseStylePresets(value.stylePresets),
   };
 }

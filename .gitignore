@@ -13,3 +13,5 @@ artifacts/
 hats/
 test-fixtures
 docs/delivery
+.scratch/
+

@@ -3,6 +3,7 @@ import type { TextAnnotationTarget, TextStructuralScope } from './text-annotatio
 const CONTEXT_LENGTH = 32;
 
 export interface CreateTextAnchorInput {
+  readonly displayText?: string;
   readonly end: number;
   readonly scope: TextStructuralScope;
   readonly source: string;
@@ -10,6 +11,7 @@ export interface CreateTextAnchorInput {
 }
 
 export async function createTextAnchor({
+  displayText,
   end,
   scope,
   source,
@@ -23,10 +25,14 @@ export async function createTextAnchor({
   if (exact.length === 0) {
     throw new Error('Selection must not be empty.');
   }
+  if (displayText !== undefined && displayText.length === 0) {
+    throw new Error('Selection display text must not be empty.');
+  }
 
   const enrichedScope = await enrichScope(source, start, scope);
 
   return {
+    ...(displayText === undefined || displayText === exact ? {} : { displayText }),
     position: { end, start, unit: 'utf16-code-unit' },
     quote: {
       exact,

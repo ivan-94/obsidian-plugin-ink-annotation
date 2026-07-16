@@ -29,22 +29,55 @@ export interface InkSurfaceRecord {
   readonly deviceId?: string;
   readonly filePath: string;
   readonly id: string;
-  readonly layout: {
-    readonly blockFingerprints: readonly string[];
-    readonly fontFamily: string;
-    readonly fontSize: number;
-    readonly lineHeight: number;
-    readonly logicalHeight: number;
-    readonly logicalWidth: number;
-    readonly sourceRevision: string;
-    readonly themeMode: 'dark' | 'light';
-  };
+  readonly layout: InkSurfaceLayout;
   readonly noteId: string;
   readonly revision: number;
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 1 | 2;
   readonly status: 'active' | 'needs-rebase' | 'unanchored';
   readonly strokes: readonly InkStroke[];
   readonly updatedAt: string;
+}
+
+export interface InkSurfaceLayout {
+  readonly blockFingerprints: readonly string[];
+  readonly fontFamily: string;
+  readonly fontSize: number;
+  readonly lineHeight: number;
+  readonly logicalHeight: number;
+  readonly logicalWidth: number;
+  readonly originY?: number;
+  readonly sourceRevision: string;
+  readonly themeMode: 'dark' | 'light';
+}
+
+export interface InkSurfaceVisibleBounds {
+  readonly height: number;
+  readonly minX: number;
+  readonly minY: number;
+  readonly width: number;
+}
+
+export function inkSurfaceVisibleBounds(record: InkSurfaceRecord): InkSurfaceVisibleBounds {
+  let minimumX = 0;
+  let minimumY = 0;
+  let maximumX = record.layout.logicalWidth;
+  let maximumY = record.layout.logicalHeight;
+  for (const stroke of record.strokes) {
+    if (stroke.tool === 'eraser') continue;
+    const radius = stroke.width / 2;
+    for (const point of stroke.points) {
+      minimumX = Math.min(minimumX, point.x - radius);
+      minimumY = Math.min(minimumY, point.y - radius);
+      maximumX = Math.max(maximumX, point.x + radius);
+      maximumY = Math.max(maximumY, point.y + radius);
+    }
+  }
+  return {
+    height: maximumY - minimumY,
+    minX: minimumX,
+    minY: minimumY,
+    width: maximumX - minimumX,
+  };
 }
 
 export function encodeInkSurfaceRecord(record: InkSurfaceRecord): string {
@@ -60,7 +93,7 @@ export function decodeInkSurfaceRecord(value: string): InkSurfaceRecord {
     throw new Error('Ink surface record is not valid JSON.', { cause: error });
   }
   if (!isInkSurfaceRecord(parsed)) {
-    throw new Error('Ink surface record does not match schema version 1.');
+    throw new Error('Ink surface record does not match a supported schema version.');
   }
   assertInkSurfaceRecord(parsed);
   return parsed;
@@ -161,7 +194,11 @@ export function assertInkSurfaceRecord(record: InkSurfaceRecord): void {
     !positive(layout.logicalWidth) ||
     !positive(layout.logicalHeight) ||
     !positive(layout.fontSize) ||
-    !positive(layout.lineHeight)
+    !positive(layout.lineHeight) ||
+    (record.schemaVersion === 2 &&
+      (typeof record.layout.originY !== 'number' ||
+        !finite(record.layout.originY) ||
+        record.layout.originY < 0))
   ) {
     throw new Error('Ink surface revision and layout dimensions must be positive.');
   }
@@ -187,8 +224,6 @@ export function assertInkSurfaceRecord(record: InkSurfaceRecord): void {
       if (
         !finite(point.x) ||
         !finite(point.y) ||
-        point.x < 0 ||
-        point.x > layout.logicalWidth ||
         point.y < 0 ||
         point.y > layout.logicalHeight ||
         !finite(point.pressure) ||
@@ -207,7 +242,11 @@ export function assertInkSurfaceRecord(record: InkSurfaceRecord): void {
 }
 
 function isInkSurfaceRecord(value: unknown): value is InkSurfaceRecord {
-  if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.layout)) {
+  if (
+    !isRecord(value) ||
+    (value.schemaVersion !== 1 && value.schemaVersion !== 2) ||
+    !isRecord(value.layout)
+  ) {
     return false;
   }
   return (
@@ -223,7 +262,7 @@ function isInkSurfaceRecord(value: unknown): value is InkSurfaceRecord {
     (value.status === 'active' ||
       value.status === 'needs-rebase' ||
       value.status === 'unanchored') &&
-    isLayout(value.layout) &&
+    isLayout(value.layout, value.schemaVersion) &&
     Array.isArray(value.strokes) &&
     value.strokes.every(isStroke)
   );
@@ -244,7 +283,7 @@ function isBinding(value: unknown): value is NonNullable<InkSurfaceRecord['bindi
   );
 }
 
-function isLayout(value: Record<string, unknown>): value is InkSurfaceRecord['layout'] {
+function isLayout(value: Record<string, unknown>, schemaVersion: 1 | 2): boolean {
   return (
     typeof value.logicalWidth === 'number' &&
     typeof value.logicalHeight === 'number' &&
@@ -254,7 +293,8 @@ function isLayout(value: Record<string, unknown>): value is InkSurfaceRecord['la
     (value.themeMode === 'light' || value.themeMode === 'dark') &&
     nonEmpty(value.sourceRevision) &&
     Array.isArray(value.blockFingerprints) &&
-    value.blockFingerprints.every(nonEmpty)
+    value.blockFingerprints.every(nonEmpty) &&
+    (schemaVersion === 1 || typeof value.originY === 'number')
   );
 }
 

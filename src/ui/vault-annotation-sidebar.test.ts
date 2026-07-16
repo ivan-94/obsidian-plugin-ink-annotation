@@ -141,23 +141,24 @@ describe('Entire Vault annotation sidebar', () => {
     });
     sidebar.showReady();
     const more = container.querySelector<HTMLButtonElement>('button[aria-label="More actions"]');
-    const headerMenu = container.querySelector<HTMLElement>('.inkstone-sidebar__overflow-menu');
     const filters = container.querySelector<HTMLButtonElement>(
       'button[aria-label="Filter annotations"]',
     );
     const filterMenu = container.querySelector<HTMLElement>('.inkstone-vault-filters--popover');
 
     more?.click();
-    expect(headerMenu?.hidden).toBe(false);
+    expect(container.querySelector('[data-obsidian-test-menu]')).toBeNull();
+    expect(document.body.querySelector('[data-obsidian-test-menu]')).not.toBeNull();
+    filters?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
     filters?.click();
-    expect(headerMenu?.hidden).toBe(true);
+    expect(document.body.querySelector('[data-obsidian-test-menu]')).toBeNull();
     expect(filterMenu?.hidden).toBe(false);
     document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
     expect(filterMenu?.hidden).toBe(true);
     expect(filters?.getAttribute('aria-expanded')).toBe('false');
   });
 
-  it('opens row actions as a real menu and dispatches open, edit and export commands', () => {
+  it('opens row actions in the global menu and dispatches open, edit and export commands', () => {
     const container = document.createElement('div');
     document.body.append(container);
     const index = new VaultAnnotationIndex();
@@ -178,28 +179,30 @@ describe('Entire Vault annotation sidebar', () => {
     const trigger = container.querySelector<HTMLButtonElement>(
       '[data-inkstone-vault-actions="row-actions"]',
     );
-    const menu = container.querySelector<HTMLElement>('[data-inkstone-vault-menu="row-actions"]');
     trigger?.click();
-    expect(menu?.hidden).toBe(false);
+    expect(container.querySelector('[data-obsidian-test-menu]')).toBeNull();
+    let menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    expect(menu).not.toBeNull();
     expect(trigger?.getAttribute('aria-expanded')).toBe('true');
     expect(opened).toEqual([]);
 
     document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-    expect(menu?.hidden).toBe(true);
+    expect(document.body.querySelector('[data-obsidian-test-menu]')).toBeNull();
 
     trigger?.click();
-    menu?.querySelector<HTMLButtonElement>('button[aria-label="Edit Row actions"]')?.click();
+    menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    menu?.querySelector<HTMLButtonElement>('button[aria-label="Edit"]')?.click();
     expect(edited).toEqual(['row-actions']);
-    expect(menu?.hidden).toBe(true);
+    expect(document.body.querySelector('[data-obsidian-test-menu]')).toBeNull();
 
     trigger?.click();
-    menu?.querySelector<HTMLButtonElement>('button[aria-label="Export Row actions"]')?.click();
+    menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    menu?.querySelector<HTMLButtonElement>('button[aria-label="Export"]')?.click();
     expect(exported).toEqual(['row-actions']);
 
     trigger?.click();
-    menu
-      ?.querySelector<HTMLButtonElement>('button[aria-label="Open source for Row actions"]')
-      ?.click();
+    menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    menu?.querySelector<HTMLButtonElement>('button[aria-label="Open source"]')?.click();
     expect(opened).toEqual(['row-actions']);
   });
 
@@ -266,7 +269,7 @@ describe('Entire Vault annotation sidebar', () => {
     container.querySelector<HTMLButtonElement>('[data-annotation-id="surface-flow"]')?.click();
     expect(opened).toEqual(['ink:surface-flow']);
 
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
     expect(
       container.querySelector<HTMLButtonElement>('button[aria-label="Tag selected"]')?.disabled,
@@ -303,8 +306,13 @@ describe('Entire Vault annotation sidebar', () => {
     expect(bottomSpacer?.style.top).toBe('1440042px');
     expect(bottomSpacer?.style.height).toBe('var(--inkstone-vault-bottom-safe-area)');
     expect(container.querySelector<HTMLElement>('.inkstone-vault-group-header')?.style.height).toBe(
-      '42px',
+      '36px',
     );
+    expect(
+      container
+        .querySelector<HTMLElement>('.inkstone-vault-group-header')
+        ?.closest<HTMLElement>('[data-inkstone-virtual-item]')?.style.height,
+    ).toBe('42px');
     expect(container.querySelector<HTMLElement>('.inkstone-vault-row')?.style.height).toBe('66px');
     expect(
       container
@@ -320,7 +328,7 @@ describe('Entire Vault annotation sidebar', () => {
     ).toBe('');
   });
 
-  it('keeps search, filter and sort in one compact toolbar and discloses filters on demand', () => {
+  it('keeps search, filter, sort and folding in one compact toolbar', () => {
     const container = document.createElement('div');
     const index = new VaultAnnotationIndex();
     index.rebuild([entry('one', 'One')]);
@@ -328,7 +336,8 @@ describe('Entire Vault annotation sidebar', () => {
     sidebar.showReady();
 
     const toolbar = container.querySelector('.inkstone-vault-toolbar');
-    expect(toolbar?.children).toHaveLength(3);
+    expect(toolbar?.children).toHaveLength(4);
+    expect(container.querySelector('.inkstone-vault-filter-chips')).toBeNull();
     expect(container.querySelector('[aria-label="Focus annotation search"]')).toBeNull();
     expect(
       container
@@ -349,6 +358,52 @@ describe('Entire Vault annotation sidebar', () => {
     container.querySelector<HTMLButtonElement>('button[aria-label="Filter annotations"]')?.click();
     expect(filters?.hidden).toBe(false);
     expect(container.querySelectorAll('.inkstone-vault-group-header')).toHaveLength(1);
+  });
+
+  it('collapses and expands every visible Vault group from the compact toolbar', () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([
+      entry('one', 'One'),
+      { ...entry('two', 'Two'), filePath: 'Notes/Other.md', noteId: 'note-other' },
+    ]);
+    const sidebar = new VaultAnnotationSidebar({ container, document, index });
+    sidebar.showReady();
+
+    expect(container.querySelectorAll('.inkstone-vault-group-header')).toHaveLength(2);
+    expect(container.querySelectorAll('[data-annotation-id]')).toHaveLength(2);
+    const collapse = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Collapse all groups"]',
+    );
+    expect(collapse?.querySelector('[data-inkstone-icon="fold-vertical"]')).not.toBeNull();
+
+    collapse?.click();
+
+    expect(container.querySelectorAll('.inkstone-vault-group-header')).toHaveLength(2);
+    expect(container.querySelectorAll('[data-annotation-id]')).toHaveLength(0);
+    const expand = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Expand all groups"]',
+    );
+    expect(expand?.querySelector('[data-inkstone-icon="unfold-vertical"]')).not.toBeNull();
+
+    expand?.click();
+
+    expect(container.querySelectorAll('[data-annotation-id]')).toHaveLength(2);
+    expect(container.querySelector('button[aria-label="Collapse all groups"]')).not.toBeNull();
+  });
+
+  it('reserves space between each Vault file header and its first annotation card', () => {
+    const container = document.createElement('div');
+    const index = new VaultAnnotationIndex();
+    index.rebuild([entry('one', 'One')]);
+    const sidebar = new VaultAnnotationSidebar({ container, document, index });
+    sidebar.showReady();
+
+    const header = container.querySelector<HTMLElement>('.inkstone-vault-group-header');
+    const virtualItem = header?.closest<HTMLElement>('[data-inkstone-virtual-item]');
+
+    expect(header?.style.height).toBe('36px');
+    expect(virtualItem?.style.height).toBe('42px');
   });
 
   it('uses compact discoverable text and reserves warning metadata for problem states', () => {
@@ -383,7 +438,7 @@ describe('Entire Vault annotation sidebar', () => {
     expect(problem?.querySelector('.inkstone-vault-row__metadata')?.textContent).toBe(
       'Needs rebase07-14 08:00',
     );
-    expect(problem?.querySelector('.inkstone-vault-row__metadata--warning')).not.toBeNull();
+    expect(problem?.querySelector('.inkstone-metadata-line__token--warning')).not.toBeNull();
   });
 
   it('shows checkboxes only in bulk mode and confirms the exact delete snapshot', async () => {
@@ -403,7 +458,7 @@ describe('Entire Vault annotation sidebar', () => {
     sidebar.showReady();
 
     expect(container.querySelector('input[type="checkbox"]')).toBeNull();
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     expect(
       [...container.querySelectorAll<HTMLElement>('.inkstone-vault-row')].every(
         (row) => row.dataset.inkstoneBulkSelection === 'true',
@@ -465,7 +520,7 @@ describe('Entire Vault annotation sidebar', () => {
     });
     sidebar.showReady();
 
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     container
       .querySelector<HTMLInputElement>('.inkstone-vault-row input[type="checkbox"]')
       ?.click();
@@ -490,7 +545,7 @@ describe('Entire Vault annotation sidebar', () => {
     });
     sidebar.showReady();
 
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     const row = container.querySelector<HTMLElement>('.inkstone-vault-row');
     const summary = row?.querySelector<HTMLButtonElement>('[data-annotation-id="one"]');
 
@@ -513,7 +568,7 @@ describe('Entire Vault annotation sidebar', () => {
     const sidebar = new VaultAnnotationSidebar({ container, document, index });
     sidebar.showReady();
 
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     const row = container.querySelector<HTMLElement>('.inkstone-vault-row');
     const checkbox = row?.querySelector<HTMLInputElement>('input[type="checkbox"]');
     const summary = row?.querySelector<HTMLElement>('.inkstone-sidebar-row__summary');
@@ -539,7 +594,7 @@ describe('Entire Vault annotation sidebar', () => {
     ]);
     const sidebar = new VaultAnnotationSidebar({ container, document, index });
     sidebar.showReady();
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
 
     const fileToggle = container.querySelector<HTMLInputElement>(
       'input[aria-label="Select all annotations in Notes/Search.md"]',
@@ -609,7 +664,7 @@ describe('Entire Vault annotation sidebar', () => {
     const sidebar = new VaultAnnotationSidebar({ container, document, index });
     sidebar.showReady();
 
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
 
     expect(
       container.querySelector<HTMLInputElement>('input[aria-label="Search annotations"]')?.disabled,
@@ -699,7 +754,7 @@ describe('Entire Vault annotation sidebar', () => {
       },
     });
     sidebar.showReady();
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
     container.querySelector<HTMLButtonElement>('button[aria-label="Tag selected"]')?.click();
     const tags = container.querySelector<HTMLInputElement>('input[aria-label="Bulk tags"]');
@@ -734,7 +789,7 @@ describe('Entire Vault annotation sidebar', () => {
       },
     });
     sidebar.showReady();
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     container
       .querySelector<HTMLInputElement>('input[aria-label="Select annotation style-me"]')
       ?.click();
@@ -763,7 +818,7 @@ describe('Entire Vault annotation sidebar', () => {
       ],
     });
     sidebar.showReady();
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
     container.querySelector<HTMLButtonElement>('button[aria-label="Style selected"]')?.click();
 
@@ -785,7 +840,7 @@ describe('Entire Vault annotation sidebar', () => {
       onBulkDelete: (selection) => Promise.resolve({ failed: selection }),
     });
     sidebar.showReady();
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
     container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.click();
     container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
@@ -815,7 +870,7 @@ describe('Entire Vault annotation sidebar', () => {
       },
     });
     sidebar.showReady();
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
     container.querySelector<HTMLButtonElement>('button[aria-label="Tag selected"]')?.click();
     const tags = container.querySelector<HTMLInputElement>('input[aria-label="Bulk tags"]');
@@ -881,13 +936,11 @@ describe('Entire Vault annotation sidebar', () => {
     }
     type.value = 'underline';
     type.dispatchEvent(new Event('change', { bubbles: true }));
-    container
-      .querySelector<HTMLButtonElement>('button[aria-label="Export current results"]')
-      ?.click();
+    clickActionMenuItem(container, 'More actions', 'Export results…');
 
     type.value = '';
     type.dispatchEvent(new Event('change', { bubbles: true }));
-    container.querySelector<HTMLButtonElement>('button[aria-label="Enter bulk mode"]')?.click();
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
     container
       .querySelector<HTMLInputElement>('input[aria-label="Select annotation highlight"]')
       ?.click();
@@ -896,6 +949,23 @@ describe('Entire Vault annotation sidebar', () => {
     expect(exports).toEqual([['underline'], ['highlight']]);
   });
 });
+
+function clickActionMenuItem(
+  container: HTMLElement,
+  triggerLabel: string,
+  itemLabel: string,
+): void {
+  const trigger = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+    (button) => button.getAttribute('aria-label') === triggerLabel,
+  );
+  if (trigger === undefined) throw new Error(`Expected menu trigger: ${triggerLabel}`);
+  trigger.click();
+  const item = [
+    ...document.body.querySelectorAll<HTMLButtonElement>('[data-obsidian-test-menu] button'),
+  ].find((button) => button.getAttribute('aria-label') === itemLabel);
+  if (item === undefined) throw new Error(`Expected menu item: ${itemLabel}`);
+  item.click();
+}
 
 function entry(id: string, quote: string): AnnotationIndexEntry {
   return {

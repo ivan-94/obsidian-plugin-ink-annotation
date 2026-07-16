@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  annotationTargetText,
   decodeTextAnnotationRecord,
   encodeTextAnnotationRecord,
   type TextAnnotationRecord,
@@ -19,6 +20,7 @@ describe('text annotation schema v1', () => {
       status: 'active',
       tags: [],
       target: {
+        displayText: '😀 compound',
         position: { end: 13, start: 2, unit: 'utf16-code-unit' },
         quote: { exact: '😀 compound', prefix: 'A ', suffix: ' anchor' },
         scope: { headingPath: ['Anchor'], sectionEndLine: 3, sectionStartLine: 2 },
@@ -28,6 +30,7 @@ describe('text annotation schema v1', () => {
     };
 
     expect(decodeTextAnnotationRecord(encodeTextAnnotationRecord(record))).toEqual(record);
+    expect(annotationTargetText(record.target)).toBe('😀 compound');
     const { mark: _mark, ...withoutMark } = record;
     void _mark;
     expect(() => encodeTextAnnotationRecord({ ...withoutMark, tags: [] })).toThrow(

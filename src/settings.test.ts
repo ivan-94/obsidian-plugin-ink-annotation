@@ -10,8 +10,21 @@ describe('parseSettings', () => {
     expect(parseSettings({ diagnosticsEnabled: true, ignored: 'value' })).toEqual({
       deviceId: '',
       diagnosticsEnabled: true,
+      showInkPreviewByDefault: true,
       stylePresets: DEFAULT_STYLE_PRESETS,
     });
+  });
+
+  it('shows saved Ink in preview by default while preserving an explicit opt-out', () => {
+    expect(parseSettings({ diagnosticsEnabled: false }).showInkPreviewByDefault).toBe(true);
+    expect(
+      parseSettings({ diagnosticsEnabled: false, showInkPreviewByDefault: false })
+        .showInkPreviewByDefault,
+    ).toBe(false);
+    expect(
+      parseSettings({ diagnosticsEnabled: false, showInkPreviewByDefault: 'sometimes' })
+        .showInkPreviewByDefault,
+    ).toBe(true);
   });
 
   it('restores valid renamed/recolored presets while rejecting malformed catalogs', () => {

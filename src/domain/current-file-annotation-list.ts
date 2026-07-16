@@ -1,4 +1,4 @@
-import type { TextAnnotationRecord } from './text-annotation';
+import { annotationTargetText, type TextAnnotationRecord } from './text-annotation';
 
 export interface CompactAnnotationRow {
   readonly deletedAt?: string;
@@ -87,7 +87,7 @@ function toCompactRow(record: TextAnnotationRecord): CompactAnnotationRow {
     notePreview:
       typeof record.body === 'string' && record.body.trim().length > 0 ? record.body.trim() : null,
     position: record.target.position.start,
-    quote: record.target.quote.exact,
+    quote: annotationTargetText(record.target),
     revision: record.revision,
     status: record.status,
     tags: [...record.tags],
