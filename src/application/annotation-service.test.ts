@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { SidecarRepository, type TextFileStore } from '../storage/sidecar-repository';
 import { AnnotationService } from './annotation-service';
@@ -370,6 +370,32 @@ describe('annotation service walking skeleton', () => {
     ).resolves.toMatchObject({ resolved: [{ record: { id: created.id, revision: 3 } }] });
   });
 
+  it('refuses a single-row delete after the canonical revision changed', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    const ids = ['note-1', 'annotation-1'];
+    const service = new AnnotationService({
+      createId: () => ids.shift() ?? 'unexpected-id',
+      repository,
+    });
+    const created = await service.createHighlight({
+      filePath: 'Stale Delete.md',
+      selection: { end: 5, scope: {}, start: 0 },
+      source: 'Stale delete target.',
+      styleId: 'highlight-sun',
+    });
+    const updated = await service.updateAnnotationContents(created.filePath, created.id, {
+      body: '',
+      mark: created.mark,
+      tags: ['remote-update'],
+    });
+
+    await expect(
+      service.deleteAnnotation(created.filePath, created.id, created.revision),
+    ).rejects.toThrow('changed since it was selected');
+    await expect(repository.readAnnotation(created.filePath, created.id)).resolves.toEqual(updated);
+  });
+
   it('edits an unanchored record without replacing its recovery target or failure context', async () => {
     const store = new MemoryTextFileStore();
     const repository = new SidecarRepository(store);
@@ -561,6 +587,50 @@ describe('annotation service walking skeleton', () => {
     await expect(repository.readAnnotation(created.filePath, created.id)).resolves.toMatchObject({
       deletedAt: '2026-07-14T15:00:00.000Z',
     });
+  });
+
+  it('keeps successful deletion receipts when a later bulk read fails', async () => {
+    const store = new MemoryTextFileStore();
+    const ids = ['note-1', 'annotation-1', 'annotation-2'];
+    const repository = new SidecarRepository(store);
+    const service = new AnnotationService({
+      createId: () => ids.shift() ?? 'unexpected-id',
+      now: () => '2026-07-17T06:00:00.000Z',
+      repository,
+    });
+    const first = await service.createHighlight({
+      filePath: 'Bulk Partial Read.md',
+      selection: { end: 5, scope: {}, start: 0 },
+      source: 'First and second.',
+      styleId: 'highlight-sun',
+    });
+    const second = await service.createHighlight({
+      filePath: 'Bulk Partial Read.md',
+      selection: { end: 16, scope: {}, start: 10 },
+      source: 'First and second.',
+      styleId: 'highlight-sun',
+    });
+    const readAnnotation = repository.readAnnotation.bind(repository);
+    vi.spyOn(repository, 'readAnnotation').mockImplementation((filePath, annotationId) =>
+      annotationId === second.id
+        ? Promise.reject(new Error('iCloud file is not hydrated'))
+        : readAnnotation(filePath, annotationId),
+    );
+
+    const result = await service.bulkDelete([
+      { expectedRevision: first.revision, filePath: first.filePath, id: first.id },
+      { expectedRevision: second.revision, filePath: second.filePath, id: second.id },
+    ]);
+
+    expect(result.succeeded).toMatchObject([{ id: first.id, revision: 2 }]);
+    expect(result.failed).toEqual([
+      {
+        expectedRevision: second.revision,
+        filePath: second.filePath,
+        id: second.id,
+        reason: 'write-failed',
+      },
+    ]);
   });
 
   it('bulk changes style without changing highlight versus underline identity', async () => {

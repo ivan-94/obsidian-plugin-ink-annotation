@@ -437,9 +437,11 @@ Composer、Style and Classification Model。
 - [x] Underline 使用当前或最近样式；额外颜色放入二级控件。（第一版上限为五个，无额外 preset。）
 - [x] Add note 先持久化 target draft，再把焦点移入 composer。
 - [x] 桌面实现 anchored compact composer；iPad 实现 keyboard-aware bottom
-      sheet/fallback。（iPad 真机验证延期。）
+      sheet/fallback，并跟随 visual
+      viewport 的 resize/scroll，避免被软键盘遮挡。（iPad 真机验证延期。）
 - [x] composer 顶部保留一到两行 quote，上下文不会因 selection collapse 丢失。
-- [x] 对正文输入 debounce autosave，并在 close/navigation/background/unload 强制 flush。
+- [x] overlap chooser 为类型标签保留固定空间，长 quote 在剩余宽度内单行省略，不覆盖相邻内容。
+- [x] 正文和 tags 输入只更新内存草稿；点击 Save 才执行常规持久化并在成功后关闭 composer，写入失败则保留窗口与草稿；close/navigation/background/unload 仅保留防丢稿的最终 flush。
 - [x] 仅显示 `Saving…`、`Saved locally` 或可操作的错误；不显示无证据的 `Synced`。
 - [x] 实现 tags 基础编辑，确保 tags 与 style/color 解耦。
 - [x] 注册 apply-last-highlight、add-note-to-selection 命令，但默认快捷键可由用户配置。

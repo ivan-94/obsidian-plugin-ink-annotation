@@ -69,6 +69,8 @@ export interface VaultAnnotationQueryPort {
 }
 
 export class VaultAnnotationIndex implements VaultAnnotationQueryPort {
+  private batchDepth = 0;
+  private batchInvalidated = false;
   private readonly entries = new Map<string, AnnotationIndexEntry>();
   private initialized = false;
   private readonly listeners = new Set<() => void>();
@@ -89,6 +91,19 @@ export class VaultAnnotationIndex implements VaultAnnotationQueryPort {
 
   get version(): number {
     return this.currentVersion;
+  }
+
+  async batch<T>(operation: () => Promise<T>): Promise<T> {
+    this.batchDepth += 1;
+    try {
+      return await operation();
+    } finally {
+      this.batchDepth -= 1;
+      if (this.batchDepth === 0 && this.batchInvalidated) {
+        this.batchInvalidated = false;
+        this.publishChange();
+      }
+    }
   }
 
   rebuild(entries: readonly AnnotationIndexEntry[]): void {
@@ -148,6 +163,66 @@ export class VaultAnnotationIndex implements VaultAnnotationQueryPort {
     this.cachedSearchText.delete(key);
     this.invalidate();
     return 'removed';
+  }
+
+  removeAtOrBelow(input: {
+    readonly id: string;
+    readonly maximumRevision: number;
+    readonly noteId: string;
+  }): 'missing' | 'removed' | 'stale' {
+    const key = entryKey(input);
+    const existing = this.entries.get(key);
+    if (existing === undefined) {
+      return 'missing';
+    }
+    if (existing.revision > input.maximumRevision) {
+      return 'stale';
+    }
+    this.entries.delete(key);
+    this.cachedSearchText.delete(key);
+    this.invalidate();
+    return 'removed';
+  }
+
+  renameNote(input: {
+    readonly newPath: string;
+    readonly noteId: string;
+    readonly oldPath: string;
+  }): number {
+    let renamed = 0;
+    for (const [key, entry] of this.entries) {
+      if (entry.noteId !== input.noteId || entry.filePath !== input.oldPath) continue;
+      const next = freezeEntry({ ...entry, filePath: input.newPath });
+      this.entries.set(key, next);
+      this.cachedSearchText.set(key, searchableText(next));
+      renamed += 1;
+    }
+    if (renamed > 0) this.invalidate();
+    return renamed;
+  }
+
+  removeNote(noteId: string): number {
+    let removed = 0;
+    for (const [key, entry] of this.entries) {
+      if (entry.noteId !== noteId) continue;
+      this.entries.delete(key);
+      this.cachedSearchText.delete(key);
+      removed += 1;
+    }
+    if (removed > 0) this.invalidate();
+    return removed;
+  }
+
+  removeFile(filePath: string): number {
+    let removed = 0;
+    for (const [key, entry] of this.entries) {
+      if (entry.filePath !== filePath) continue;
+      this.entries.delete(key);
+      this.cachedSearchText.delete(key);
+      removed += 1;
+    }
+    if (removed > 0) this.invalidate();
+    return removed;
   }
 
   subscribe(listener: () => void): () => void {
@@ -252,6 +327,14 @@ export class VaultAnnotationIndex implements VaultAnnotationQueryPort {
     this.cachedQuery = null;
     this.cachedSearchableSnapshot = null;
     this.cachedSnapshot = null;
+    if (this.batchDepth > 0) {
+      this.batchInvalidated = true;
+      return;
+    }
+    this.publishChange();
+  }
+
+  private publishChange(): void {
     this.currentVersion += 1;
     this.listeners.forEach((listener) => listener());
   }

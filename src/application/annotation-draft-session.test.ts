@@ -7,25 +7,27 @@ import { AnnotationService } from './annotation-service';
 describe('annotation draft session', () => {
   afterEach(() => vi.useRealTimers());
 
-  it('debounces edits, activates the draft and reports only local persistence', async () => {
+  it('keeps edits in memory until an explicit flush activates the draft', async () => {
     vi.useFakeTimers();
     const fixture = await createDraftFixture();
     const states: string[] = [];
     const session = new AnnotationDraftSession({
-      debounceMs: 300,
       draft: fixture.draft,
       onStateChange: (state) => states.push(state.kind),
       service: fixture.service,
     });
 
     session.update({ body: 'First local thought', tags: ['research'] });
-    await vi.advanceTimersByTimeAsync(299);
+    await vi.advanceTimersByTimeAsync(1_000);
     await expect(
       fixture.repository.readAnnotation('Drafts.md', fixture.draft.id),
     ).resolves.toMatchObject({ revision: 1, status: 'draft' });
+    expect(session.snapshot().kind).toBe('idle');
+    expect(states).not.toContain('saving');
 
-    await vi.advanceTimersByTimeAsync(1);
-    await vi.waitFor(() => expect(session.snapshot().kind).toBe('saved-locally'));
+    await session.flush();
+
+    expect(session.snapshot().kind).toBe('saved-locally');
     await expect(
       fixture.repository.readAnnotation('Drafts.md', fixture.draft.id),
     ).resolves.toMatchObject({
@@ -43,7 +45,6 @@ describe('annotation draft session', () => {
     vi.useFakeTimers();
     const fixture = await createDraftFixture();
     const session = new AnnotationDraftSession({
-      debounceMs: 10_000,
       draft: fixture.draft,
       service: fixture.service,
     });
@@ -57,7 +58,6 @@ describe('annotation draft session', () => {
 
     const second = await createDraftFixture('Empty.md');
     const emptySession = new AnnotationDraftSession({
-      debounceMs: 10_000,
       draft: second.draft,
       service: second.service,
     });
@@ -69,7 +69,6 @@ describe('annotation draft session', () => {
     vi.useFakeTimers();
     const fixture = await createDraftFixture();
     const session = new AnnotationDraftSession({
-      debounceMs: 300,
       draft: fixture.draft,
       service: fixture.service,
     });
@@ -79,7 +78,7 @@ describe('annotation draft session', () => {
     await expect(session.flush()).rejects.toThrow('disk unavailable');
     expect(session.snapshot()).toMatchObject({
       kind: 'error',
-      message: "Couldn't save locally. Retry.",
+      message: "Couldn't save locally.",
     });
     await expect(
       fixture.repository.readAnnotation('Drafts.md', fixture.draft.id),

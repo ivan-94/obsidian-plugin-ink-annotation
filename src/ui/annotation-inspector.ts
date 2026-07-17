@@ -20,14 +20,18 @@ export interface AnnotationInspectorChanges {
   readonly tags: readonly string[];
 }
 
+export type AnnotationInspectorInitialFocus = 'mark-type' | 'note';
+
 export class AnnotationInspector {
   private anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'> = new DOMRect();
   private readonly document: Document;
   private host: HTMLDivElement | null = null;
+  private initialFocus: AnnotationInspectorInitialFocus = 'mark-type';
   private invoker: HTMLElement | undefined;
   private readonly island: UiIsland<AnnotationInspectorAppProps> =
     createPreactIsland(AnnotationInspectorApp);
   private readonly onDeleteRecord: (record: TextAnnotationRecord) => Promise<TextAnnotationRecord>;
+  private readonly onDiscardRecord: (record: TextAnnotationRecord) => Promise<void> | void;
   private readonly onExportRecord: (record: TextAnnotationRecord, invoker: HTMLElement) => void;
   private readonly onNavigateRecord: (record: TextAnnotationRecord) => void;
   private readonly onConfirmReattachRecord:
@@ -101,6 +105,7 @@ export class AnnotationInspector {
   constructor(input: {
     readonly document: Document;
     readonly onDelete: (record: TextAnnotationRecord) => Promise<TextAnnotationRecord>;
+    readonly onDiscard?: (record: TextAnnotationRecord) => Promise<void> | void;
     readonly onExport?: (record: TextAnnotationRecord, invoker: HTMLElement) => void;
     readonly onConfirmReattach?: (
       record: TextAnnotationRecord,
@@ -117,6 +122,7 @@ export class AnnotationInspector {
   }) {
     this.document = input.document;
     this.onDeleteRecord = input.onDelete;
+    this.onDiscardRecord = input.onDiscard ?? (() => undefined);
     this.onExportRecord = input.onExport ?? (() => undefined);
     this.onConfirmReattachRecord = input.onConfirmReattach;
     this.onNavigateRecord = input.onNavigate;
@@ -128,6 +134,7 @@ export class AnnotationInspector {
 
   show(input: {
     readonly anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>;
+    readonly initialFocus?: AnnotationInspectorInitialFocus;
     readonly invoker?: HTMLElement;
     readonly records: readonly TextAnnotationRecord[];
   }): void {
@@ -138,7 +145,7 @@ export class AnnotationInspector {
       input.records.length > 1
         ? ({ kind: 'choosing', records: input.records } as const)
         : inspectorEditingState(input.records[0] as TextAnnotationRecord, this.presets);
-    this.mount(initial, input.anchorRect, input.invoker);
+    this.mount(initial, input.anchorRect, input.invoker, input.initialFocus ?? 'mark-type');
   }
 
   showReattachmentPreview(input: {
@@ -169,9 +176,11 @@ export class AnnotationInspector {
     initial: InspectorState,
     anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>,
     invoker: HTMLElement | undefined,
+    initialFocus: AnnotationInspectorInitialFocus = 'mark-type',
   ): void {
     this.close(false);
     this.anchorRect = anchorRect;
+    this.initialFocus = initialFocus;
     this.invoker = invoker;
     this.store.state.value = initial;
     const host = this.document.createElement('div');
@@ -292,6 +301,7 @@ export class AnnotationInspector {
     return {
       anchorRect: this.anchorRect,
       document: this.document,
+      initialFocus: this.initialFocus,
       ...(this.invoker === undefined ? {} : { invoker: this.invoker }),
       onCancelReattach: this.handleCancelReattach,
       onChoose: this.handleChoose,
@@ -312,7 +322,16 @@ export class AnnotationInspector {
   private async requestDismiss(): Promise<boolean> {
     const state = this.store.state.value;
     if (state.kind === 'closed') return true;
-    if (state.kind === 'editing' && !(await this.performSave(false))) return false;
+    if (state.kind === 'editing') {
+      const discardCleanDraft = state.draft.record.status === 'draft' && !state.draft.dirty;
+      if (discardCleanDraft || !(await this.performSave(false))) {
+        try {
+          await this.onDiscardRecord(state.draft.record);
+        } catch {
+          // Dismissal must never trap the user in an invalid editor. The caller owns cleanup retry.
+        }
+      }
+    }
     this.close(false);
     return true;
   }

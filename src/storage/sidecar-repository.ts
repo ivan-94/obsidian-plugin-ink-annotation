@@ -82,12 +82,35 @@ export class SidecarRepository {
   constructor(
     private readonly store: TextFileStore,
     events: {
+      readonly onEventIssue?: (error: unknown) => void;
       readonly onRecordChanged?: (record: TextAnnotationRecord) => void;
       readonly onRecordRemoved?: (record: TextAnnotationRecord) => void;
     } = {},
   ) {
-    this.onRecordChanged = events.onRecordChanged ?? (() => undefined);
-    this.onRecordRemoved = events.onRecordRemoved ?? (() => undefined);
+    const onEventIssue = events.onEventIssue ?? (() => undefined);
+    const reportEventIssue = (error: unknown): void => {
+      try {
+        onEventIssue(error);
+      } catch {
+        // Canonical writes must not be reclassified by disposable projection diagnostics.
+      }
+    };
+    const onRecordChanged = events.onRecordChanged ?? (() => undefined);
+    const onRecordRemoved = events.onRecordRemoved ?? (() => undefined);
+    this.onRecordChanged = (record) => {
+      try {
+        onRecordChanged(record);
+      } catch (error) {
+        reportEventIssue(error);
+      }
+    };
+    this.onRecordRemoved = (record) => {
+      try {
+        onRecordRemoved(record);
+      } catch (error) {
+        reportEventIssue(error);
+      }
+    };
   }
 
   async getOrCreateNote(input: {
@@ -130,6 +153,14 @@ export class SidecarRepository {
     const existing = await this.store.read(metaPath);
     if (existing !== null) {
       const decoded = decodeNoteMeta(existing, filePath, pathHash);
+      if (
+        decoded.sourceMissingAt !== undefined &&
+        decoded.sourceFingerprint !== input.sourceFingerprint
+      ) {
+        throw new Error(
+          `Source path ${filePath} contains different content; manual sidecar relinking is required.`,
+        );
+      }
       if (
         decoded.sourceMissingAt !== undefined ||
         decoded.sourceFingerprint !== input.sourceFingerprint
@@ -174,6 +205,54 @@ export class SidecarRepository {
     return reconciled;
   }
 
+  async reconcileObservedRename(input: {
+    readonly newPath: string;
+    readonly now: string;
+    readonly oldPath: string;
+  }): Promise<NoteMeta | null> {
+    const oldPath = normalizeVaultPath(input.oldPath);
+    const newPath = normalizeVaultPath(input.newPath);
+    const oldPathHash = await hashText(oldPath);
+    const newPathHash = await hashText(newPath);
+    const oldRoot = `${SIDECAR_ROOT}/${oldPathHash}`;
+    const newRoot = `${SIDECAR_ROOT}/${newPathHash}`;
+    const oldMetaContents = await this.store.read(`${oldRoot}/meta.json`);
+
+    if (oldMetaContents === null) {
+      const newMetaContents = await this.store.read(`${newRoot}/meta.json`);
+      return newMetaContents === null
+        ? null
+        : decodeNoteMeta(newMetaContents, newPath, newPathHash);
+    }
+
+    const oldMeta = decodeNoteMeta(oldMetaContents, oldPath, oldPathHash);
+    const destinationContents = await this.store.read(`${newRoot}/meta.json`);
+    if (destinationContents !== null && oldRoot !== newRoot) {
+      const destination = decodeNoteMeta(destinationContents, newPath, newPathHash);
+      if (destination.noteId !== oldMeta.noteId) {
+        throw new Error(`Renamed note destination ${newPath} belongs to a different note.`);
+      }
+    }
+    if (oldRoot !== newRoot) {
+      if (this.store.rename === undefined) {
+        throw new Error('The text file store cannot rekey a renamed note sidecar.');
+      }
+      await this.store.rename(oldRoot, newRoot);
+    }
+
+    const { sourceMissingAt: _missing, ...available } = oldMeta;
+    void _missing;
+    const reconciled: NoteMeta = {
+      ...available,
+      filePath: newPath,
+      lastReconciledAt: input.now,
+      pathHash: newPathHash,
+    };
+    await this.store.write(`${newRoot}/meta.json`, `${JSON.stringify(reconciled, null, 2)}\n`);
+    await this.rewriteReconciledRecordPaths(newRoot, newPath, input.now);
+    return reconciled;
+  }
+
   async markNoteSourceMissing(filePath: string, now: string): Promise<NoteMeta | null> {
     const normalizedPath = normalizeVaultPath(filePath);
     const pathHash = await hashText(normalizedPath);
@@ -182,10 +261,11 @@ export class SidecarRepository {
     if (contents === null) {
       return null;
     }
+    const existing = decodeNoteMeta(contents, normalizedPath, pathHash);
     const missing: NoteMeta = {
-      ...decodeNoteMeta(contents, normalizedPath, pathHash),
+      ...existing,
       lastReconciledAt: now,
-      sourceMissingAt: now,
+      sourceMissingAt: existing.sourceMissingAt ?? now,
     };
     await this.store.write(metaPath, `${JSON.stringify(missing, null, 2)}\n`);
     return missing;
@@ -417,6 +497,38 @@ export class SidecarRepository {
     };
   }
 
+  /** Resolves a text candidate sidecar event without treating its hash as source identity. */
+  async resolveFilePathForAnnotationSidecar(sidecarPath: string): Promise<string | null> {
+    const normalizedSidecarPath = sidecarPath.replaceAll('\\', '/');
+    const match =
+      /^\.obsidian-annotations\/v1\/notes\/([a-f0-9]{64})\/annotations\/[^/]+\.json$/u.exec(
+        normalizedSidecarPath,
+      );
+    const pathHash = match?.[1];
+    if (pathHash === undefined) {
+      return null;
+    }
+
+    try {
+      const contents = await this.store.read(`${SIDECAR_ROOT}/${pathHash}/meta.json`);
+      if (contents === null) {
+        return null;
+      }
+      const meta = decodeStoredNoteMeta(contents);
+      const filePath = normalizeVaultPath(meta.filePath);
+      if (
+        filePath !== meta.filePath ||
+        meta.pathHash !== pathHash ||
+        (await hashText(filePath)) !== pathHash
+      ) {
+        return null;
+      }
+      return filePath;
+    } catch {
+      return null;
+    }
+  }
+
   async listNotes(): Promise<{
     readonly issues: readonly RepositoryIssue[];
     readonly notes: readonly NoteMeta[];
@@ -514,27 +626,22 @@ export class SidecarRepository {
       if (contents === null) {
         continue;
       }
+      let record: TextAnnotationRecord;
       try {
-        const record = decodeTextAnnotationRecord(contents);
-        if (record.filePath !== filePath) {
-          await this.store.write(
-            path,
-            encodeTextAnnotationRecord({
-              ...record,
-              filePath,
-              revision: record.revision + 1,
-              updatedAt: now,
-            }),
-          );
-          this.onRecordChanged({
-            ...record,
-            filePath,
-            revision: record.revision + 1,
-            updatedAt: now,
-          });
-        }
+        record = decodeTextAnnotationRecord(contents);
       } catch {
         // Preserve damaged/conflict artifacts byte-for-byte for explicit repair.
+        continue;
+      }
+      if (record.filePath !== filePath) {
+        const reconciled: TextAnnotationRecord = {
+          ...record,
+          filePath,
+          revision: record.revision + 1,
+          updatedAt: now,
+        };
+        await this.store.write(path, encodeTextAnnotationRecord(reconciled));
+        this.onRecordChanged(reconciled);
       }
     }
   }

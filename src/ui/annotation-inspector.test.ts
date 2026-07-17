@@ -60,6 +60,83 @@ describe('annotation inspector', () => {
     await vi.waitFor(() => expect(document.activeElement).toBe(invoker));
   });
 
+  it('opens a new draft in Note mode and focuses the note field', () => {
+    const inspector = new AnnotationInspector({
+      document,
+      onDelete: (item) => Promise.resolve(item),
+      onNavigate: () => undefined,
+      onSave: (item) => Promise.resolve(item),
+      onUndo: (item) => Promise.resolve(item),
+      presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
+      writeClipboard: () => Promise.resolve(),
+    });
+    const { mark: _mark, ...recordWithoutMark } = record('new-note', 'New note target');
+    void _mark;
+    const draft: TextAnnotationRecord = { ...recordWithoutMark, status: 'draft' };
+
+    inspector.show({
+      anchorRect: new DOMRect(),
+      initialFocus: 'note',
+      records: [draft],
+    });
+
+    expect(
+      document
+        .querySelector<HTMLButtonElement>('[data-inkstone-mark-type="note"]')
+        ?.getAttribute('aria-pressed'),
+    ).toBe('true');
+    expect(document.activeElement).toBe(
+      document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Note"]'),
+    );
+  });
+
+  it('flips and clamps the editor inside the iPad visual viewport', () => {
+    const visualViewport = new EventTarget();
+    Object.defineProperties(visualViewport, {
+      height: { value: 600 },
+      offsetLeft: { value: 0 },
+      offsetTop: { value: 0 },
+      width: { value: 768 },
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    });
+    const rect = vi
+      .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+      .mockImplementation(function (this: HTMLElement) {
+        return this.classList.contains('inkstone-annotation-inspector')
+          ? new DOMRect(0, 0, 380, 360)
+          : new DOMRect();
+      });
+    const inspector = new AnnotationInspector({
+      document,
+      onDelete: (item) => Promise.resolve(item),
+      onNavigate: () => undefined,
+      onSave: (item) => Promise.resolve(item),
+      onUndo: (item) => Promise.resolve(item),
+      presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
+      writeClipboard: () => Promise.resolve(),
+    });
+
+    inspector.show({
+      anchorRect: new DOMRect(680, 530, 40, 30),
+      records: [record('ipad-edge', 'Near the lower-right edge')],
+    });
+
+    const element = document.querySelector<HTMLElement>('[data-inkstone-annotation-inspector]');
+    expect(element?.style.left).toBe('376px');
+    expect(element?.style.top).toBe('162px');
+    expect(element?.dataset.inkstonePlacement).toBe('above');
+
+    inspector.close(false);
+    rect.mockRestore();
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: undefined,
+    });
+  });
+
   it('keeps Copy JSON directly available without an overflow menu', () => {
     const inspector = new AnnotationInspector({
       document,
@@ -446,10 +523,14 @@ describe('annotation inspector', () => {
     expect(document.activeElement).toBe(invoker);
   });
 
-  it('keeps dirty inspector open when save-on-dismiss fails', async () => {
+  it('abandons dirty edits and closes when save-on-dismiss fails', async () => {
+    const discarded: string[] = [];
     const inspector = new AnnotationInspector({
       document,
       onDelete: (item) => Promise.resolve(item),
+      onDiscard: (item) => {
+        discarded.push(item.id);
+      },
       onNavigate: () => undefined,
       onSave: () => Promise.reject(new Error('disk unavailable')),
       onUndo: (item) => Promise.resolve(item),
@@ -465,12 +546,36 @@ describe('annotation inspector', () => {
     document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
 
     await vi.waitFor(() =>
-      expect(document.querySelector('[data-inkstone-inspector-status]')?.textContent).toContain(
-        "Couldn't save locally",
-      ),
+      expect(document.querySelector('[data-inkstone-annotation-inspector]')).toBeNull(),
     );
-    expect(document.querySelector('[data-inkstone-annotation-inspector]')).not.toBeNull();
-    expect(note.value).toBe('Do not lose me');
+    expect(discarded).toEqual(['dirty-fail']);
+  });
+
+  it('discards a clean empty draft when the inspector is dismissed', async () => {
+    const discarded: string[] = [];
+    const inspector = new AnnotationInspector({
+      document,
+      onDelete: (item) => Promise.resolve(item),
+      onDiscard: (item) => {
+        discarded.push(item.id);
+      },
+      onNavigate: () => undefined,
+      onSave: (item) => Promise.resolve(item),
+      onUndo: (item) => Promise.resolve(item),
+      presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
+      writeClipboard: () => Promise.resolve(),
+    });
+    const { mark: _mark, ...recordWithoutMark } = record('clean-draft', 'Clean draft');
+    void _mark;
+    const draft: TextAnnotationRecord = { ...recordWithoutMark, status: 'draft' };
+    inspector.show({ anchorRect: new DOMRect(), initialFocus: 'note', records: [draft] });
+
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-inkstone-annotation-inspector]')).toBeNull(),
+    );
+    expect(discarded).toEqual(['clean-draft']);
   });
 
   it('keeps an explicit failed save open and focuses the Retry action', async () => {

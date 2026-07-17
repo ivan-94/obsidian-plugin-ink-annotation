@@ -8,6 +8,7 @@ import {
 } from '../domain/ink-workspace';
 import {
   LocalInkToolPreferenceStore,
+  resolveInkToolStyles,
   type InkToolPreference,
 } from '../storage/local-ink-tool-preference';
 import { InkToolbarApp, type InkToolbarAppProps } from './ink/ink-toolbar-app';
@@ -18,6 +19,7 @@ import {
   type InkStageFrame,
 } from './ink-stage-frame';
 import { createPreactIsland, type UiIsland } from './runtime/mount-preact-island';
+import { viewportBounds } from './runtime/anchored-layer-position';
 import {
   createInkToolbarStore,
   type InkToolbarState,
@@ -32,7 +34,9 @@ interface InkSessionLike {
   canUndo(): boolean;
   clearSelection?(): boolean;
   commitSelectionMove?(): boolean;
+  deleteSelectedStrokes?(): readonly string[];
   eraseStrokeAt(point: InkPoint, radius: number): string | null;
+  eraseStrokesInPolygon(polygon: readonly InkPoint[]): readonly string[];
   enter(): void;
   exit(): Promise<void>;
   redo(): boolean;
@@ -54,8 +58,11 @@ interface InkControlsDragState {
 }
 
 interface InkSelectionDragState {
+  readonly dragged: boolean;
   readonly pointerId: number;
   readonly start: InkPoint;
+  readonly startClient: CssPoint;
+  readonly toggleOnClick: boolean;
 }
 
 interface InkDirtyRect {
@@ -65,12 +72,33 @@ interface InkDirtyRect {
   readonly y: number;
 }
 
+interface InkClientInputSample {
+  readonly clientX: number;
+  readonly clientY: number;
+  readonly pressure: number;
+  readonly timeStamp: number;
+}
+
+interface InkLayoutPresentation {
+  readonly rect: CssRect;
+  readonly scale: number;
+}
+
+interface InkToolStyle {
+  readonly color: string;
+  readonly width: number;
+}
+
+type InkToolStyles = Record<InkStroke['tool'], InkToolStyle>;
+
 /** A single fixed logical surface. Rendering stays pointer-transparent in every view mode. */
 export class InkCanvasController {
   private active = false;
   private readonly activeCanvas: HTMLCanvasElement;
   private readonly activeContext: CanvasRenderingContext2D;
   private activePointerId: number | null = null;
+  private activeStylusTouchId: number | null = null;
+  private activeClientPoints: CssPoint[] = [];
   private activePoints: InkPoint[] = [];
   private activePaintedPointCount = 0;
   private readonly committedCanvas: HTMLCanvasElement;
@@ -82,6 +110,7 @@ export class InkCanvasController {
   private documentOriginInset: CssPoint | null;
   private readonly dragHandle: HTMLButtonElement;
   private readonly extentProbeTimeouts = new Set<number>();
+  private eraserPreviewColor = '#dc2626';
   private frame: number | null = null;
   private hintShown: boolean;
   private hoveredStrokeId: string | null = null;
@@ -114,7 +143,9 @@ export class InkCanvasController {
   private readonly toolbarHost: HTMLElement;
   private readonly toolbarIsland: UiIsland<InkToolbarAppProps> = createPreactIsland(InkToolbarApp);
   private readonly toolbarStore: InkToolbarStore;
+  private readonly toolStyles: InkToolStyles;
   private viewMode: 'raw' | 'preview' | 'edit' = 'raw';
+  private readonly viewportHost: HTMLElement | null;
 
   private get viewportHeight(): number {
     return this.stageFrame.logicalViewport.height;
@@ -158,11 +189,13 @@ export class InkCanvasController {
     readonly root: HTMLElement;
     readonly scrollContainer?: HTMLElement;
     readonly session: InkSessionLike;
+    readonly viewportHost?: HTMLElement;
   }) {
     this.document = input.document;
     this.root = input.root;
     this.layoutRoot = input.layoutRoot ?? input.root;
     this.scrollContainer = input.scrollContainer ?? null;
+    this.viewportHost = input.viewportHost ?? null;
     this.inputTarget = this.scrollContainer ?? this.root;
     this.session = input.session;
     this.now = input.now ?? (() => performance.now());
@@ -171,7 +204,11 @@ export class InkCanvasController {
     this.recordInputToPaint = input.recordInputToPaint ?? (() => undefined);
     const preference = input.preference ?? LocalInkToolPreferenceStore.DEFAULT;
     this.hintShown = preference.hintShown;
-    this.toolbarStore = createInkToolbarStore(preference);
+    this.toolStyles = initialToolStyles(preference);
+    this.toolbarStore = createInkToolbarStore({
+      ...preference,
+      ...this.toolStyles[preference.tool],
+    });
     this.onPreferenceChanged = input.onPreferenceChanged ?? (() => undefined);
     this.onRetryRequested = input.onRetryRequested ?? (() => this.retrySave());
     this.previousPosition = input.root.style.position;
@@ -225,6 +262,8 @@ export class InkCanvasController {
 
     this.attachHostListeners();
     this.document.defaultView?.addEventListener('resize', this.onRootResized);
+    this.document.defaultView?.visualViewport?.addEventListener('resize', this.onRootResized);
+    this.document.defaultView?.visualViewport?.addEventListener('scroll', this.onRootResized);
     this.sync(snapshot);
     const ResizeObserverConstructor =
       input.document.defaultView?.ResizeObserver ??
@@ -390,6 +429,7 @@ export class InkCanvasController {
       canRedo: this.session.canRedo(),
       canUndo: this.session.canUndo(),
       saveError: error ? snapshot.persistence.message : null,
+      selectedCount: this.session.selectedStrokeIds?.().length ?? 0,
       statusText: error
         ? `Ink Mode · ${snapshot.persistence.message}`
         : snapshot.persistence.kind === 'saving'
@@ -414,6 +454,8 @@ export class InkCanvasController {
     this.pendingSelectionDelta = null;
     this.stopControlsDrag();
     this.document.defaultView?.removeEventListener('resize', this.onRootResized);
+    this.document.defaultView?.visualViewport?.removeEventListener('resize', this.onRootResized);
+    this.document.defaultView?.visualViewport?.removeEventListener('scroll', this.onRootResized);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     for (const timeout of this.extentProbeTimeouts) {
@@ -429,26 +471,48 @@ export class InkCanvasController {
   }
 
   private attachHostListeners(): void {
+    this.inputTarget.addEventListener('click', this.onReadingViewActivation, true);
+    this.inputTarget.addEventListener('dblclick', this.onReadingViewActivation, true);
+    this.inputTarget.addEventListener('selectstart', this.onReadingViewSelection, true);
     this.inputTarget.addEventListener('pointerdown', this.onPointerDown, true);
     this.inputTarget.addEventListener('pointermove', this.onPointerMove, true);
     this.inputTarget.addEventListener('pointerleave', this.onPointerLeave, true);
     this.inputTarget.addEventListener('pointerup', this.onPointerEnd, true);
     this.inputTarget.addEventListener('pointercancel', this.onPointerCancel, true);
-    this.inputTarget.addEventListener('wheel', this.onNativeNavigationIntent, { passive: true });
-    this.inputTarget.addEventListener('touchstart', this.onNativeNavigationIntent, {
-      passive: true,
+    this.inputTarget.addEventListener('touchstart', this.onTouchStart, {
+      capture: true,
+      passive: false,
     });
+    this.inputTarget.addEventListener('touchmove', this.onTouchMove, {
+      capture: true,
+      passive: false,
+    });
+    this.inputTarget.addEventListener('touchend', this.onTouchEnd, {
+      capture: true,
+      passive: false,
+    });
+    this.inputTarget.addEventListener('touchcancel', this.onTouchCancel, {
+      capture: true,
+      passive: false,
+    });
+    this.inputTarget.addEventListener('wheel', this.onNativeNavigationIntent, { passive: true });
     this.scrollContainer?.addEventListener('scroll', this.onScrolled, { passive: true });
   }
 
   private detachHostListeners(): void {
+    this.inputTarget.removeEventListener('click', this.onReadingViewActivation, true);
+    this.inputTarget.removeEventListener('dblclick', this.onReadingViewActivation, true);
+    this.inputTarget.removeEventListener('selectstart', this.onReadingViewSelection, true);
     this.inputTarget.removeEventListener('pointerdown', this.onPointerDown, true);
     this.inputTarget.removeEventListener('pointermove', this.onPointerMove, true);
     this.inputTarget.removeEventListener('pointerleave', this.onPointerLeave, true);
     this.inputTarget.removeEventListener('pointerup', this.onPointerEnd, true);
     this.inputTarget.removeEventListener('pointercancel', this.onPointerCancel, true);
+    this.inputTarget.removeEventListener('touchstart', this.onTouchStart, true);
+    this.inputTarget.removeEventListener('touchmove', this.onTouchMove, true);
+    this.inputTarget.removeEventListener('touchend', this.onTouchEnd, true);
+    this.inputTarget.removeEventListener('touchcancel', this.onTouchCancel, true);
     this.inputTarget.removeEventListener('wheel', this.onNativeNavigationIntent);
-    this.inputTarget.removeEventListener('touchstart', this.onNativeNavigationIntent);
     this.scrollContainer?.removeEventListener('scroll', this.onScrolled);
   }
 
@@ -481,32 +545,21 @@ export class InkCanvasController {
   private readonly onPointerDown = (event: PointerEvent): void => {
     this.cancelReadingContextRestore();
     if (event.target instanceof Node && this.toolbarHost.contains(event.target)) return;
+    if (this.preserveNativeTouchNavigation(event)) return;
     if (!this.active || event.button !== 0 || !isDrawingPointer(event.pointerType)) {
       return;
     }
     event.preventDefault();
     event.stopPropagation();
     if (this.toolbarStore.state.value.interaction === 'select') {
-      const start = this.eventPoint(event);
-      if (start === null) return;
-      const selected =
-        this.session.selectStrokeAt?.(
-          start,
-          Math.max(8, this.width),
-          this.toolbarStore.state.value.multiple ||
-            event.shiftKey ||
-            event.metaKey ||
-            event.ctrlKey,
-        ) ?? [];
-      this.selectionDragState =
-        selected.length === 0 ? null : { pointerId: event.pointerId, start };
-      this.hoveredStrokeId = selected[0] ?? null;
-      this.inputTarget.style.cursor = this.selectionDragState === null ? '' : 'grabbing';
-      if (this.selectionDragState !== null) this.inputTarget.setPointerCapture?.(event.pointerId);
-      this.sync(this.session.snapshot());
+      const additive =
+        this.toolbarStore.state.value.multiple || event.shiftKey || event.metaKey || event.ctrlKey;
+      this.beginSelection(event, event.pointerId, additive, true);
       return;
     }
     this.activePointerId = event.pointerId;
+    if (this.tool === 'eraser') this.eraserPreviewColor = this.resolveEraserPreviewColor();
+    this.activeClientPoints = [];
     this.activePoints = [];
     this.activePaintedPointCount = 0;
     this.clearCanvas(this.activeCanvas, this.activeContext);
@@ -516,17 +569,27 @@ export class InkCanvasController {
     this.scheduleActivePaint();
   };
 
+  private readonly onReadingViewActivation = (event: MouseEvent): void => {
+    if (!this.active) return;
+    if (event.target instanceof Node && this.toolbarHost.contains(event.target)) return;
+    if (event.type === 'click' && event.detail < 2) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+
+  private readonly onReadingViewSelection = (event: Event): void => {
+    if (!this.active) return;
+    if (event.target instanceof Node && this.toolbarHost.contains(event.target)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+
   private readonly onPointerMove = (event: PointerEvent): void => {
+    if (this.preserveNativeTouchNavigation(event)) return;
     if (event.pointerId === this.selectionDragState?.pointerId) {
       event.preventDefault();
       event.stopPropagation();
-      const point = this.eventPoint(event);
-      if (point !== null) {
-        this.scheduleSelectionPreview(
-          point.x - this.selectionDragState.start.x,
-          point.y - this.selectionDragState.start.y,
-        );
-      }
+      this.updateSelectionDrag(event);
       return;
     }
     if (
@@ -556,9 +619,11 @@ export class InkCanvasController {
   };
 
   private readonly onPointerEnd = (event: PointerEvent): void => {
+    if (this.preserveNativeTouchNavigation(event)) return;
     if (event.pointerId === this.selectionDragState?.pointerId) {
       event.preventDefault();
       event.stopPropagation();
+      if (this.selectionDragState.dragged === false) this.updateSelectionDrag(event);
       this.finishSelectionMove(true);
       return;
     }
@@ -572,6 +637,7 @@ export class InkCanvasController {
   };
 
   private readonly onPointerCancel = (event: PointerEvent): void => {
+    if (this.preserveNativeTouchNavigation(event)) return;
     if (event.pointerId === this.selectionDragState?.pointerId) {
       event.preventDefault();
       event.stopPropagation();
@@ -585,6 +651,107 @@ export class InkCanvasController {
     event.stopPropagation();
     this.finishStroke(false);
   };
+
+  private readonly onTouchStart = (event: TouchEvent): void => {
+    this.cancelReadingContextRestore();
+    if (!this.active) return;
+    if (event.target instanceof Node && this.toolbarHost.contains(event.target)) return;
+    const stylus = findStylusTouch(event.changedTouches);
+    if (stylus === null) {
+      event.stopPropagation();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (this.activePointerId !== null || this.selectionDragState !== null) return;
+    this.activeStylusTouchId = stylus.identifier;
+    const pointerId = stylusPointerId(stylus.identifier);
+    const sample = touchInputSample(event, stylus);
+    if (this.toolbarStore.state.value.interaction === 'select') {
+      const additive =
+        this.toolbarStore.state.value.multiple || event.shiftKey || event.metaKey || event.ctrlKey;
+      if (!this.beginSelection(sample, pointerId, additive, false)) {
+        this.activeStylusTouchId = null;
+      }
+      return;
+    }
+    this.activePointerId = pointerId;
+    if (this.tool === 'eraser') this.eraserPreviewColor = this.resolveEraserPreviewColor();
+    this.activeClientPoints = [];
+    this.activePoints = [];
+    this.activePaintedPointCount = 0;
+    this.clearCanvas(this.activeCanvas, this.activeContext);
+    this.selectionChromeBounds = null;
+    this.appendInputPoint(sample);
+    this.scheduleActivePaint();
+  };
+
+  private readonly onTouchMove = (event: TouchEvent): void => {
+    if (!this.active) return;
+    const stylus = findStylusTouch(event.changedTouches);
+    if (stylus === null) {
+      event.stopPropagation();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (stylus.identifier !== this.activeStylusTouchId) return;
+    const sample = touchInputSample(event, stylus);
+    if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
+      this.updateSelectionDrag(sample);
+      return;
+    }
+    this.appendInputPoint(sample);
+    this.scheduleActivePaint();
+  };
+
+  private readonly onTouchEnd = (event: TouchEvent): void => {
+    if (!this.active) return;
+    const stylus = findStylusTouch(event.changedTouches);
+    if (stylus === null) {
+      event.stopPropagation();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (stylus.identifier !== this.activeStylusTouchId) return;
+    const sample = touchInputSample(event, stylus);
+    if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
+      if (this.selectionDragState.dragged === false) this.updateSelectionDrag(sample);
+      this.activeStylusTouchId = null;
+      this.finishSelectionMove(true);
+      return;
+    }
+    this.appendInputPoint(sample);
+    this.activeStylusTouchId = null;
+    this.finishStroke(true);
+  };
+
+  private readonly onTouchCancel = (event: TouchEvent): void => {
+    if (!this.active) return;
+    const stylus = findStylusTouch(event.changedTouches);
+    if (stylus === null) {
+      event.stopPropagation();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (stylus.identifier !== this.activeStylusTouchId) return;
+    this.activeStylusTouchId = null;
+    if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
+      this.finishSelectionMove(false);
+      return;
+    }
+    this.finishStroke(false);
+  };
+
+  private preserveNativeTouchNavigation(event: PointerEvent): boolean {
+    if (!this.active || event.pointerType !== 'touch') return false;
+    // WKWebView scrolls only when the real Reading View remains the hit target. Isolate its
+    // component listeners without cancelling the browser's native pan action.
+    event.stopPropagation();
+    return true;
+  }
 
   private readonly onControlsDragStart = (event: PointerEvent): void => {
     if (event.button !== 0) return;
@@ -638,6 +805,7 @@ export class InkCanvasController {
   private readonly onControlsDragEnd = (event: PointerEvent): void => {
     if (event.pointerId !== this.controlsDragState?.pointerId) return;
     this.stopControlsDrag();
+    this.persistPreference();
   };
 
   private readonly onControlsDragKeyDown = (event: KeyboardEvent): void => {
@@ -653,27 +821,36 @@ export class InkCanvasController {
     event.preventDefault();
     const bounds = this.controls.getBoundingClientRect();
     this.moveControls(bounds.left + movement[0], bounds.top + movement[1]);
+    this.persistPreference();
   };
 
   private appendEventPoints(event: PointerEvent): void {
-    const layout = this.session.snapshot().surface.layout;
-    const samples = event.getCoalescedEvents?.() ?? [event];
+    // Pointer Events exposes coalesced samples for moves, but down/up normally return an empty
+    // list. Preserve the parent event so WebKit does not lose the Pencil contact endpoints.
+    const coalesced = event.getCoalescedEvents?.() ?? [];
+    const samples = coalesced.length === 0 ? [event] : coalesced;
     for (const sample of samples) {
-      const previous = this.activePoints.at(-1);
-      const time = Math.max(sample.timeStamp, previous?.time ?? Number.NEGATIVE_INFINITY);
-      const point = this.stageFrame.clientToLogical({ x: sample.clientX, y: sample.clientY });
-      this.activePoints.push({
-        pressure: sample.pressure > 0 ? sample.pressure : 0.5,
-        time,
-        x: point.x,
-        y: clamp(point.y, 0, layout.logicalHeight),
-        ...(sample.tiltX === 0 ? {} : { tiltX: sample.tiltX }),
-        ...(sample.tiltY === 0 ? {} : { tiltY: sample.tiltY }),
-      });
+      this.appendInputPoint(sample, sample.tiltX, sample.tiltY);
     }
   }
 
-  private eventPoint(event: PointerEvent): InkPoint | null {
+  private appendInputPoint(sample: InkClientInputSample, tiltX = 0, tiltY = 0): void {
+    const layout = this.session.snapshot().surface.layout;
+    const previous = this.activePoints.at(-1);
+    const time = Math.max(sample.timeStamp, previous?.time ?? Number.NEGATIVE_INFINITY);
+    const point = this.stageFrame.clientToLogical({ x: sample.clientX, y: sample.clientY });
+    this.activeClientPoints.push({ x: sample.clientX, y: sample.clientY });
+    this.activePoints.push({
+      pressure: sample.pressure > 0 ? sample.pressure : 0.5,
+      time,
+      x: point.x,
+      y: clamp(point.y, 0, layout.logicalHeight),
+      ...(tiltX === 0 ? {} : { tiltX }),
+      ...(tiltY === 0 ? {} : { tiltY }),
+    });
+  }
+
+  private eventPoint(event: InkClientInputSample): InkPoint | null {
     const layout = this.session.snapshot().surface.layout;
     const point = this.stageFrame.clientToLogical({ x: event.clientX, y: event.clientY });
     return {
@@ -684,18 +861,78 @@ export class InkCanvasController {
     };
   }
 
+  private beginSelection(
+    sample: InkClientInputSample,
+    pointerId: number,
+    additive: boolean,
+    capturePointer: boolean,
+  ): boolean {
+    const start = this.eventPoint(sample);
+    if (start === null) return false;
+    const tolerance = Math.max(8, this.width);
+    const hitStrokeId = this.session.strokeIdAt?.(start, tolerance) ?? null;
+    const currentSelection = this.session.selectedStrokeIds?.() ?? [];
+    const toggleOnClick =
+      additive && hitStrokeId !== null && currentSelection.includes(hitStrokeId);
+    const selected = toggleOnClick
+      ? currentSelection
+      : (this.session.selectStrokeAt?.(start, tolerance, additive) ?? []);
+    this.selectionDragState =
+      selected.length === 0
+        ? null
+        : {
+            dragged: false,
+            pointerId,
+            start,
+            startClient: { x: sample.clientX, y: sample.clientY },
+            toggleOnClick,
+          };
+    this.hoveredStrokeId = hitStrokeId;
+    this.inputTarget.style.cursor = this.selectionDragState === null ? '' : 'grabbing';
+    if (capturePointer && this.selectionDragState !== null) {
+      this.inputTarget.setPointerCapture?.(pointerId);
+    }
+    this.sync(this.session.snapshot());
+    return this.selectionDragState !== null;
+  }
+
   private finishSelectionMove(commit: boolean): void {
-    const pointerId = this.selectionDragState?.pointerId;
+    const drag = this.selectionDragState;
+    const pointerId = drag?.pointerId;
     this.selectionDragState = null;
-    if (pointerId !== undefined && this.inputTarget.hasPointerCapture?.(pointerId)) {
+    this.activeStylusTouchId = null;
+    if (
+      pointerId !== undefined &&
+      pointerId >= 0 &&
+      this.inputTarget.hasPointerCapture?.(pointerId)
+    ) {
       this.inputTarget.releasePointerCapture(pointerId);
     }
     this.flushSelectionPreview();
-    if (commit) this.session.commitSelectionMove?.();
-    else this.session.cancelSelectionMove?.();
+    if (commit && drag?.dragged === true) {
+      this.session.commitSelectionMove?.();
+    } else if (commit && drag?.toggleOnClick === true) {
+      this.session.selectStrokeAt?.(drag.start, Math.max(8, this.width), true);
+    } else if (!commit) {
+      this.session.cancelSelectionMove?.();
+    }
     this.selectionCommittedStrokes = null;
     this.inputTarget.style.cursor = this.hoveredStrokeId === null ? '' : 'grab';
     this.sync(this.session.snapshot());
+  }
+
+  private updateSelectionDrag(event: InkClientInputSample): void {
+    const drag = this.selectionDragState;
+    if (drag === null) return;
+    const dragged =
+      drag.dragged ||
+      Math.hypot(event.clientX - drag.startClient.x, event.clientY - drag.startClient.y) >= 4;
+    if (!dragged) return;
+    if (!drag.dragged) this.selectionDragState = { ...drag, dragged: true };
+    const point = this.eventPoint(event);
+    if (point !== null) {
+      this.scheduleSelectionPreview(point.x - drag.start.x, point.y - drag.start.y);
+    }
   }
 
   private scheduleSelectionPreview(dx: number, dy: number): void {
@@ -740,18 +977,27 @@ export class InkCanvasController {
     this.cancelFrame();
     const pointerId = this.activePointerId;
     this.activePointerId = null;
+    this.activeStylusTouchId = null;
     if (pointerId !== null && this.inputTarget.hasPointerCapture?.(pointerId)) {
       this.inputTarget.releasePointerCapture(pointerId);
     }
     this.clearCanvas(this.activeCanvas, this.activeContext);
     this.selectionChromeBounds = null;
+    const closedLoopErase =
+      this.tool === 'eraser' && isClosedLoopEraseGesture(this.activeClientPoints);
     const points = simplifyPoints(this.activePoints, 0.8);
+    this.activeClientPoints = [];
     this.activePoints = [];
     this.activePaintedPointCount = 0;
     if (!commit || points.length === 0) {
       return;
     }
     if (this.tool === 'eraser') {
+      if (closedLoopErase) {
+        this.session.eraseStrokesInPolygon(points);
+        this.sync(this.session.snapshot());
+        return;
+      }
       const target = points.at(-1);
       if (target !== undefined) this.session.eraseStrokeAt(target, Math.max(8, this.width));
       this.sync(this.session.snapshot());
@@ -781,12 +1027,24 @@ export class InkCanvasController {
       this.pendingInputStartedAt = null;
       const segment = nextActivePaintSegment(this.activePoints, this.activePaintedPointCount);
       this.activePaintedPointCount = segment.nextPaintedPointCount;
-      drawStroke(
-        this.activeContext,
-        segment.points,
-        this.tool === 'highlighter' ? `${this.color}88` : this.color,
-        this.width,
-      );
+      if (this.tool === 'eraser') {
+        drawEraserPreview(
+          this.activeContext,
+          segment.points,
+          this.activePoints[0],
+          this.eraserPreviewColor,
+          this.width,
+          this.stageFrame.actualScale,
+          isClosedLoopEraseGesture(this.activeClientPoints),
+        );
+      } else {
+        drawStroke(
+          this.activeContext,
+          segment.points,
+          this.tool === 'highlighter' ? `${this.color}88` : this.color,
+          this.width,
+        );
+      }
       if (inputStartedAt !== null) {
         requestAnimationFrame(() => {
           if (!this.disposed) {
@@ -880,16 +1138,16 @@ export class InkCanvasController {
     // Native scrolling changes only the client-space projection of the immutable document.
     // The pane-fixed Canvas rect and CSS zoom stay unchanged; only the document origin moves.
     // Recalibrating the fixed overlay here would create a write/read/write layout feedback loop.
-    const layoutRect = this.layoutRoot.getBoundingClientRect();
-    const scale = this.stageFrame.actualScale;
+    const layout = this.measureLayoutPresentation();
+    const scale = layout.scale;
     const inset = this.documentOriginInset ?? { x: 0, y: 0 };
     this.publishStageFrame(
       createInkStageFrame({
         actualScale: scale,
         canvasClientRect: this.stageFrame.canvasClientRect,
         documentClientOrigin: {
-          x: layoutRect.left + inset.x * scale,
-          y: layoutRect.top + inset.y * scale,
+          x: layout.rect.left + inset.x * scale,
+          y: layout.rect.top + inset.y * scale,
         },
       }),
     );
@@ -909,8 +1167,12 @@ export class InkCanvasController {
     if (logicalViewportTop !== null) this.restoreLogicalViewportTop(logicalViewportTop);
     this.updateViewport(true);
     const scale = this.viewMode === 'raw' ? 1 : this.stageFrame.actualScale;
-    const layoutRect = this.layoutRoot.getBoundingClientRect();
-    const extent = Math.ceil(Math.max(this.layoutRoot.scrollHeight, layoutRect.height / scale));
+    const layout = this.measureLayoutPresentation();
+    const visibleLogicalBottom =
+      this.stageFrame.logicalViewport.top + this.stageFrame.logicalViewport.height;
+    const extent = Math.ceil(
+      Math.max(this.layoutRoot.scrollHeight, layout.rect.height / scale, visibleLogicalBottom),
+    );
     if (!this.coversHeight(extent) && extent > this.reportedLayoutExtent) {
       this.reportedLayoutExtent = extent;
       this.onLayoutExtentChanged(extent);
@@ -945,12 +1207,24 @@ export class InkCanvasController {
     this.clearCanvas(this.activeCanvas, this.activeContext);
     this.selectionChromeBounds = null;
     if (this.activePointerId !== null && this.activePoints.length > 0) {
-      drawStroke(
-        this.activeContext,
-        this.activePoints,
-        this.tool === 'highlighter' ? `${this.color}88` : this.color,
-        this.width,
-      );
+      if (this.tool === 'eraser') {
+        drawEraserPreview(
+          this.activeContext,
+          this.activePoints,
+          this.activePoints[0],
+          this.eraserPreviewColor,
+          this.width,
+          this.stageFrame.actualScale,
+          isClosedLoopEraseGesture(this.activeClientPoints),
+        );
+      } else {
+        drawStroke(
+          this.activeContext,
+          this.activePoints,
+          this.tool === 'highlighter' ? `${this.color}88` : this.color,
+          this.width,
+        );
+      }
       this.activePaintedPointCount = this.activePoints.length;
       return;
     }
@@ -961,13 +1235,13 @@ export class InkCanvasController {
     if (this.scrollContainer === null) {
       this.overlay.style.left = '0px';
       this.overlay.style.top = '0px';
-      const layoutRect = this.layoutRoot.getBoundingClientRect();
-      const scale = this.measureActualScale(layoutRect);
-      const width = layoutRect.width || INK_DOCUMENT_LOGICAL_WIDTH * scale;
+      const layout = this.measureLayoutPresentation();
+      const scale = layout.scale;
+      const width = layout.rect.width || INK_DOCUMENT_LOGICAL_WIDTH * scale;
       const height =
-        layoutRect.height || this.session.snapshot().surface.layout.logicalHeight * scale;
-      const left = layoutRect.left;
-      const top = layoutRect.top;
+        layout.rect.height || this.session.snapshot().surface.layout.logicalHeight * scale;
+      const left = layout.rect.left;
+      const top = layout.rect.top;
       const documentOriginInset = this.documentOriginInset ?? { x: 0, y: 0 };
       this.overlay.style.width = `${width}px`;
       this.overlay.style.height = `${height}px`;
@@ -976,8 +1250,8 @@ export class InkCanvasController {
           actualScale: scale,
           canvasClientRect: { height, left, top, width },
           documentClientOrigin: {
-            x: layoutRect.left + documentOriginInset.x * scale,
-            y: layoutRect.top + documentOriginInset.y * scale,
+            x: layout.rect.left + documentOriginInset.x * scale,
+            y: layout.rect.top + documentOriginInset.y * scale,
           },
         }),
       );
@@ -985,8 +1259,8 @@ export class InkCanvasController {
     }
     const hostRect = this.root.getBoundingClientRect();
     const paneRect = this.scrollContainer.getBoundingClientRect();
-    const layoutRect = this.layoutRoot.getBoundingClientRect();
-    const scale = this.measureActualScale(layoutRect);
+    const layout = this.measureLayoutPresentation();
+    const scale = layout.scale;
     const paneWidth = this.paneWidth(INK_DOCUMENT_LOGICAL_WIDTH);
     const paneHeight = this.paneHeight(this.stageFrame.canvasClientRect.height);
     if (this.documentOriginInset === null && !this.overlay.hidden) {
@@ -1005,8 +1279,8 @@ export class InkCanvasController {
         actualScale: scale,
         canvasClientRect,
         documentClientOrigin: {
-          x: layoutRect.left + documentOriginInset.x * scale,
-          y: layoutRect.top + documentOriginInset.y * scale,
+          x: layout.rect.left + documentOriginInset.x * scale,
+          y: layout.rect.top + documentOriginInset.y * scale,
         },
       }),
     );
@@ -1124,12 +1398,49 @@ export class InkCanvasController {
     return Object.freeze({ ...target });
   }
 
-  private measureActualScale(layoutRect: DOMRect): number {
+  private measureLayoutPresentation(): InkLayoutPresentation {
+    const layoutRect = this.layoutRoot.getBoundingClientRect();
     const unscaledBorderBoxWidth =
       this.layoutRoot.offsetWidth > 0 ? this.layoutRoot.offsetWidth : INK_DOCUMENT_LOGICAL_WIDTH;
     const measured = layoutRect.width / unscaledBorderBoxWidth;
-    return Number.isFinite(measured) && measured > 0
-      ? measured
+    const presented = this.presentedWorkspaceScale();
+    const containingScale = this.measureContainingScale();
+    const expected = presented * containingScale;
+    const ignoresCssZoom =
+      Math.abs(presented - 1) > 0.000_001 &&
+      approximatelyEqual(measured, containingScale) &&
+      !approximatelyEqual(measured, expected);
+    if (ignoresCssZoom) {
+      return Object.freeze({
+        rect: Object.freeze({
+          height: layoutRect.height * presented,
+          left: layoutRect.left * presented,
+          top: layoutRect.top * presented,
+          width: layoutRect.width * presented,
+        }),
+        scale: expected,
+      });
+    }
+    return Object.freeze({
+      rect: freezeCssRect(layoutRect),
+      scale: Number.isFinite(measured) && measured > 0 ? measured : expected,
+    });
+  }
+
+  private measureContainingScale(): number {
+    const rootRect = this.root.getBoundingClientRect();
+    const unscaledWidth = this.root.offsetWidth || this.root.clientWidth;
+    const measured = unscaledWidth > 0 ? rootRect.width / unscaledWidth : 1;
+    return Number.isFinite(measured) && measured > 0 ? measured : 1;
+  }
+
+  private presentedWorkspaceScale(): number {
+    if (this.viewMode === 'raw' || !this.layoutRoot.classList.contains('inkstone-ink-workspace')) {
+      return 1;
+    }
+    const presented = Number(this.layoutRoot.style.getPropertyValue('--inkstone-ink-scale'));
+    return Number.isFinite(presented) && presented > 0
+      ? presented
       : this.toolbarStore.state.value.zoomScale;
   }
 
@@ -1170,7 +1481,12 @@ export class InkCanvasController {
     this.updateToolbar({ optionsVisible: visible });
   }
 
+  private resolveEraserPreviewColor(): string {
+    return getComputedStyle(this.root).getPropertyValue('--text-error').trim() || '#dc2626';
+  }
+
   private readonly onToolbarColor = (color: string): void => {
+    this.toolStyles[this.tool] = { ...this.toolStyles[this.tool], color };
     this.updateToolbar({ color });
     this.persistPreference();
   };
@@ -1183,6 +1499,11 @@ export class InkCanvasController {
     if (this.session.redo()) this.sync(this.session.snapshot());
   };
 
+  private readonly onToolbarDeleteSelection = (): void => {
+    const deletedStrokeIds = this.session.deleteSelectedStrokes?.() ?? [];
+    if (deletedStrokeIds.length > 0) this.sync(this.session.snapshot());
+  };
+
   private readonly onToolbarRetry = (): void => {
     void this.onRetryRequested().catch(() => this.sync(this.session.snapshot()));
   };
@@ -1190,24 +1511,20 @@ export class InkCanvasController {
   private readonly onToolbarToggleOptions = (): void => {
     const visible = !this.toolbarStore.state.value.optionsVisible;
     this.setToolOptionsVisible(visible);
-    if (visible) {
-      this.controls
-        .querySelector<HTMLInputElement>('[data-inkstone-ink-color]')
-        ?.focus({ preventScroll: true });
-    }
+    this.persistPreference();
+    queueMicrotask(() => this.clampDraggedControls());
   };
 
   private readonly onToolbarTool = (tool: InkStroke['tool']): void => {
-    const state = this.toolbarStore.state.value;
-    this.updateToolbar(
-      {
-        interaction: 'draw',
-        tool,
-        width:
-          state.tool === tool ? state.width : tool === 'pen' ? 4 : tool === 'highlighter' ? 12 : 16,
-      },
-      false,
-    );
+    this.finishStroke(false);
+    const style = this.toolStyles[tool];
+    this.updateToolbar({
+      color: style.color,
+      interaction: 'draw',
+      selectedCount: 0,
+      tool,
+      width: style.width,
+    });
     this.hoveredStrokeId = null;
     this.inputTarget.style.cursor = '';
     this.session.clearSelection?.();
@@ -1220,10 +1537,12 @@ export class InkCanvasController {
     this.finishStroke(false);
     this.updateToolbar({ interaction: 'select', optionsVisible: false });
     this.inputTarget.style.cursor = '';
+    this.persistPreference();
   };
 
   private readonly onToolbarToggleMultiple = (): void => {
     this.updateToolbar({ multiple: !this.toolbarStore.state.value.multiple });
+    this.persistPreference();
   };
 
   private readonly onToolbarUndo = (): void => {
@@ -1231,6 +1550,7 @@ export class InkCanvasController {
   };
 
   private readonly onToolbarWidth = (width: number): void => {
+    this.toolStyles[this.tool] = { ...this.toolStyles[this.tool], width };
     this.updateToolbar({ width });
     this.persistPreference();
   };
@@ -1238,6 +1558,7 @@ export class InkCanvasController {
   private readonly onToolbarZoomFit = (): void => {
     this.updateToolbar({ zoomMode: 'fit' });
     this.refreshWorkspacePresentation();
+    this.persistPreference();
   };
 
   private readonly onToolbarZoomIn = (): void => {
@@ -1246,6 +1567,7 @@ export class InkCanvasController {
       zoomScale: stepInkWorkspaceScale(this.toolbarStore.state.value.zoomScale, 1),
     });
     this.refreshWorkspacePresentation();
+    this.persistPreference();
   };
 
   private readonly onToolbarZoomOut = (): void => {
@@ -1254,6 +1576,7 @@ export class InkCanvasController {
       zoomScale: stepInkWorkspaceScale(this.toolbarStore.state.value.zoomScale, -1),
     });
     this.refreshWorkspacePresentation();
+    this.persistPreference();
   };
 
   private refreshWorkspacePresentation(): void {
@@ -1272,7 +1595,8 @@ export class InkCanvasController {
   private applyWorkspaceScale(): void {
     if (this.viewMode === 'raw') return;
     const state = this.toolbarStore.state.value;
-    const fit = state.zoomMode === 'fit';
+    const preview = this.viewMode === 'preview';
+    const fit = !preview && state.zoomMode === 'fit';
     if (this.root.classList.contains('is-ink-fit') !== fit) {
       this.root.classList.toggle('is-ink-fit', fit);
     }
@@ -1281,12 +1605,16 @@ export class InkCanvasController {
       this.scrollContainer === null
         ? logicalWidth + INK_FIT_GUTTER * 2
         : this.fitPaneWidth(logicalWidth + INK_FIT_GUTTER * 2);
-    const zoomScale = fit ? fitInkWorkspaceScale(availableWidth, logicalWidth) : state.zoomScale;
+    const zoomScale = preview
+      ? 1
+      : fit
+        ? fitInkWorkspaceScale(availableWidth, logicalWidth)
+        : state.zoomScale;
     const presentedScale = Number(this.layoutRoot.style.getPropertyValue('--inkstone-ink-scale'));
     if (!Number.isFinite(presentedScale) || Math.abs(presentedScale - zoomScale) > 0.000_001) {
       this.layoutRoot.style.setProperty('--inkstone-ink-scale', String(zoomScale));
     }
-    if (zoomScale !== state.zoomScale) this.updateToolbar({ zoomScale });
+    if (!preview && zoomScale !== state.zoomScale) this.updateToolbar({ zoomScale });
   }
 
   private paneWidth(fallback: number): number {
@@ -1317,16 +1645,21 @@ export class InkCanvasController {
 
   private paneHeight(fallback: number): number {
     if (this.scrollContainer === null) return fallback;
-    return (
-      this.scrollContainer.clientHeight ||
-      this.scrollContainer.getBoundingClientRect().height ||
-      fallback
-    );
+    const paneRect = this.scrollContainer.getBoundingClientRect();
+    let measured = Math.max(this.scrollContainer.clientHeight, paneRect.height);
+    const viewportRect = this.viewportHost?.getBoundingClientRect();
+    if (viewportRect !== undefined && viewportRect.height > 0) {
+      const visibleTop = Math.max(paneRect.top, viewportRect.top);
+      const visibleBottom = viewportRect.bottom;
+      measured = Math.max(measured, visibleBottom - visibleTop);
+    }
+    return measured > 0 ? measured : fallback;
   }
 
   private toolbarProps(): InkToolbarAppProps {
     return {
       onColor: this.onToolbarColor,
+      onDeleteSelection: this.onToolbarDeleteSelection,
       onDone: this.onToolbarDone,
       onDragKeyDown: this.onControlsDragKeyDown,
       onDragStart: this.onControlsDragStart,
@@ -1352,22 +1685,27 @@ export class InkCanvasController {
 
   private moveControls(left: number, top: number, markDragged = true): void {
     const bounds = this.controls.getBoundingClientRect();
-    const viewport = this.document.documentElement;
+    const viewport = viewportBounds(this.document);
     const width = bounds.width || this.controls.offsetWidth;
     const height = bounds.height || this.controls.offsetHeight;
-    const maxLeft = Math.max(8, viewport.clientWidth - width - 8);
-    const maxTop = Math.max(8, viewport.clientHeight - height - 8);
+    const safeLeft = viewport.left + 12;
+    const safeTop = viewport.top + 12;
+    const maxLeft = Math.max(safeLeft, viewport.left + viewport.width - width - 12);
+    const maxTop = Math.max(safeTop, viewport.top + viewport.height - height - 12);
     this.updateToolbar({
       position: {
         dragged: markDragged || this.toolbarStore.state.value.position?.dragged === true,
-        left: Math.round(clamp(left, 8, maxLeft)),
-        top: Math.round(clamp(top, 8, maxTop)),
+        left: Math.round(clamp(left, safeLeft, maxLeft)),
+        top: Math.round(clamp(top, safeTop, maxTop)),
       },
     });
   }
 
   private positionControlsDefault(): void {
-    if (this.toolbarStore.state.value.position?.dragged === true) return;
+    if (this.toolbarStore.state.value.position?.dragged === true) {
+      this.clampDraggedControls();
+      return;
+    }
     if (this.document.documentElement.clientWidth <= 600) return;
     const hostBounds = this.root.getBoundingClientRect();
     const controlsBounds = this.controls.getBoundingClientRect();
@@ -1381,9 +1719,10 @@ export class InkCanvasController {
   }
 
   private clampDraggedControls(): void {
-    if (this.toolbarStore.state.value.position?.dragged !== true) return;
-    const bounds = this.controls.getBoundingClientRect();
-    this.moveControls(bounds.left, bounds.top);
+    if (this.disposed) return;
+    const position = this.toolbarStore.state.value.position;
+    if (position?.dragged !== true) return;
+    this.moveControls(position.left, position.top);
   }
 
   private stopControlsDrag(): void {
@@ -1403,8 +1742,21 @@ export class InkCanvasController {
     this.onPreferenceChanged({
       color: state.color,
       hintShown: this.hintShown,
+      interaction: state.interaction,
+      multiple: state.multiple,
+      optionsVisible: state.optionsVisible,
       tool: state.tool,
+      ...(state.position?.dragged === true
+        ? { toolbarPosition: { left: state.position.left, top: state.position.top } }
+        : {}),
+      toolStyles: {
+        eraser: { ...this.toolStyles.eraser },
+        highlighter: { ...this.toolStyles.highlighter },
+        pen: { ...this.toolStyles.pen },
+      },
       width: state.width,
+      zoomMode: state.zoomMode,
+      zoomScale: state.zoomScale,
     });
   }
 
@@ -1497,6 +1849,11 @@ function cssPixels(value: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function approximatelyEqual(left: number, right: number): boolean {
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+  return Math.abs(left - right) <= Math.max(0.005, Math.abs(right) * 0.01);
+}
+
 function isMeasurableRect(rect: DOMRect): boolean {
   return (
     Number.isFinite(rect.left) &&
@@ -1579,6 +1936,83 @@ function isDrawingPointer(pointerType: string): boolean {
   return pointerType === 'pen' || pointerType === 'mouse' || pointerType === '';
 }
 
+function initialToolStyles(preference: InkToolPreference): InkToolStyles {
+  const styles = resolveInkToolStyles(preference);
+  return {
+    eraser: { ...styles.eraser },
+    highlighter: { ...styles.highlighter },
+    pen: { ...styles.pen },
+  };
+}
+
+function isClosedLoopEraseGesture(points: readonly CssPoint[]): boolean {
+  if (points.length < 3 || points.some(({ x, y }) => !Number.isFinite(x) || !Number.isFinite(y))) {
+    return false;
+  }
+  let length = 0;
+  let minimumX = Number.POSITIVE_INFINITY;
+  let minimumY = Number.POSITIVE_INFINITY;
+  let maximumX = Number.NEGATIVE_INFINITY;
+  let maximumY = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const previous = points[index - 1];
+    if (point === undefined) continue;
+    minimumX = Math.min(minimumX, point.x);
+    minimumY = Math.min(minimumY, point.y);
+    maximumX = Math.max(maximumX, point.x);
+    maximumY = Math.max(maximumY, point.y);
+    if (previous !== undefined) length += Math.hypot(point.x - previous.x, point.y - previous.y);
+  }
+  const first = points[0];
+  const last = points.at(-1);
+  if (first === undefined || last === undefined) return false;
+  const width = maximumX - minimumX;
+  const height = maximumY - minimumY;
+  const diagonal = Math.hypot(width, height);
+  const closingGap = Math.hypot(last.x - first.x, last.y - first.y);
+  const adaptiveClosingGap = Math.min(120, Math.max(32, diagonal * 0.6));
+  let effectiveArea = 0;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const point = points[index];
+    const next = points[index + 1];
+    if (point === undefined || next === undefined) continue;
+    effectiveArea +=
+      Math.abs(
+        (point.x - first.x) * (next.y - first.y) - (point.y - first.y) * (next.x - first.x),
+      ) / 2;
+  }
+  return (
+    length >= 48 &&
+    width >= 16 &&
+    height >= 16 &&
+    closingGap <= adaptiveClosingGap &&
+    closingGap / length <= 0.3 &&
+    effectiveArea >= Math.max(64, width * height * 0.12)
+  );
+}
+
+function findStylusTouch(touches: TouchList): Touch | null {
+  for (let index = 0; index < touches.length; index += 1) {
+    const touch = touches[index];
+    if (touch?.touchType === 'stylus') return touch;
+  }
+  return null;
+}
+
+function stylusPointerId(identifier: number): number {
+  return -(identifier + 1);
+}
+
+function touchInputSample(event: TouchEvent, touch: Touch): InkClientInputSample {
+  return {
+    clientX: touch.clientX,
+    clientY: touch.clientY,
+    pressure: touch.force,
+    timeStamp: event.timeStamp,
+  };
+}
+
 function selectionChromeBounds(
   strokes: readonly InkStroke[],
   frame: InkStageFrame,
@@ -1628,6 +2062,32 @@ function drawStroke(
     }
   }
   context.stroke();
+}
+
+function drawEraserPreview(
+  context: CanvasRenderingContext2D,
+  points: readonly InkPoint[],
+  start: InkPoint | undefined,
+  color: string,
+  width: number,
+  scale: number,
+  closed: boolean,
+): void {
+  const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  context.save();
+  context.setLineDash([6 / safeScale, 4 / safeScale]);
+  drawStroke(context, points, color, width);
+  if (start !== undefined) {
+    const radius = 6 / safeScale;
+    context.setLineDash([]);
+    context.beginPath();
+    context.strokeStyle = color;
+    context.lineWidth = 2 / safeScale;
+    context.arc(start.x, start.y, radius, 0, Math.PI * 2);
+    if (closed) context.arc(start.x, start.y, radius / 2, 0, Math.PI * 2);
+    context.stroke();
+  }
+  context.restore();
 }
 
 function simplifyPoints(points: readonly InkPoint[], tolerance: number): readonly InkPoint[] {

@@ -2,9 +2,14 @@ import { useLayoutEffect, useRef } from 'preact/hooks';
 
 import type { StylePreset } from '../../domain/style-preset';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
+import {
+  observeAnchoredElement,
+  observeViewportBottomActionBar,
+} from '../runtime/anchored-layer-position';
 import { registerDismissibleLayer } from '../runtime/dismissible-layer';
 import type {
   QuickToolbarAction,
+  QuickToolbarLayout,
   QuickToolbarShowInput,
   QuickToolbarUnavailableInput,
 } from '../quick-highlight-toolbar';
@@ -16,6 +21,7 @@ export type QuickHighlightToolbarModel =
 
 export interface QuickHighlightToolbarAppProps {
   readonly document: Document;
+  readonly layout: QuickToolbarLayout;
   readonly model: QuickHighlightToolbarModel;
   readonly onAction: (action: QuickToolbarAction) => Promise<void>;
   readonly onDismiss: () => void;
@@ -25,6 +31,7 @@ export interface QuickHighlightToolbarAppProps {
 
 export function QuickHighlightToolbarApp({
   document,
+  layout,
   model,
   onAction,
   onDismiss,
@@ -38,6 +45,9 @@ export function QuickHighlightToolbarApp({
   useLayoutEffect(() => {
     const element = toolbar.current;
     if (element === null) return;
+    if (layout === 'mobile-action-bar') {
+      return registerMobileSelectionLayer(document, element, onDismiss);
+    }
     return registerDismissibleLayer(document, {
       dismissOnScroll: true,
       element,
@@ -45,32 +55,45 @@ export function QuickHighlightToolbarApp({
         onDismiss();
       },
     });
-  }, [document, onDismiss]);
+  }, [document, layout, onDismiss]);
 
   useLayoutEffect(() => {
     const element = toolbar.current;
     if (element === null) return;
+    if (layout === 'mobile-action-bar') {
+      return observeViewportBottomActionBar({ document, element });
+    }
+    return observeAnchoredElement({
+      anchorRect: model.anchorRect,
+      document,
+      element,
+      preferredPlacement: 'above',
+    });
+  }, [document, layout, model.anchorRect]);
+
+  useLayoutEffect(() => {
+    const element = toolbar.current;
+    if (element === null) return;
+    if (layout === 'mobile-action-bar') return;
     if (model.kind === 'actions') {
       element.querySelector<HTMLButtonElement>('button')?.focus({ preventScroll: true });
     } else {
       element.focus({ preventScroll: true });
     }
-  }, [model.kind]);
+  }, [layout, model.kind]);
 
-  const style = {
-    '--inkstone-toolbar-x': `${Math.round(model.anchorRect.left + model.anchorRect.width / 2)}px`,
-    '--inkstone-toolbar-y': `${Math.round(model.anchorRect.top)}px`,
-  };
+  const toolbarClassName = `inkstone-quick-toolbar${
+    layout === 'mobile-action-bar' ? ' inkstone-quick-toolbar--mobile-action-bar' : ''
+  }`;
 
   if (model.kind === 'unavailable') {
     return (
       <div
         aria-label="Annotation actions"
-        className="inkstone-quick-toolbar inkstone-quick-toolbar--unavailable"
+        className={`${toolbarClassName} inkstone-quick-toolbar--unavailable`}
         data-inkstone-quick-toolbar=""
         ref={toolbar}
         role="status"
-        style={style}
         tabIndex={-1}
       >
         <span className="inkstone-quick-toolbar__reason">{model.message}</span>
@@ -100,12 +123,11 @@ export function QuickHighlightToolbarApp({
   return (
     <div
       aria-label="Annotation actions"
-      className="inkstone-quick-toolbar"
+      className={toolbarClassName}
       data-inkstone-quick-toolbar=""
       onKeyDown={(event) => handleRovingFocus(event, document)}
       ref={toolbar}
       role="toolbar"
-      style={style}
     >
       {model.presets.map((preset, index) => {
         const actionKey = `highlight:${preset.id}`;
@@ -236,4 +258,71 @@ function handleRovingFocus(event: KeyboardEvent, document: Document): void {
     button.tabIndex = index === nextIndex ? 0 : -1;
   });
   buttons[nextIndex]?.focus({ preventScroll: true });
+}
+
+function registerMobileSelectionLayer(
+  document: Document,
+  element: HTMLElement,
+  onDismiss: () => void,
+): () => void {
+  const movementThreshold = 8;
+  let outsideGesture:
+    | {
+        readonly pointerId: number;
+        readonly startX: number;
+        readonly startY: number;
+        moved: boolean;
+      }
+    | undefined;
+  const NodeConstructor = document.defaultView?.Node;
+  const isInside = (target: EventTarget | null): boolean =>
+    NodeConstructor !== undefined && target instanceof NodeConstructor && element.contains(target);
+  const handlePointerDown = (event: PointerEvent): void => {
+    outsideGesture = isInside(event.target)
+      ? undefined
+      : {
+          moved: false,
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+        };
+  };
+  const handlePointerMove = (event: PointerEvent): void => {
+    const gesture = outsideGesture;
+    if (gesture === undefined || gesture.pointerId !== event.pointerId) return;
+    if (
+      Math.hypot(event.clientX - gesture.startX, event.clientY - gesture.startY) > movementThreshold
+    ) {
+      gesture.moved = true;
+    }
+  };
+  const handlePointerUp = (event: PointerEvent): void => {
+    const gesture = outsideGesture;
+    if (gesture === undefined || gesture.pointerId !== event.pointerId) return;
+    outsideGesture = undefined;
+    if (!gesture.moved && !isInside(event.target)) onDismiss();
+  };
+  const handlePointerCancel = (): void => {
+    outsideGesture = undefined;
+  };
+  const handleKeyDown = (event: KeyboardEvent): void => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    onDismiss();
+  };
+  const handleScroll = (): void => onDismiss();
+  document.addEventListener('pointerdown', handlePointerDown, true);
+  document.addEventListener('pointermove', handlePointerMove, true);
+  document.addEventListener('pointerup', handlePointerUp, true);
+  document.addEventListener('pointercancel', handlePointerCancel, true);
+  document.addEventListener('keydown', handleKeyDown, true);
+  document.addEventListener('scroll', handleScroll, true);
+  return () => {
+    document.removeEventListener('pointerdown', handlePointerDown, true);
+    document.removeEventListener('pointermove', handlePointerMove, true);
+    document.removeEventListener('pointerup', handlePointerUp, true);
+    document.removeEventListener('pointercancel', handlePointerCancel, true);
+    document.removeEventListener('keydown', handleKeyDown, true);
+    document.removeEventListener('scroll', handleScroll, true);
+  };
 }

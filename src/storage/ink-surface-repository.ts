@@ -3,6 +3,10 @@ import {
   encodeInkSurfaceRecord,
   type InkSurfaceRecord,
 } from '../domain/ink-surface';
+import {
+  planConcurrentInkAppendMerge,
+  type InkConcurrentAppendConflictReason,
+} from '../domain/ink-concurrent-append-merge';
 import { hashText } from '../domain/text-anchor';
 import {
   decodeInkSurfaceSummaryIndex,
@@ -54,6 +58,18 @@ export class InkSurfaceConflictError extends Error {
   }
 }
 
+export class InkSurfaceStaleBaseError extends Error {
+  constructor(
+    readonly surfaceId: string,
+    readonly reason: InkConcurrentAppendConflictReason,
+  ) {
+    super(
+      `Ink surface changed since the expected base was read and cannot be merged safely (${reason}); local Ink is retained.`,
+    );
+    this.name = 'InkSurfaceStaleBaseError';
+  }
+}
+
 /** Canonical per-surface persistence with the same conservative iCloud rules as text records. */
 export class InkSurfaceRepository {
   private readonly onSurfaceChanged: (record: InkSurfaceRecord) => void;
@@ -62,10 +78,26 @@ export class InkSurfaceRepository {
   constructor(
     private readonly store: TextFileStore,
     events: {
+      readonly onEventIssue?: (error: unknown) => void;
       readonly onSurfaceChanged?: (record: InkSurfaceRecord) => void;
     } = {},
   ) {
-    this.onSurfaceChanged = events.onSurfaceChanged ?? (() => undefined);
+    const onEventIssue = events.onEventIssue ?? (() => undefined);
+    const reportEventIssue = (error: unknown): void => {
+      try {
+        onEventIssue(error);
+      } catch {
+        // Canonical writes must not be reclassified by disposable projection diagnostics.
+      }
+    };
+    const onSurfaceChanged = events.onSurfaceChanged ?? (() => undefined);
+    this.onSurfaceChanged = (record) => {
+      try {
+        onSurfaceChanged(record);
+      } catch (error) {
+        reportEventIssue(error);
+      }
+    };
     this.writes = sharedVaultWrites(store.coordinationScope ?? store);
   }
 
@@ -99,9 +131,12 @@ export class InkSurfaceRepository {
     });
   }
 
-  async updateSurface(record: InkSurfaceRecord, expectedBase?: InkSurfaceRecord): Promise<void> {
+  async updateSurface(
+    record: InkSurfaceRecord,
+    expectedBase?: InkSurfaceRecord,
+  ): Promise<InkSurfaceRecord | void> {
     const key = surfaceWriteKey(record.filePath, record.id);
-    await this.withNoteBatchLock(record.filePath, () =>
+    return this.withNoteBatchLock(record.filePath, () =>
       this.enqueueWrite(key, async () => {
         await this.assertNoteIdentity(record);
         const candidates = await this.readCandidates(record.filePath, record.id);
@@ -114,11 +149,27 @@ export class InkSurfaceRepository {
           this.onSurfaceChanged(record);
           return;
         }
+        let nextRecord = record;
+        let rebased = false;
         if (expectedBase !== undefined && !sameSurfaceRecord(existing, expectedBase)) {
-          throw new Error('Ink surface changed since the expected base was read.');
+          const plan = planConcurrentInkAppendMerge({
+            base: expectedBase,
+            local: record,
+            remote: existing,
+          });
+          if (plan.kind === 'conflict') {
+            throw new InkSurfaceStaleBaseError(record.id, plan.reason);
+          }
+          if (plan.kind === 'already-merged') {
+            await this.refreshSummaryIndex(plan.record);
+            this.onSurfaceChanged(plan.record);
+            return plan.record;
+          }
+          nextRecord = plan.record;
+          rebased = true;
         }
-        const base = expectedBase ?? existing;
-        if (existing.noteId !== record.noteId || record.revision !== base.revision + 1) {
+        const base = rebased ? existing : (expectedBase ?? existing);
+        if (existing.noteId !== nextRecord.noteId || nextRecord.revision !== base.revision + 1) {
           throw new Error(
             'Ink surface update must preserve note identity and advance exactly one revision.',
           );
@@ -127,7 +178,7 @@ export class InkSurfaceRepository {
         const path = await this.surfacePath(record.filePath, record.id);
         const previousContents = await this.store.read(path);
         try {
-          await this.store.write(path, encodeInkSurfaceRecord(record));
+          await this.store.write(path, encodeInkSurfaceRecord(nextRecord));
         } catch (error) {
           try {
             if (previousContents === null) {
@@ -149,8 +200,9 @@ export class InkSurfaceRepository {
           }
           throw error;
         }
-        await this.refreshSummaryIndex(record);
-        this.onSurfaceChanged(record);
+        await this.refreshSummaryIndex(nextRecord);
+        this.onSurfaceChanged(nextRecord);
+        return rebased ? nextRecord : undefined;
       }),
     );
   }
@@ -159,7 +211,7 @@ export class InkSurfaceRepository {
   async updateSurfacesAtomically(
     records: readonly InkSurfaceRecord[],
     expectedBases?: readonly InkSurfaceRecord[],
-  ): Promise<void> {
+  ): Promise<readonly InkSurfaceRecord[] | void> {
     if (records.length === 0) return;
     if (new Set(records.map((record) => record.id)).size !== records.length) {
       throw new Error('Atomic Ink update contains duplicate surface IDs.');
@@ -169,12 +221,14 @@ export class InkSurfaceRepository {
     if (records.some((record) => normalizeVaultPath(record.filePath) !== filePath)) {
       throw new Error('Atomic Ink update must stay within one note.');
     }
-    await this.withNoteBatchLock(filePath, async () => {
+    return this.withNoteBatchLock(filePath, async () => {
       const prepared: Array<{
         readonly path: string;
         readonly previousContents: string;
         readonly record: InkSurfaceRecord;
       }> = [];
+      const committedRecords: InkSurfaceRecord[] = [];
+      let rebased = false;
       for (const record of records) {
         await this.assertNoteIdentity(record);
         const candidates = await this.readCandidates(record.filePath, record.id);
@@ -183,14 +237,32 @@ export class InkSurfaceRepository {
         }
         const existing = selectLatestCandidate(candidates, record.id).record;
         if (sameSurfaceRecord(existing, record)) {
+          committedRecords.push(existing);
           continue;
         }
         const expectedBase = expectedById?.get(record.id);
+        let nextRecord = record;
+        let recordRebased = false;
         if (expectedBase !== undefined && !sameSurfaceRecord(existing, expectedBase)) {
-          throw new Error(`Ink surface ${record.id} changed since the expected base was read.`);
+          const plan = planConcurrentInkAppendMerge({
+            base: expectedBase,
+            local: record,
+            remote: existing,
+          });
+          if (plan.kind === 'conflict') {
+            throw new InkSurfaceStaleBaseError(record.id, plan.reason);
+          }
+          if (plan.kind === 'already-merged') {
+            committedRecords.push(plan.record);
+            rebased = true;
+            continue;
+          }
+          nextRecord = plan.record;
+          recordRebased = true;
+          rebased = true;
         }
-        const base = expectedBase ?? existing;
-        if (existing.noteId !== record.noteId || record.revision !== base.revision + 1) {
+        const base = recordRebased ? existing : (expectedBase ?? existing);
+        if (existing.noteId !== nextRecord.noteId || nextRecord.revision !== base.revision + 1) {
           throw new Error(
             'Ink surface update must preserve note identity and advance exactly one revision.',
           );
@@ -200,13 +272,14 @@ export class InkSurfaceRepository {
         if (previousContents === null) {
           throw new Error(`Canonical Ink surface ${record.id} disappeared during batch update.`);
         }
-        prepared.push({ path, previousContents, record });
+        prepared.push({ path, previousContents, record: nextRecord });
+        committedRecords.push(nextRecord);
       }
 
       if (prepared.length === 0) {
-        for (const record of records) await this.refreshSummaryIndex(record);
-        for (const record of records) this.onSurfaceChanged(record);
-        return;
+        for (const record of committedRecords) await this.refreshSummaryIndex(record);
+        for (const record of committedRecords) this.onSurfaceChanged(record);
+        return rebased ? committedRecords : undefined;
       }
       if (prepared.length !== records.length) {
         throw new Error('Atomic Ink update cannot mix idempotent and advancing surfaces.');
@@ -250,6 +323,7 @@ export class InkSurfaceRepository {
       await this.clearBatchJournal(journalPath).catch(() => undefined);
       for (const { record } of prepared) await this.refreshSummaryIndex(record);
       for (const { record } of prepared) this.onSurfaceChanged(record);
+      return rebased ? committedRecords : undefined;
     });
   }
 
@@ -341,12 +415,13 @@ export class InkSurfaceRepository {
     return sortSummaries(summaries);
   }
 
-  /** Rebuilds disposable Ink summaries after Obsidian reports an external surface artifact event. */
+  /** Rebuilds disposable Ink summaries after an external canonical or summary artifact event. */
   async rebuildSummariesForSidecarPath(sidecarPath: string): Promise<string | null> {
     const normalizedPath = sidecarPath.replaceAll('\\', '/');
-    const match = /^\.obsidian-annotations\/v1\/notes\/([^/]+)\/surfaces\/[^/]+\.json$/u.exec(
-      normalizedPath,
-    );
+    const match =
+      /^\.obsidian-annotations\/v1\/notes\/([^/]+)\/(?:surfaces\/[^/]+\.json|ink-summaries\.json)$/u.exec(
+        normalizedPath,
+      );
     const pathHash = match?.[1];
     if (pathHash === undefined) return null;
     const metaContents = await this.store.read(`${SIDECAR_ROOT}/${pathHash}/meta.json`);
@@ -379,9 +454,13 @@ export class InkSurfaceRepository {
     surfaceId: string,
     now: string,
     deviceId?: string,
+    expectedRevision?: number,
   ): Promise<InkSurfaceRecord> {
     const current = await this.readSurface(filePath, surfaceId);
     if (current === null) throw new Error(`Ink surface ${surfaceId} does not exist.`);
+    if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+      throw new Error(`Ink surface ${surfaceId} changed since it was selected.`);
+    }
     if (current.deletedAt !== undefined) return current;
     const deleted: InkSurfaceRecord = {
       ...current,
@@ -425,9 +504,13 @@ export class InkSurfaceRepository {
     surfaceId: string,
     now: string,
     deviceId?: string,
+    expectedRevision?: number,
   ): Promise<InkSurfaceRecord> {
     const current = await this.readSurface(filePath, surfaceId);
     if (current === null) throw new Error(`Ink surface ${surfaceId} does not exist.`);
+    if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+      throw new Error(`Ink surface ${surfaceId} changed since it was deleted.`);
+    }
     if (current.deletedAt === undefined) return current;
     const { deletedAt: _deletedAt, ...active } = current;
     void _deletedAt;
@@ -447,6 +530,41 @@ export class InkSurfaceRepository {
     readonly records: readonly InkSurfaceRecord[];
   }> {
     return this.withNoteBatchLock(filePath, () => this.listSurfacesNow(filePath));
+  }
+
+  async reconcileNotePath(filePath: string, now: string): Promise<readonly InkSurfaceRecord[]> {
+    const normalizedPath = normalizeVaultPath(filePath);
+    return this.withNoteBatchLock(normalizedPath, async () => {
+      const root = await this.surfaceRoot(normalizedPath);
+      const updated: InkSurfaceRecord[] = [];
+      for (const filename of (await this.store.list(root)).filter((name) =>
+        name.endsWith('.json'),
+      )) {
+        const path = `${root}/${filename}`;
+        const contents = await this.store.read(path);
+        if (contents === null) continue;
+        let record: InkSurfaceRecord;
+        try {
+          record = decodeInkSurfaceRecord(contents);
+        } catch {
+          // Preserve damaged/conflict artifacts byte-for-byte for explicit repair.
+          continue;
+        }
+        if (normalizeVaultPath(record.filePath) === normalizedPath) continue;
+        const reconciled: InkSurfaceRecord = {
+          ...record,
+          filePath: normalizedPath,
+          revision: record.revision + 1,
+          updatedAt: now,
+        };
+        await this.store.write(path, encodeInkSurfaceRecord(reconciled));
+        updated.push(reconciled);
+      }
+      const loaded = await this.listSurfacesNow(normalizedPath);
+      await this.writeSummaryIndex(normalizedPath, summarizeLoadedSurfaces(loaded));
+      for (const record of updated) this.onSurfaceChanged(record);
+      return updated;
+    });
   }
 
   private async listSurfacesNow(filePath: string): Promise<{

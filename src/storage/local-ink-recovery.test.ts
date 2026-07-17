@@ -259,6 +259,114 @@ describe('local Ink recovery checkpoint', () => {
     ).toMatchObject({ kind: 'conflict' });
   });
 
+  it('restores a version-3 checkpoint whose base was polluted only by transient canvas extent', () => {
+    const canonical = surface('a', 1, ['saved']);
+    const pollutedBase = {
+      ...canonical,
+      layout: { ...canonical.layout, logicalHeight: canonical.layout.logicalHeight + 600 },
+    };
+    const pending = {
+      ...pollutedBase,
+      revision: 2,
+      strokes: [...pollutedBase.strokes, stroke('local-pending')],
+      updatedAt: '2026-07-16T00:30:00.000Z',
+    };
+    const checkpoint = {
+      capturedAt: '2026-07-16T00:31:00.000Z',
+      expectedBases: [pollutedBase],
+      filePath: 'Ink.md',
+      generation: 'generation-transient-extent',
+      pendingAttempts: [pending],
+      records: [pending],
+      version: 3 as const,
+    };
+
+    expect(planLocalInkRecovery([canonical], checkpoint, '2026-07-16T01:00:00.000Z')).toMatchObject(
+      {
+        expectedBases: [canonical],
+        kind: 'restore',
+        records: [
+          {
+            layout: { logicalHeight: pollutedBase.layout.logicalHeight },
+            revision: 2,
+            strokes: [{ id: 'saved' }, { id: 'local-pending' }],
+          },
+        ],
+        writes: [{ id: 'a', revision: 2 }],
+      },
+    );
+  });
+
+  it('does not forgive any canonical difference alongside a transient extent mismatch', () => {
+    const canonical = surface('a', 1, ['saved']);
+    const divergentBase = {
+      ...canonical,
+      layout: {
+        ...canonical.layout,
+        fontFamily: 'concurrent-font',
+        logicalHeight: canonical.layout.logicalHeight + 600,
+      },
+    };
+    const pending = {
+      ...divergentBase,
+      revision: 2,
+      strokes: [...divergentBase.strokes, stroke('local-pending')],
+    };
+
+    expect(
+      planLocalInkRecovery(
+        [canonical],
+        {
+          capturedAt: '2026-07-16T00:31:00.000Z',
+          expectedBases: [divergentBase],
+          filePath: 'Ink.md',
+          generation: 'generation-real-divergence',
+          pendingAttempts: [pending],
+          records: [pending],
+          version: 3,
+        },
+        '2026-07-16T01:00:00.000Z',
+      ),
+    ).toMatchObject({ kind: 'conflict' });
+  });
+
+  it('restores independent local and remote stroke appends from one exact checkpoint base', () => {
+    const base = surface('a', 1, []);
+    const localPending = surface('a', 2, ['local-pending']);
+    const remoteCanonical = surface('a', 2, ['remote-canonical']);
+
+    expect(
+      planLocalInkRecovery(
+        [remoteCanonical],
+        {
+          capturedAt: '2026-07-17T02:30:00.000Z',
+          expectedBases: [base],
+          filePath: 'Ink.md',
+          generation: 'generation-concurrent-appends',
+          pendingAttempts: [localPending],
+          records: [localPending],
+          version: 3,
+        },
+        '2026-07-17T02:31:00.000Z',
+      ),
+    ).toMatchObject({
+      expectedBases: [remoteCanonical],
+      kind: 'restore',
+      records: [
+        {
+          revision: 3,
+          strokes: [{ id: 'remote-canonical' }, { id: 'local-pending' }],
+        },
+      ],
+      writes: [
+        {
+          revision: 3,
+          strokes: [{ id: 'remote-canonical' }, { id: 'local-pending' }],
+        },
+      ],
+    });
+  });
+
   it('keeps version-3 expected bases aligned with only the records that require writes', () => {
     const baseA = surface('a', 1, []);
     const pendingA = surface('a', 2, ['already-landed']);
@@ -399,5 +507,18 @@ function surface(id: string, revision: number, strokeIds: readonly string[]): In
       width: 4,
     })),
     updatedAt: '2026-07-16T00:00:00.000Z',
+  };
+}
+
+function stroke(id: string): InkSurfaceRecord['strokes'][number] {
+  return {
+    color: '#111111',
+    id,
+    points: [
+      { pressure: 0.5, time: 0, x: 1, y: 1 },
+      { pressure: 0.5, time: 1, x: 2, y: 2 },
+    ],
+    tool: 'pen',
+    width: 2,
   };
 }

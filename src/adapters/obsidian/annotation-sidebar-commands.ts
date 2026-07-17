@@ -2,20 +2,46 @@ import type { AnnotationIndexEntry } from '../../domain/vault-annotation-index';
 import type { InkSurfaceSummary } from '../../domain/ink-surface-summary';
 import type { InkSurfaceConflict } from '../../storage/ink-surface-repository';
 
-export interface AnnotationSidebarBulkInkSelection {
+export interface AnnotationSidebarBulkSelection {
   readonly expectedRevision: number;
   readonly filePath: string;
   readonly id: string;
+  readonly noteId?: string;
   readonly type: AnnotationIndexEntry['type'];
 }
 
+export interface AnnotationSidebarDeletedItem {
+  readonly deletedRevision: number;
+  readonly filePath: string;
+  readonly id: string;
+  readonly noteId?: string;
+  readonly type: AnnotationIndexEntry['type'];
+}
+
+export interface AnnotationSidebarBulkDeleteOutcome {
+  readonly failed: readonly AnnotationSidebarBulkSelection[];
+  readonly succeeded: readonly AnnotationSidebarDeletedItem[];
+}
+
+export interface AnnotationSidebarBulkRestoreOutcome {
+  readonly failed: readonly AnnotationSidebarDeletedItem[];
+}
+
 export interface AnnotationSidebarCommands {
-  readonly bulkDeleteInk: (
-    selection: readonly AnnotationSidebarBulkInkSelection[],
-  ) => Promise<{ readonly failed: readonly AnnotationSidebarBulkInkSelection[] }>;
+  readonly bulkDelete: (
+    selection: readonly AnnotationSidebarBulkSelection[],
+  ) => Promise<AnnotationSidebarBulkDeleteOutcome>;
   readonly closed?: () => void;
-  readonly deleteAnnotation: (filePath: string, annotationId: string) => Promise<void>;
-  readonly deleteInk: (filePath: string, surfaceId: string) => Promise<void>;
+  readonly deleteAnnotation: (
+    filePath: string,
+    annotationId: string,
+    expectedRevision: number,
+  ) => Promise<void>;
+  readonly deleteInk: (
+    filePath: string,
+    surfaceId: string,
+    expectedRevision: number,
+  ) => Promise<void>;
   readonly editInk: (filePath: string, surfaceId: string) => void;
   readonly exportCurrentFile: (filePath: string, invoker: HTMLElement) => void;
   readonly exportInkPng: (filePath: string, surfaceId: string) => Promise<void>;
@@ -46,5 +72,12 @@ export interface AnnotationSidebarCommands {
     annotationId: string,
     expectedRevision: number,
   ) => Promise<void>;
-  readonly restoreInk: (filePath: string, surfaceId: string) => Promise<void>;
+  readonly restoreDeleted: (
+    selection: readonly AnnotationSidebarDeletedItem[],
+  ) => Promise<AnnotationSidebarBulkRestoreOutcome>;
+  readonly restoreInk: (
+    filePath: string,
+    surfaceId: string,
+    expectedRevision: number,
+  ) => Promise<void>;
 }

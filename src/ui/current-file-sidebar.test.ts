@@ -221,7 +221,7 @@ describe('current-file sidebar', () => {
     const sidebar = new CurrentFileSidebar({
       container,
       document,
-      onDeleteAnnotation: (id: string) => deleted.push(id),
+      onDeleteAnnotation: (id: string, revision: number) => deleted.push(`${id}:${revision}`),
       onRestoreAnnotation: (id: string, revision: number) => restored.push(`${id}:${revision}`),
       onSelect: () => undefined,
     });
@@ -233,7 +233,7 @@ describe('current-file sidebar', () => {
     document.body
       .querySelector<HTMLButtonElement>('[data-obsidian-test-menu] button[aria-label="Delete"]')
       ?.click();
-    expect(deleted).toEqual(['active-1']);
+    expect(deleted).toEqual(['active-1:1']);
 
     sidebar.render({
       groups: [
@@ -504,6 +504,74 @@ describe('current-file sidebar', () => {
     });
   });
 
+  it('leaves selection mode after a successful bulk delete and explains short Restore', async () => {
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onBulkDelete: () => Promise.resolve({ failed: [] }),
+      onSelect: () => undefined,
+    });
+    sidebar.render(fixture());
+
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
+    await vi.waitFor(() =>
+      expect(container.querySelector('button[aria-label="Done selecting"]')).not.toBeNull(),
+    );
+    container.querySelector<HTMLButtonElement>('[data-annotation-id="active-1"]')?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('button[aria-label="Delete selected"]')).not.toBeNull(),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.click();
+
+    await vi.waitFor(() =>
+      expect(container.querySelector('.inkstone-bulk-dialog__description')?.textContent).toBe(
+        'Deleted annotations can be restored for a short time.',
+      ),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('button[aria-label="Done selecting"]')).toBeNull();
+      expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+      expect(container.querySelector('button[aria-label="More actions"]')).not.toBeNull();
+    });
+  });
+
+  it('retains failed Current file selections after a partial bulk delete', async () => {
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onBulkDelete: (selection) => Promise.resolve({ failed: selection }),
+      onSelect: () => undefined,
+    });
+    sidebar.render(fixture());
+
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
+    await vi.waitFor(() =>
+      expect(container.querySelector('button[aria-label="Done selecting"]')).not.toBeNull(),
+    );
+    container.querySelector<HTMLButtonElement>('[data-annotation-id="active-1"]')?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('button[aria-label="Delete selected"]')).not.toBeNull(),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('button[aria-label="Confirm bulk delete"]')).not.toBeNull(),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('button[aria-label="Done selecting"]')).not.toBeNull();
+      expect(
+        container.querySelector<HTMLInputElement>('input[aria-label="Select annotation active-1"]')
+          ?.checked,
+      ).toBe(true);
+      expect(container.textContent).toContain('1 selected');
+    });
+  });
+
   it('restores keyboard focus to the active scope after an asynchronous scope switch', async () => {
     const container = document.createElement('div');
     document.body.append(container);
@@ -563,11 +631,11 @@ describe('current-file sidebar', () => {
     const sidebar = new CurrentFileSidebar({
       container,
       document,
-      onDeleteInk: (id) => actions.push(`delete:${id}`),
+      onDeleteInk: (id, expectedRevision) => actions.push(`delete:${id}@${expectedRevision}`),
       onEditInk: (id) => actions.push(`edit:${id}`),
       onExportInkPng: (id) => actions.push(`png:${id}`),
       onExportInkSvg: (id) => actions.push(`svg:${id}`),
-      onRestoreInk: (id) => actions.push(`restore:${id}`),
+      onRestoreInk: (id, expectedRevision) => actions.push(`restore:${id}@${expectedRevision}`),
       onSelect: () => undefined,
       onSelectInk: (summary) => actions.push(`select:${summary.id}`),
     });
@@ -621,8 +689,8 @@ describe('current-file sidebar', () => {
       'edit:surface-1',
       'svg:surface-1',
       'png:surface-1',
-      'delete:surface-1',
-      'restore:surface-2',
+      'delete:surface-1@2',
+      'restore:surface-2@2',
     ]);
   });
 

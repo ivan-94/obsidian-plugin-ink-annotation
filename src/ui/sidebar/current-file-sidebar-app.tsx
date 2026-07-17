@@ -39,8 +39,8 @@ export interface CurrentFileSidebarAppProps {
     selection: readonly CurrentBulkSelectionEntry[],
     invoker: HTMLElement,
   ) => Promise<void>;
-  readonly onDeleteAnnotation: (annotationId: string) => void;
-  readonly onDeleteInk: (surfaceId: string) => void;
+  readonly onDeleteAnnotation: (annotationId: string, expectedRevision: number) => void;
+  readonly onDeleteInk: (surfaceId: string, expectedRevision: number) => void;
   readonly onEditInk: (surfaceId: string) => void;
   readonly onEntireVault: () => void | Promise<void>;
   readonly onExportCurrentFile: (invoker: HTMLElement) => void;
@@ -52,7 +52,7 @@ export interface CurrentFileSidebarAppProps {
   readonly onRetry: () => void;
   readonly onReviewConflicts: (invoker: HTMLElement) => void;
   readonly onRestoreAnnotation: (annotationId: string, expectedRevision: number) => void;
-  readonly onRestoreInk: (surfaceId: string) => void;
+  readonly onRestoreInk: (surfaceId: string, expectedRevision: number) => void;
   readonly onSelect: (annotationId: string) => void;
   readonly onSelectInk: (summary: InkSurfaceSummary) => void;
   readonly showScope: boolean;
@@ -189,12 +189,16 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
                       <InkAnnotationListItem
                         model={model}
                         onDeleteRequest={() => {
-                          state.pendingInkDelete.value = { id: summary.id, title: model.title };
+                          state.pendingInkDelete.value = {
+                            expectedRevision: summary.revision,
+                            id: summary.id,
+                            title: model.title,
+                          };
                         }}
                         onEdit={() => props.onEditInk(summary.id)}
                         onExportPng={() => props.onExportInkPng(summary.id)}
                         onExportSvg={() => props.onExportInkSvg(summary.id)}
-                        onRestore={() => props.onRestoreInk(summary.id)}
+                        onRestore={() => props.onRestoreInk(summary.id, summary.revision)}
                         onSelect={() => props.onSelectInk(summary)}
                         {...(state.selectionMode.value
                           ? {
@@ -232,7 +236,7 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
                       <div hidden={!matches(textSearchText(row))} key={model.key}>
                         <TextAnnotationListItem
                           model={model}
-                          onDelete={() => props.onDeleteAnnotation(row.id)}
+                          onDelete={() => props.onDeleteAnnotation(row.id, row.revision)}
                           onInspect={(invoker) => props.onInspect(row.id, invoker)}
                           {...(props.onRepairAnnotation === undefined
                             ? {}
@@ -290,7 +294,7 @@ function InkDeleteDialog({ onDeleteInk, state }: CurrentFileSidebarAppProps) {
       onCancel={close}
       onConfirm={() => {
         close();
-        onDeleteInk(pending.id);
+        onDeleteInk(pending.id, pending.expectedRevision);
       }}
       pending={false}
       title={`Delete ${pending.title}?`}
@@ -364,6 +368,7 @@ function CurrentBulkDialog({
     void operation.then(
       (outcome) => {
         state.selectedKeys.value = new Set(outcome.failed.map((entry) => entry.key));
+        state.selectionMode.value = outcome.failed.length > 0;
         state.bulkPending.value = false;
         state.bulkDialog.value = null;
         if (outcome.failed.length > 0) {
@@ -394,7 +399,11 @@ function CurrentBulkDialog({
       }
       confirmLabel={dialog.kind === 'delete' ? 'Delete' : 'Apply'}
       danger={dialog.kind === 'delete'}
-      description={dialog.kind === 'delete' ? 'This action cannot be undone.' : undefined}
+      description={
+        dialog.kind === 'delete'
+          ? 'Deleted annotations can be restored for a short time.'
+          : undefined
+      }
       feedback={state.bulkFeedback.value}
       icon={dialog.kind === 'delete' ? 'trash-2' : dialog.kind === 'tags' ? 'tag' : 'scan-text'}
       onCancel={close}

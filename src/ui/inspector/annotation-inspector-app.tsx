@@ -5,12 +5,15 @@ import type { StylePreset } from '../../domain/style-preset';
 import { annotationTargetText, type TextAnnotationRecord } from '../../domain/text-annotation';
 import { IconButton } from '../primitives/icon-button';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
+import { observeAnchoredElement, viewportBounds } from '../runtime/anchored-layer-position';
 import { registerDismissibleLayer } from '../runtime/dismissible-layer';
 import type { InspectorDraft, InspectorState } from '../stores/annotation-inspector-store';
+import type { AnnotationInspectorInitialFocus } from '../annotation-inspector';
 
 export interface AnnotationInspectorAppProps {
   readonly anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>;
   readonly document: Document;
+  readonly initialFocus: AnnotationInspectorInitialFocus;
   readonly invoker?: HTMLElement;
   readonly onCancelReattach: () => void;
   readonly onChoose: (record: TextAnnotationRecord) => void;
@@ -48,16 +51,30 @@ export function AnnotationInspectorApp(props: AnnotationInspectorAppProps) {
   useLayoutEffect(() => {
     const element = inspector.current;
     if (element === null) return;
+    if (state.kind === 'deleted' || viewportBounds(props.document).width <= 600) return;
+    return observeAnchoredElement({
+      anchorRect: props.anchorRect,
+      document: props.document,
+      element,
+      preferredPlacement: 'below',
+    });
+  }, [focusKey, props.anchorRect, props.document, state.kind]);
+
+  useLayoutEffect(() => {
+    const element = inspector.current;
+    if (element === null) return;
     const selector =
       state.kind === 'choosing'
         ? 'button[data-inkstone-overlap-choice]'
         : state.kind === 'editing'
-          ? `button[data-inkstone-mark-type="${state.draft.markKind}"]`
+          ? props.initialFocus === 'note'
+            ? 'textarea[aria-label="Note"]'
+            : `button[data-inkstone-mark-type="${state.draft.markKind}"]`
           : state.kind === 'previewing-reattachment'
             ? 'button[aria-label="Confirm reattachment"]'
             : 'button[aria-label="Undo delete"]';
-    element.querySelector<HTMLButtonElement>(selector)?.focus({ preventScroll: true });
-  }, [focusKey]);
+    element.querySelector<HTMLElement>(selector)?.focus({ preventScroll: true });
+  }, [focusKey, props.initialFocus]);
 
   useLayoutEffect(() => {
     if (state.kind === 'editing' && state.save.kind === 'error') {
@@ -80,10 +97,6 @@ export function AnnotationInspectorApp(props: AnnotationInspectorAppProps) {
       data-inkstone-reattachment-preview={state.kind === 'previewing-reattachment' ? '' : undefined}
       ref={inspector}
       role="dialog"
-      style={{
-        '--inkstone-inspector-x': `${Math.round(props.anchorRect.left + props.anchorRect.width / 2)}px`,
-        '--inkstone-inspector-y': `${Math.round(props.anchorRect.bottom)}px`,
-      }}
     >
       {state.kind === 'choosing' ? (
         <OverlapChooser onChoose={props.onChoose} records={state.records} />

@@ -157,6 +157,134 @@ describe('Vault annotation derived index', () => {
     expect(index.query()).toMatchObject({ state: 'no-annotations', total: 0 });
   });
 
+  it('removes a projection at or below a canonical revision boundary', () => {
+    const index = new VaultAnnotationIndex();
+    const original = textRecordToIndexEntry(
+      record({ exact: 'Original', filePath: 'Note.md', id: 'same-id', position: 1 }),
+    );
+    index.rebuild([{ ...original, revision: 2 }]);
+
+    expect(
+      index.removeAtOrBelow({
+        id: original.id,
+        maximumRevision: 4,
+        noteId: original.noteId,
+      }),
+    ).toBe('removed');
+    expect(index.snapshot()).toEqual([]);
+  });
+
+  it('preserves a projection newer than a canonical revision boundary', () => {
+    const index = new VaultAnnotationIndex();
+    const original = textRecordToIndexEntry(
+      record({ exact: 'Original', filePath: 'Note.md', id: 'same-id', position: 1 }),
+    );
+    index.rebuild([{ ...original, revision: 5 }]);
+
+    expect(
+      index.removeAtOrBelow({
+        id: original.id,
+        maximumRevision: 4,
+        noteId: original.noteId,
+      }),
+    ).toBe('stale');
+    expect(index.snapshot()).toMatchObject([{ id: original.id, revision: 5 }]);
+  });
+
+  it('renames every indexed row for one note in a single published change', () => {
+    const index = new VaultAnnotationIndex();
+    const first = textRecordToIndexEntry(
+      record({ exact: 'First', filePath: 'Old.md', id: 'first', position: 1 }),
+    );
+    const second = textRecordToIndexEntry(
+      record({ exact: 'Second', filePath: 'Old.md', id: 'second', position: 2 }),
+    );
+    const unrelated = textRecordToIndexEntry(
+      record({ exact: 'Other', filePath: 'Other.md', id: 'other', position: 3 }),
+    );
+    index.rebuild([first, second, unrelated]);
+    const listener = vi.fn();
+    index.subscribe(listener);
+
+    expect(index.renameNote({ newPath: 'New.md', noteId: first.noteId, oldPath: 'Old.md' })).toBe(
+      2,
+    );
+
+    expect(index.snapshot().map((entry) => [entry.id, entry.filePath])).toEqual([
+      ['first', 'New.md'],
+      ['second', 'New.md'],
+      ['other', 'Other.md'],
+    ]);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes every indexed row for a missing source in a single published change', () => {
+    const index = new VaultAnnotationIndex();
+    const first = textRecordToIndexEntry(
+      record({ exact: 'First', filePath: 'Deleted.md', id: 'first', position: 1 }),
+    );
+    const second = textRecordToIndexEntry(
+      record({ exact: 'Second', filePath: 'Deleted.md', id: 'second', position: 2 }),
+    );
+    const unrelated = textRecordToIndexEntry(
+      record({ exact: 'Other', filePath: 'Other.md', id: 'other', position: 3 }),
+    );
+    index.rebuild([first, second, unrelated]);
+    const listener = vi.fn();
+    index.subscribe(listener);
+
+    expect(index.removeNote(first.noteId)).toBe(2);
+
+    expect(index.snapshot()).toMatchObject([{ id: 'other', filePath: 'Other.md' }]);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed by removing every row at a deleted source path before metadata repair', () => {
+    const index = new VaultAnnotationIndex();
+    const first = textRecordToIndexEntry(
+      record({ exact: 'First', filePath: 'Deleted.md', id: 'first', position: 1 }),
+    );
+    const second = textRecordToIndexEntry({
+      ...record({ exact: 'Second', filePath: 'Deleted.md', id: 'second', position: 2 }),
+      noteId: 'second-note-id',
+    });
+    const unrelated = textRecordToIndexEntry(
+      record({ exact: 'Other', filePath: 'Other.md', id: 'other', position: 3 }),
+    );
+    index.rebuild([first, second, unrelated]);
+    const listener = vi.fn();
+    index.subscribe(listener);
+
+    expect(index.removeFile('Deleted.md')).toBe(2);
+    expect(index.snapshot()).toMatchObject([{ id: 'other', filePath: 'Other.md' }]);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('publishes one coherent index change for an asynchronous note lifecycle batch', async () => {
+    const index = new VaultAnnotationIndex();
+    const first = textRecordToIndexEntry(
+      record({ exact: 'First', filePath: 'Old.md', id: 'first', position: 1 }),
+    );
+    const second = textRecordToIndexEntry(
+      record({ exact: 'Second', filePath: 'Old.md', id: 'second', position: 2 }),
+    );
+    index.rebuild([first, second]);
+    const listener = vi.fn();
+    index.subscribe(listener);
+
+    await index.batch(async () => {
+      index.upsert({ ...first, filePath: 'New.md', revision: 2 });
+      await Promise.resolve();
+      index.upsert({ ...second, filePath: 'New.md', revision: 2 });
+    });
+
+    expect(index.snapshot()).toMatchObject([
+      { filePath: 'New.md', id: 'first', revision: 2 },
+      { filePath: 'New.md', id: 'second', revision: 2 },
+    ]);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
   it('indexes searchable Ink metadata without thumbnail SVG or vector points', () => {
     const index = new VaultAnnotationIndex();
     index.rebuild([

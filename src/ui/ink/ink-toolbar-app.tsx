@@ -6,6 +6,7 @@ import type { InkToolbarState } from '../stores/ink-toolbar-store';
 
 export interface InkToolbarAppProps {
   readonly onColor: (color: string) => void;
+  readonly onDeleteSelection: () => void;
   readonly onDone: () => void;
   readonly onDragKeyDown: (event: KeyboardEvent) => void;
   readonly onDragStart: (event: PointerEvent) => void;
@@ -65,7 +66,13 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
           data={{ inkstoneInkTool: tool }}
           icon={tool === 'pen' ? 'pen-line' : tool === 'highlighter' ? 'highlighter' : 'eraser'}
           key={tool}
-          label={tool === 'pen' ? 'Pen' : tool === 'highlighter' ? 'Highlighter' : 'Stroke eraser'}
+          label={
+            tool === 'pen'
+              ? 'Pen'
+              : tool === 'highlighter'
+                ? 'Highlighter'
+                : 'Stroke eraser: tap a stroke or circle strokes'
+          }
           onClick={(event) => {
             const toolbar = (event.currentTarget as HTMLElement).closest('[role="toolbar"]');
             for (const button of toolbar?.querySelectorAll<HTMLElement>(
@@ -93,6 +100,13 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         onClick={props.onToggleMultiple}
         pressed={state.multiple}
       />
+      <ToolbarButton
+        data={{ inkstoneInkDeleteSelection: 'true' }}
+        hidden={state.interaction !== 'select' || state.selectedCount === 0}
+        icon="trash-2"
+        label={`Delete ${state.selectedCount} selected Ink stroke${state.selectedCount === 1 ? '' : 's'}`}
+        onClick={props.onDeleteSelection}
+      />
       <input
         aria-label="Ink color"
         data-inkstone-ink-color="true"
@@ -106,23 +120,29 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         className="inkstone-ink-controls__width"
         data-inkstone-ink-width-control="true"
         hidden={!state.optionsVisible}
-        role="group"
         title={`Ink width: ${state.width} px`}
       >
-        {[2, 4, 8].map((sample, index) => (
-          <button
-            aria-label={`Set Ink width to ${sample} px`}
-            aria-pressed={nearestSample(state.width) === sample}
-            className="inkstone-ink-controls__width-sample"
-            data-inkstone-ink-width-sample={sample}
-            key={sample}
-            onClick={() => props.onWidth(sample)}
-            title={`Set Ink width to ${sample} px`}
-            type="button"
-          >
-            <span aria-hidden="true" style={{ height: `${index + 2}px` }} />
-          </button>
-        ))}
+        <span
+          aria-hidden="true"
+          className="inkstone-ink-controls__width-preview"
+          style={{ height: `${Math.min(state.width, 8)}px` }}
+        />
+        <span aria-hidden="true" className="inkstone-ink-controls__width-value">
+          {state.width}px
+        </span>
+        <ObsidianIcon icon="chevron-down" />
+        <select
+          aria-label="Ink width"
+          data-inkstone-ink-width-select="true"
+          onChange={(event) => props.onWidth(Number(event.currentTarget.value))}
+          value={state.width}
+        >
+          {widthOptions(state.width).map((width) => (
+            <option key={width} value={width}>
+              {width} px
+            </option>
+          ))}
+        </select>
       </div>
       <ToolbarButton
         data={{ inkstoneInkZoomOut: 'true' }}
@@ -240,8 +260,6 @@ function ToolbarButton({
   );
 }
 
-function nearestSample(width: number): number {
-  return [2, 4, 8].reduce((closest, sample) =>
-    Math.abs(sample - width) < Math.abs(closest - width) ? sample : closest,
-  );
+function widthOptions(current: number): readonly number[] {
+  return [...new Set([1, 2, 4, 8, 12, 16, current])].sort((left, right) => left - right);
 }

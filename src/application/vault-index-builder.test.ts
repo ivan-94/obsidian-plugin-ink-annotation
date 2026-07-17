@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import type { TextAnnotationRecord } from '../domain/text-annotation';
 import type { InkSurfaceSummary } from '../domain/ink-surface-summary';
-import { VaultAnnotationIndex, type AnnotationIndexEntry } from '../domain/vault-annotation-index';
+import {
+  textRecordToIndexEntry,
+  VaultAnnotationIndex,
+  type AnnotationIndexEntry,
+} from '../domain/vault-annotation-index';
 import type { NoteMeta, RepositoryConflict } from '../storage/sidecar-repository';
 import { VaultIndexBuilder, type CanonicalVaultAnnotationSource } from './vault-index-builder';
 
@@ -18,7 +22,7 @@ describe('Vault index builder', () => {
       onProgress: (value) => progress.push(value.completed),
     });
 
-    expect(result).toEqual({ indexed: 6, issues: [] });
+    expect(result).toEqual({ indexed: 6, issues: [], status: 'committed' });
     expect(source.maximumConcurrentReads).toBe(2);
     expect(progress).toEqual([0, 1, 2, 3]);
     expect(index.snapshot().map((entry) => `${entry.filePath}:${entry.type}`)).toEqual([
@@ -66,6 +70,105 @@ describe('Vault index builder', () => {
     expect(index.snapshot().map((entry) => entry.filePath)).toEqual(['Existing.md']);
   });
 
+  it('retries instead of replacing a canonical change with an older build snapshot', async () => {
+    const original = record('Race.md');
+    let current = original;
+    let annotationReads = 0;
+    let signalFirstReadStarted!: () => void;
+    let releaseFirstRead!: () => void;
+    const firstReadStarted = new Promise<void>((resolve) => {
+      signalFirstReadStarted = resolve;
+    });
+    const firstReadGate = new Promise<void>((resolve) => {
+      releaseFirstRead = resolve;
+    });
+    const source: CanonicalVaultAnnotationSource = {
+      listAnnotations: async () => {
+        annotationReads += 1;
+        const snapshot = current;
+        if (annotationReads === 1) {
+          signalFirstReadStarted();
+          await firstReadGate;
+        }
+        return { conflicts: [], issues: [], records: [snapshot] };
+      },
+      listNotes: () =>
+        Promise.resolve({
+          issues: [],
+          notes: [note('Race.md')],
+        }),
+      listSurfaceSummaries: () => Promise.resolve([]),
+    };
+    const index = new VaultAnnotationIndex();
+    index.rebuild([textRecordToIndexEntry(original)]);
+    const builder = new VaultIndexBuilder({ index, source });
+
+    const rebuilding = builder.rebuild({ concurrency: 1 });
+    await firstReadStarted;
+    current = {
+      ...original,
+      revision: 2,
+      updatedAt: '2026-07-14T09:00:00.000Z',
+    };
+    expect(index.upsert(textRecordToIndexEntry(current))).toBe('applied');
+    releaseFirstRead();
+
+    await expect(rebuilding).resolves.toEqual({ indexed: 1, issues: [], status: 'committed' });
+    expect(annotationReads).toBe(2);
+    expect(index.snapshot()).toMatchObject([
+      { filePath: 'Race.md', id: 'annotation-Race.md', revision: 2 },
+    ]);
+  });
+
+  it('keeps the incrementally updated index when every bounded build attempt is superseded', async () => {
+    const original = record('Busy.md');
+    let current = original;
+    let annotationReads = 0;
+    const firstReadStarted = deferred();
+    const releaseFirstRead = deferred();
+    const secondReadStarted = deferred();
+    const releaseSecondRead = deferred();
+    const starts = [firstReadStarted, secondReadStarted];
+    const releases = [releaseFirstRead, releaseSecondRead];
+    const source: CanonicalVaultAnnotationSource = {
+      listAnnotations: async () => {
+        const readIndex = annotationReads;
+        annotationReads += 1;
+        const snapshot = current;
+        starts[readIndex]?.resolve();
+        await releases[readIndex]?.promise;
+        return { conflicts: [], issues: [], records: [snapshot] };
+      },
+      listNotes: () =>
+        Promise.resolve({
+          issues: [],
+          notes: [note('Busy.md')],
+        }),
+      listSurfaceSummaries: () => Promise.resolve([]),
+    };
+    const index = new VaultAnnotationIndex();
+    index.rebuild([textRecordToIndexEntry(original)]);
+    const cache = new MemoryIndexCache();
+    const builder = new VaultIndexBuilder({ cache, index, source });
+
+    const rebuilding = builder.rebuild({ concurrency: 1 });
+    await firstReadStarted.promise;
+    current = revision(original, 2);
+    expect(index.upsert(textRecordToIndexEntry(current))).toBe('applied');
+    releaseFirstRead.resolve();
+    await secondReadStarted.promise;
+    current = revision(original, 3);
+    expect(index.upsert(textRecordToIndexEntry(current))).toBe('applied');
+    releaseSecondRead.resolve();
+
+    await expect(rebuilding).resolves.toEqual({ indexed: 1, issues: [], status: 'superseded' });
+    expect(annotationReads).toBe(2);
+    expect(index.snapshot()).toMatchObject([
+      { filePath: 'Busy.md', id: 'annotation-Busy.md', revision: 3 },
+    ]);
+    expect(cache.saved).toBeNull();
+  });
+
   it('restores a disposable cache and refreshes it only after a complete rebuild', async () => {
     const source = new DelayedCanonicalSource(['Fresh.md']);
     const index = new VaultAnnotationIndex();
@@ -88,6 +191,33 @@ describe('Vault index builder', () => {
     await new VaultIndexBuilder({ index, source }).rebuild();
 
     expect(index.snapshot().map((entry) => entry.type)).toEqual(['highlight']);
+  });
+
+  it('excludes missing-source notes from the active Vault index', async () => {
+    const source = new DelayedCanonicalSource(
+      ['Live.md', 'Deleted.md'],
+      2,
+      new Set(['Deleted.md']),
+    );
+    const index = new VaultAnnotationIndex();
+
+    await new VaultIndexBuilder({ index, source }).rebuild();
+
+    expect(index.snapshot().map((entry) => entry.filePath)).toEqual(['Live.md', 'Live.md']);
+  });
+
+  it('fails closed when the Markdown source is gone before missing metadata persists', async () => {
+    const source = new DelayedCanonicalSource(
+      ['Live.md', 'Unpersisted Missing.md'],
+      2,
+      new Set(),
+      new Set(['Unpersisted Missing.md']),
+    );
+    const index = new VaultAnnotationIndex();
+
+    await new VaultIndexBuilder({ index, source }).rebuild();
+
+    expect(index.snapshot().map((entry) => entry.filePath)).toEqual(['Live.md', 'Live.md']);
   });
 });
 
@@ -131,7 +261,13 @@ class DelayedCanonicalSource implements CanonicalVaultAnnotationSource {
   constructor(
     private readonly paths: readonly string[],
     private readonly inkStrokeCount = 2,
+    private readonly missingPaths: ReadonlySet<string> = new Set(),
+    private readonly unavailablePaths: ReadonlySet<string> = new Set(),
   ) {}
+
+  isSourceAvailable(filePath: string): boolean {
+    return !this.unavailablePaths.has(filePath);
+  }
 
   listAnnotations(filePath: string): Promise<{
     readonly conflicts: readonly RepositoryConflict[];
@@ -158,6 +294,7 @@ class DelayedCanonicalSource implements CanonicalVaultAnnotationSource {
         pathHash: `hash-${index}`,
         schemaVersion: 1,
         sourceFingerprint: `source-${index}`,
+        ...(this.missingPaths.has(filePath) ? { sourceMissingAt: '2026-07-14T09:00:00.000Z' } : {}),
       })),
     });
   }
@@ -200,4 +337,31 @@ function record(filePath: string): TextAnnotationRecord {
     },
     updatedAt: '2026-07-14T08:00:00.000Z',
   };
+}
+
+function note(filePath: string): NoteMeta {
+  return {
+    filePath,
+    lastReconciledAt: '2026-07-14T08:00:00.000Z',
+    noteId: `note-${filePath}`,
+    pathHash: `hash-${filePath}`,
+    schemaVersion: 1,
+    sourceFingerprint: `source-${filePath}`,
+  };
+}
+
+function revision(record: TextAnnotationRecord, nextRevision: number): TextAnnotationRecord {
+  return {
+    ...record,
+    revision: nextRevision,
+    updatedAt: `2026-07-14T${String(8 + nextRevision).padStart(2, '0')}:00:00.000Z`,
+  };
+}
+
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = () => settle();
+  });
+  return { promise, resolve };
 }

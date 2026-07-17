@@ -57,11 +57,13 @@ describe('ink surface repository contract', () => {
     await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(next);
   });
 
-  it('re-publishes an idempotent retry after the canonical write landed before an event error', async () => {
+  it('does not report a canonical write as failed when a projection event throws', async () => {
     const { store, surface } = await createFixture();
     const changed: InkSurfaceRecord[] = [];
+    const issues: unknown[] = [];
     let failNextEvent = false;
     const repository = new InkSurfaceRepository(store, {
+      onEventIssue: (error) => issues.push(error),
       onSurfaceChanged: (record) => {
         changed.push(record);
         if (failNextEvent) {
@@ -74,12 +76,11 @@ describe('ink surface repository contract', () => {
     const next = revision(surface, 2, [stroke('landed')]);
     failNextEvent = true;
 
-    await expect(repository.updateSurface(next, surface)).rejects.toThrow(
-      /subscriber unavailable/u,
-    );
+    await expect(repository.updateSurface(next, surface)).resolves.toBeUndefined();
     await expect(repository.updateSurface(next, surface)).resolves.toBeUndefined();
 
     expect(changed).toEqual([surface, next, next]);
+    expect(issues).toEqual([expect.objectContaining({ message: 'subscriber unavailable' })]);
     await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(next);
   });
 
@@ -840,6 +841,31 @@ describe('ink surface repository contract', () => {
     ]);
   });
 
+  it('rejects a delayed iCloud summary by rebuilding it from canonical surfaces', async () => {
+    const { repository, surface, store } = await createFixture();
+    await repository.writeSurface({ ...surface, strokes: [stroke('visible')] });
+    const summaryPath = store.pathBySuffix('/ink-summaries.json');
+    const staleSummary = store.readBySuffix('/ink-summaries.json');
+    if (summaryPath === null || staleSummary === null) {
+      throw new Error('Missing Ink summary fixture.');
+    }
+    await repository.tombstoneSurface(
+      surface.filePath,
+      surface.id,
+      '2026-07-14T11:59:00.000Z',
+      undefined,
+      surface.revision,
+    );
+    store.replaceBySuffix('/ink-summaries.json', staleSummary);
+
+    await expect(repository.rebuildSummariesForSidecarPath(summaryPath)).resolves.toBe(
+      surface.filePath,
+    );
+    await expect(repository.listSurfaceSummaries(surface.filePath)).resolves.toMatchObject([
+      { deletedAt: '2026-07-14T11:59:00.000Z', id: surface.id, revision: 2 },
+    ]);
+  });
+
   it('tombstones and restores a whole surface with monotonic revisions and retained vectors', async () => {
     const { repository, surface } = await createFixture();
     const withInk = { ...surface, strokes: [stroke('keep-me')] };
@@ -858,14 +884,47 @@ describe('ink surface repository contract', () => {
       strokes: [{ id: 'keep-me' }],
     });
 
+    await expect(
+      repository.restoreSurface(
+        surface.filePath,
+        surface.id,
+        '2026-07-14T12:00:30.000Z',
+        'desktop-device',
+        1,
+      ),
+    ).rejects.toThrow('changed since it was deleted');
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toMatchObject({
+      deletedAt: '2026-07-14T12:00:00.000Z',
+      revision: 2,
+    });
+
     const restored = await repository.restoreSurface(
       surface.filePath,
       surface.id,
       '2026-07-14T12:01:00.000Z',
       'desktop-device',
+      2,
     );
     expect(restored).toMatchObject({ revision: 3, strokes: [{ id: 'keep-me' }] });
     expect(restored.deletedAt).toBeUndefined();
+  });
+
+  it('refuses to tombstone an Ink surface after the selected revision changed', async () => {
+    const { repository, surface } = await createFixture();
+    await repository.writeSurface(surface);
+    const updated = revision(surface, 2, [stroke('newer-stroke')]);
+    await repository.updateSurface(updated);
+
+    await expect(
+      repository.tombstoneSurface(
+        surface.filePath,
+        surface.id,
+        '2026-07-14T12:02:00.000Z',
+        'desktop-device',
+        surface.revision,
+      ),
+    ).rejects.toThrow('changed since it was selected');
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(updated);
   });
 
   it('reclaims active zero-stroke surfaces as tombstones without touching visible Ink', async () => {

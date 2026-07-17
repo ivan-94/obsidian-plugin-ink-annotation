@@ -72,6 +72,61 @@ describe('production CSS architecture', () => {
     );
   });
 
+  it('resets iPad native search and button chrome inside plugin surfaces', () => {
+    expect(styles).toMatch(
+      /:is\(\s*\.inkstone-quick-toolbar,[\s\S]*?\.inkstone-ink-controls\s*\)\s*:is\(button,\s*input\[type='search'\],\s*input\[type='text'\],\s*textarea\)\s*\{[^}]*-webkit-appearance:\s*none[^}]*appearance:\s*none/u,
+    );
+    expect(styles).toMatch(
+      /:is\(\.inkstone-sidebar__search,\s*\.inkstone-vault-search\)\s+input\[type='search'\]\s*\{[^}]*border-radius:\s*0/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-ink-controls\s+input\[type='color'\]\s*\{[^}]*-webkit-appearance:\s*none[^}]*appearance:\s*none[^}]*border-radius:\s*50%/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-ink-controls__width-preview\s*\{[^}]*background:\s*currentColor/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-ink-controls__width\s+select\s*\{[^}]*position:\s*absolute[^}]*opacity:\s*0/u,
+    );
+  });
+
+  it('lets Inspector controls shrink within the iPad mobile panel', () => {
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector__editor-controls\s*\{[^}]*min-width:\s*0/u,
+    );
+    expect(styles).toMatch(/\.inkstone-annotation-inspector__segments\s*\{[^}]*min-width:\s*0/u);
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector__segments\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector\s+\.inkstone-annotation-inspector__segments\s+button\s*\{[^}]*min-width:\s*0/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector__styles\s*\{[^}]*width:\s*100%[^}]*min-width:\s*0[^}]*overflow:\s*hidden/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector__styles\s*>\s*\.inkstone-annotation-inspector__style\s*\{[^}]*min-width:\s*var\(--inkstone-control-height\)[^}]*max-width:\s*var\(--inkstone-control-height\)/u,
+    );
+    expect(styles).toMatch(
+      /:is\([\s\S]*?\.inkstone-annotation-inspector[\s\S]*?\)\s*\.inkstone-icon-button\s*\{[^}]*min-width:\s*var\(--inkstone-control-height\)/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector\s+\.inkstone-annotation-inspector__save\s*\{[^}]*min-width:\s*82px/u,
+    );
+  });
+
+  it('keeps a long overlap quote inside its choice row without covering the mark label', () => {
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector\s+\[data-inkstone-overlap-choice\]\s*\{[^}]*min-width:\s*0[^}]*overflow:\s*hidden/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector\s+\[data-inkstone-overlap-choice\]\s*>\s*span:first-child\s*\{[^}]*min-width:\s*0[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-annotation-inspector\s+\[data-inkstone-overlap-choice\]\s*>\s*span:last-child\s*\{[^}]*white-space:\s*nowrap/u,
+    );
+  });
+
   it('adapts the shared sidebar by container width instead of viewport width', () => {
     expect(styles).toMatch(
       /\.inkstone-annotation-sidebar-view\s*\{[^}]*container-name:\s*inkstone-sidebar[^}]*container-type:\s*inline-size/u,

@@ -1,5 +1,6 @@
 import type { AnnotationSidebarStore } from '../stores/annotation-sidebar-store';
 import { EmptyState } from '../primitives/empty-state';
+import { ObsidianIcon } from '../primitives/obsidian-icon';
 import { StatusBanner } from '../primitives/status-banner';
 
 export type SidebarStatePresentation =
@@ -100,6 +101,39 @@ export function SidebarStateView({
         />
       );
     case 'loading':
-      return <StatusBanner kind="loading" message={presentation.message} />;
+      return <SidebarLoadingState message={presentation.message} />;
   }
+}
+
+function SidebarLoadingState({ message }: { readonly message: string }) {
+  return (
+    <div
+      aria-label={message.replace(/…$/u, '')}
+      aria-live="polite"
+      className="inkstone-sidebar__loading"
+      role="status"
+    >
+      <div className="inkstone-sidebar__loading-label">
+        <ObsidianIcon className="inkstone-sidebar__loading-icon" icon="loader-circle" />
+        <span>{message}</span>
+      </div>
+      <div aria-hidden="true" className="inkstone-sidebar__loading-list">
+        <LoadingRow />
+        <LoadingRow />
+        <LoadingRow />
+      </div>
+    </div>
+  );
+}
+
+function LoadingRow() {
+  return (
+    <div className="inkstone-sidebar__loading-row">
+      <span className="inkstone-sidebar__loading-thumbnail" />
+      <span className="inkstone-sidebar__loading-copy">
+        <span className="inkstone-sidebar__loading-line inkstone-sidebar__loading-line--title" />
+        <span className="inkstone-sidebar__loading-line inkstone-sidebar__loading-line--metadata" />
+      </span>
+    </div>
+  );
 }

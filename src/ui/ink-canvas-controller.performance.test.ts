@@ -111,6 +111,9 @@ class LargeSession {
   eraseStrokeAt(): string | null {
     return null;
   }
+  eraseStrokesInPolygon(): readonly string[] {
+    return [];
+  }
   enter(): void {}
   exit(): Promise<void> {
     return Promise.resolve();

@@ -22,6 +22,8 @@ The same visible defects returned after several local geometry corrections:
    Markdown layer.
 3. Vertical scrolling has previously produced different deltas for Ink and Markdown.
 4. In Ink edit, mouse-wheel scrolling no longer moves the note; only dragging the scrollbar works.
+5. On iPad, switching from 100% to 60% can leave Ink at 100% size and move its origin far to the
+   right while Markdown visibly scales and recenters.
 
 Native Obsidian 1.12.7 measurements show why:
 
@@ -56,30 +58,39 @@ The wheel regression has a separate but related cause: the same Canvas is both r
 surface. Making the fixed Canvas interactive removes the native Reading View content from hit
 testing, so browser navigation no longer has the correct scroll target.
 
+The iPad-only zoom regression is a WebKit CSS `zoom` geometry defect. WebKit can render the zoom
+while `getBoundingClientRect()` retains the unzoomed width and height and reports viewport
+coordinates divided by the zoom factor. Dividing that width by `offsetWidth` therefore returns `1`,
+and publishing the raw `left`/`top` moves the Stage Frame origin in the opposite direction.
+
 ## Decisions
 
-| ID          | Decision                                                                                                                                                                                                                                                                           |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| INK-V1.3-01 | One immutable **Stage Frame** is the only runtime authority for logical, client, Canvas-CSS, and Canvas-backing coordinates.                                                                                                                                                       |
-| INK-V1.3-02 | The Stage Frame is measured from actual DOM rectangles and actual rendered scale. It does not reconstruct centering, padding, scroll, or fixed containing-block behavior.                                                                                                          |
-| INK-V1.3-03 | Existing 100% placement is the compatibility baseline. Its structural document-origin inset is captured once per Reading View host attachment, normalized by the measured containing-block scale, and multiplied by the actual document scale thereafter. No sidecar is rewritten. |
-| INK-V1.3-04 | Both committed and active Canvas contexts consume the same Stage Frame matrix. Pointer creation and hit testing consume its exact inverse.                                                                                                                                         |
-| INK-V1.3-05 | Canvas is always pointer-transparent. Mouse and pen input are captured at the stable Reading View scroll host; touch remains unhandled so native finger scrolling survives.                                                                                                        |
-| INK-V1.3-06 | Wheel scrolling is never bridged or reimplemented by the plugin. The native scroll host remains the browser event target.                                                                                                                                                          |
-| INK-V1.3-07 | Zoom, scroll, and resize each replace the complete Stage Frame atomically before redraw. Partial viewport fields are removed.                                                                                                                                                      |
-| INK-V1.3-08 | One global lifecycle queue owns the active `(view, mounted session, file path)` transition. Async exit commits only if the same view and mounted-session identity still own the manager.                                                                                           |
-| INK-V1.3-09 | Preview is a persisted Reading transition, so re-entering Edit must reopen every retained bounded domain session before the UI accepts input.                                                                                                                                      |
-| INK-V1.3-10 | Retry belongs to the same manager lifecycle queue as exit. A toolbar Retry cannot locally deactivate a controller while the manager still owns it.                                                                                                                                 |
-| INK-V1.3-11 | A pending enter captures the active-leaf epoch and is cancelled after mounting if the leaf, view, or mounted identity changed.                                                                                                                                                     |
-| INK-V1.3-12 | Dirty bounded vectors receive a synchronous device-local recovery checkpoint. Canonical sidecars remain authoritative; revision divergence fails closed instead of overwriting either copy.                                                                                        |
-| INK-V1.3-13 | Native scroll is a read-only Stage Frame projection: it reuses the measured Canvas frame and scale, updates only the document client origin, and redraws without writing layout or measuring Canvas.                                                                               |
-| INK-V1.3-14 | Manual zoom, Fit resize, and Reading View host replacement preserve the same logical viewport top across the layout transaction.                                                                                                                                                   |
-| INK-V1.3-15 | A newer wheel, touch, pointer, keyboard, or scroll intent cancels any deferred Reading Context restore so plugin restoration cannot overwrite native navigation.                                                                                                                   |
-| INK-V1.3-16 | Repository instances sharing one Vault text-file adapter share one canonical write coordinator; single, batch, and summary keys are collision-proof namespaces.                                                                                                                    |
-| INK-V1.3-17 | One document-level macrotask is the commit barrier for a multi-chunk logical Ink command, preventing sibling chunk persistence from exposing a partial command.                                                                                                                    |
-| INK-V1.3-18 | A successful owner write invalidates sibling preview mounts for the same file so a second visible leaf cannot keep rendering stale canonical Ink.                                                                                                                                  |
-| INK-V1.3-19 | Recovery v3 persists the confirmed base, pending attempt, and working record separately; it fences stale managers, quarantines corrupt bytes, and retains one reachable live owner after dual checkpoint/canonical failure.                                                        |
-| INK-V1.3-20 | Journal recovery preflights every canonical record before writing any record. It may replay only when all canonical bytes are exactly the journal's previous or next bytes; any third state fails closed without mutation.                                                         |
+| ID          | Decision                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| INK-V1.3-01 | One immutable **Stage Frame** is the only runtime authority for logical, client, Canvas-CSS, and Canvas-backing coordinates.                                                                                                                                                                                                                                                                                                         |
+| INK-V1.3-02 | The Stage Frame is measured from actual DOM rectangles and actual rendered scale. It does not reconstruct centering, padding, scroll, or fixed containing-block behavior.                                                                                                                                                                                                                                                            |
+| INK-V1.3-03 | Existing 100% placement is the compatibility baseline. Its structural document-origin inset is captured once per Reading View host attachment, normalized by the measured containing-block scale, and multiplied by the actual document scale thereafter. No sidecar is rewritten.                                                                                                                                                   |
+| INK-V1.3-04 | Both committed and active Canvas contexts consume the same Stage Frame matrix. Pointer creation and hit testing consume its exact inverse.                                                                                                                                                                                                                                                                                           |
+| INK-V1.3-05 | Canvas and its pane-wide surface are always pointer-transparent. Mouse and `pointerType: pen` input are captured at the stable Reading View scroll host. WebKit `Touch.touchType: stylus` is the Apple Pencil fallback when Pointer Events are missing or misclassified. Direct finger touch propagation is stopped without cancelling the event, so Reading View handlers stay isolated while the browser retains native scrolling. |
+| INK-V1.3-06 | Wheel scrolling is never bridged or reimplemented by the plugin. The native scroll host remains the browser event target.                                                                                                                                                                                                                                                                                                            |
+| INK-V1.3-07 | Zoom, scroll, and resize each replace the complete Stage Frame atomically before redraw. Partial viewport fields are removed.                                                                                                                                                                                                                                                                                                        |
+| INK-V1.3-08 | One global lifecycle queue owns the active `(view, mounted session, file path)` transition. Async exit commits only if the same view and mounted-session identity still own the manager.                                                                                                                                                                                                                                             |
+| INK-V1.3-09 | Preview is a persisted Reading transition, so re-entering Edit must reopen every retained bounded domain session before the UI accepts input.                                                                                                                                                                                                                                                                                        |
+| INK-V1.3-10 | Retry belongs to the same manager lifecycle queue as exit. A toolbar Retry cannot locally deactivate a controller while the manager still owns it.                                                                                                                                                                                                                                                                                   |
+| INK-V1.3-11 | A pending enter captures the active-leaf epoch and is cancelled after mounting if the leaf, view, or mounted identity changed.                                                                                                                                                                                                                                                                                                       |
+| INK-V1.3-12 | Dirty bounded vectors receive a synchronous device-local recovery checkpoint. Canonical sidecars remain authoritative; revision divergence fails closed instead of overwriting either copy.                                                                                                                                                                                                                                          |
+| INK-V1.3-13 | Native scroll is a read-only Stage Frame projection: it reuses the measured Canvas frame and scale, updates only the document client origin, and redraws without writing layout or measuring Canvas.                                                                                                                                                                                                                                 |
+| INK-V1.3-14 | Manual zoom, Fit resize, and Reading View host replacement preserve the same logical viewport top across the layout transaction.                                                                                                                                                                                                                                                                                                     |
+| INK-V1.3-15 | A newer wheel, touch, pointer, keyboard, or scroll intent cancels any deferred Reading Context restore so plugin restoration cannot overwrite native navigation.                                                                                                                                                                                                                                                                     |
+| INK-V1.3-16 | Repository instances sharing one Vault text-file adapter share one canonical write coordinator; single, batch, and summary keys are collision-proof namespaces.                                                                                                                                                                                                                                                                      |
+| INK-V1.3-17 | One document-level macrotask is the commit barrier for a multi-chunk logical Ink command, preventing sibling chunk persistence from exposing a partial command.                                                                                                                                                                                                                                                                      |
+| INK-V1.3-18 | A successful owner write invalidates sibling preview mounts for the same file so a second visible leaf cannot keep rendering stale canonical Ink.                                                                                                                                                                                                                                                                                    |
+| INK-V1.3-19 | Recovery v3 persists the confirmed base, pending attempt, and working record separately; it fences stale managers, quarantines corrupt bytes, and retains one reachable live owner after dual checkpoint/canonical failure.                                                                                                                                                                                                          |
+| INK-V1.3-20 | Journal recovery preflights every canonical record before writing any record. It may replay only when all canonical bytes are exactly the journal's previous or next bytes; any third state fails closed without mutation.                                                                                                                                                                                                           |
+| INK-V1.3-21 | Brush width uses one visible preview/value trigger backed by a full-size native `select`. iPad delegates choice to the system picker instead of exposing several compressed line targets; the control never autofocuses.                                                                                                                                                                                                             |
+| INK-V1.3-22 | The DOM measurement adapter detects whether the layout rect ignored the presented CSS zoom by comparing its raw scale with the unzoomed containing scale and the expected presented scale. Only in that case it normalizes rect size, viewport origin, and Stage Frame scale together; detection is geometric rather than user-agent based.                                                                                          |
+| INK-V1.3-23 | Every stable toolbar choice is device-local preference state: drawing tool, color, width, Draw/Select interaction, multiple selection, More expansion, edit zoom mode/scale, and dragged position. Undo/Redo availability, save state, and selected stroke identities remain session state.                                                                                                                                          |
+| INK-V1.3-24 | Ink Preview always presents the Reading View at its native `100%` scale. Edit zoom is remembered separately and restored only when Edit is entered again; it never leaks into Preview.                                                                                                                                                                                                                                               |
 
 ## Stage Frame Contract
 
@@ -136,14 +147,31 @@ coordinate field.
 - The pane-wide overlay is calibrated to the actual Reading View client rect; browser fixed-layer
   containing-block offsets must not leak into its final rect.
 - Canvas layers remain viewport-sized and do not contribute to `scrollWidth` or `scrollHeight`.
+- The pane-wide surface and both Canvas children remain pointer-transparent in Edit, Preview, and
+  Raw. Reading View content remains the browser hit target so its real scroll container owns native
+  touch navigation.
 - Every Canvas transform is replaced with `setTransform`; transforms are not incrementally stacked.
 - Strokes are rendered in canonical logical coordinates without subtracting ad-hoc viewport offsets.
 - Canvas clearing temporarily uses backing-pixel identity space so translations cannot leave stale
   pixels.
 - Pointer listeners live on `scrollContainer ?? root` in capture phase. Only primary mouse/pen input
   in Ink edit is prevented and interpreted as Ink.
-- Touch input is ignored by Ink capture and continues through Obsidian's native scrolling path.
-- Canvas and overlay stay `pointer-events: none` in preview and edit. Passive navigation-intent
+- During Ink edit, touch pointer events are stopped at the scroll-host capture boundary but are
+  never cancelled. They therefore cannot reach Markdown component listeners while the browser's
+  default pan action still scrolls the native Reading View container.
+- WebKit stylus Touch Events are a second Apple Pencil input adapter. `touchType: stylus` is
+  cancelled and mapped into the same draw, erase, and Select/Move state machine; `touchType: direct`
+  is never cancelled. When WebKit emits both Pointer and Touch Events for one Pencil sequence, the
+  active Pointer sequence owns the stroke and the Touch fallback does not duplicate it.
+- WebKit CSS-zoom rect normalization happens before Stage Frame publication. A rect that already
+  includes the presented zoom remains untouched; a rect that ignores it has width, height, left, and
+  top corrected as one measurement transaction.
+- Reading View `selectstart` is cancelled during Ink edit so touch/Pencil gestures cannot select
+  Markdown text. Preview and Raw restore native selection.
+- Ink edit consumes Reading View `dblclick` and the second `click` in a multi-click sequence outside
+  the Ink toolbar. The first click remains available to WKWebView's Pencil input pipeline; Raw and
+  Preview retain ordinary Reading View activation.
+- Canvas layers and the surface stay `pointer-events: none` in every mode. Passive navigation-intent
   listeners may cancel a pending plugin restore, but never prevent, bridge, or synthesize native
   wheel or touch scrolling.
 
@@ -241,6 +269,29 @@ Recovery rules:
 - Mouse wheel and trackpad scrolling work when the pointer is over text, Ink, and pane whitespace.
 - Apple Pencil/mouse can still draw outside the 704 boundary, while a finger scroll is not captured
   as a stroke.
+- Finger or Apple Pencil double-tap in Ink edit cannot switch the note into Markdown editing.
+  Toolbar controls remain operable, and the first Pencil click is not canceled.
+- Pencil input targets Reading View content and is intercepted by the scroll-host capture listener
+  to create Ink without reaching Markdown handlers. Finger input is stopped at the same boundary
+  without cancellation, retaining native Reading View scrolling.
+- A Pencil sequence remains drawable when WKWebView reports its Pointer Event as touch, because the
+  subsequent `Touch.touchType: stylus` sequence supplies the fallback. A normal `touchType: direct`
+  sequence never creates a stroke and remains uncancelled.
+- Markdown text cannot be selected during Ink edit because `selectstart` is cancelled at the capture
+  boundary. Preview and Raw restore normal Reading View selection.
+- Ink edit does not apply `user-select: none` or disable native touch actions; Pencil remains on the
+  drawing path while finger input retains native scrolling.
+- The brush-width control exposes `1`, `2`, `4`, `8`, `12`, and `16` px through the native platform
+  picker, preserves a current non-standard width as an option, and applies the selected width to the
+  next stroke without moving focus on toolbar mount.
+- Stable toolbar choices, including the More expansion state, survive controller disposal and
+  recreation through the device-local preference store. Existing v1 preference bytes without the new
+  optional fields continue to load with safe defaults.
+- Leaving Edit for Preview restores native Reading View scale to `100%`; re-entering Edit restores
+  the last editing zoom mode and scale without changing canonical Ink coordinates.
+- At 100%, 90%, 80%, 70%, 60%, and 50% on iPad, persisted Ink and newly drawn Ink use the same
+  visual scale and document origin as Markdown; switching zoom cannot retain a 100% Canvas transform
+  or publish the zoom-divided WebKit coordinates.
 - Pointer-down at a visible landmark round-trips through persistence and reload at every supported
   scale.
 - Fit content with no real horizontal overflow has no horizontal scrollbar.
@@ -275,12 +326,38 @@ Recovery rules:
 
 ### Sources
 
+- User request and toolbar screenshot supplied in the 2026-07-17 Codex task requiring complete
+  toolbar-choice memory, a `1 px` brush option, and `100%` Preview independent of Edit zoom.
 - User report and three screenshots supplied in the 2026-07-16 Codex task: 100% accepted state, 50%
   alignment failure, sidebar-resize alignment failure, and loss of mouse-wheel scrolling.
+- User follow-up in the same task reporting that finger or Apple Pencil double-tap during Ink edit
+  entered Markdown editing and could hand Pencil input to iPadOS Scribble.
+- Physical iPad follow-up showing that suppressing Reading View selection regressed Apple Pencil
+  from drawing to native window scrolling.
+- User-directed experiment in the same task: place a transparent interaction shield over the
+  original Obsidian Markdown view during Ink edit instead of relying on Markdown event suppression.
+- Physical iPad follow-up in the same task showing that the fixed interaction shield prevented
+  native finger scrolling even with native pan actions declared; the shield was rejected in favor of
+  a non-cancelling scroll-host capture barrier.
+- Physical iPad follow-up in the same task showing that the pointer-only capture barrier restored
+  finger scrolling but again stopped Apple Pencil drawing, requiring WebKit's stylus Touch fallback.
+- Physical iPad follow-up and screenshot in the same task showing that the compressed inline brush
+  width samples were not discoverable or reliably selectable, with the requested replacement being a
+  dropdown control.
+- Physical iPad follow-up and two screenshots in the same task showing the returned 100% to 60%
+  regression: Markdown scaled and recentered while persisted Ink retained its former size and moved
+  right.
 - Earlier user reports and screenshots in the same task covering zoom drift, vertical scroll drift,
   horizontal overflow, pane resize, and Canvas/input behavior.
 - Native Obsidian 1.12.7 DOM/Canvas measurements collected in the same task.
 - Trusted Chromium fixed-overlay wheel reproduction collected in the same task.
+- Apple WebKitJS `Touch` documentation exposing `touchType`:
+  https://developer.apple.com/documentation/webkitjs/touch
+- WebKit Safari 18.2 Pointer Events notes documenting Apple Pencil angle data and recent Pointer
+  Events changes: https://webkit.org/blog/16301/webkit-features-in-safari-18-2/
+- WebKit bug 77998 documenting that `getBoundingClientRect()` can return unzoomed size and
+  zoom-divided coordinates for elements using CSS `zoom`:
+  https://bugs.webkit.org/show_bug.cgi?id=77998
 - `docs/specs/2026-07-15-ink-fixed-width-manual-repositioning.md`
 - `docs/specs/2026-07-16-ink-704-zoomable-workspace.md`
 - `docs/delivery/slices/S16-ink-fixed-width-manual-move/`
@@ -325,6 +402,9 @@ Recovery rules:
 - Preserve native browser navigation instead of synthesizing wheel or touch scroll.
 - Serialize active-owner changes globally and commit awaited lifecycle work only when its captured
   mount identity is still current.
+- Treat Preview scale as Reading View presentation rather than a remembered editing preference.
+- Persist stable toolbar choices device-locally while keeping undo history, save status, and live
+  selection session-local.
 
 ### Verification evidence
 
@@ -335,3 +415,26 @@ Recovery rules:
   navigation, Raw scroll restoration, and active-file switching passed after a fresh plugin reload.
 - Native geometry: 704 logical px rendered to 352 CSS px at scale 0.5; Canvas and overlay client
   rects matched, and both were pointer-transparent.
+- Ink input-isolation regressions verify that touch `pointerdown` and the first Pencil click remain
+  uncanceled while a second click/`dblclick` is consumed during Ink edit; CSS verification prevents
+  the workspace from disabling selection or native touch actions.
+- Input-barrier regressions verify the surface stays pointer-transparent; Pencil events captured
+  from Reading View persist a stroke; finger events do not reach Markdown handlers and remain
+  uncanceled for native scrolling; Edit-only `selectstart` suppression restores in Preview.
+- WebKit input-adapter regressions verify misclassified Pointer touch followed by
+  `Touch.touchType: stylus` draws, erases, and Select/Moves; direct finger Touch remains
+  uncancelled; dual Pointer plus stylus Touch delivery persists exactly one stroke.
+- Toolbar regressions verify the visible width trigger is backed by one full-size native `select`,
+  exposes all supported widths, and applies the chosen width to the next stroke.
+- The iPad CSS-zoom regression fixture reproduces WebKit's unzoomed layout rect at 60%, then
+  verifies the committed Canvas transform, document origin, and pointer-to-logical round trip all
+  use 0.6.
+- Latest focused Stage Frame/Canvas suite: 4 files / 89 tests passed. Remaining executable suite: 98
+  files / 640 tests passed; performance tests, production bundle, mobile bundle, focused lint,
+  formatting, and full typecheck passed, followed by a fresh development Vault installation.
+- Latest full `npm run check`: 98 files / 637 tests and 4 performance files / 8 tests passed;
+  production and mobile builds passed, followed by a fresh development Vault installation.
+- 2026-07-17 toolbar-preference/Preview-scale correction: focused preference and Canvas suites
+  passed 81 tests; the full executable suite passed 101 files / 698 tests and 4 performance files /
+  9 tests. Formatting, ESLint, TypeScript, production build, mobile bundle validation, and a fresh
+  development Vault installation passed.

@@ -491,7 +491,7 @@ describe('Entire Vault annotation sidebar', () => {
       'Delete 2 annotations?',
     );
     expect(dialog?.querySelector('.inkstone-bulk-dialog__description')?.textContent).toBe(
-      'This action cannot be undone.',
+      'Deleted annotations can be restored for a short time.',
     );
     expect(dialog?.querySelector('.inkstone-bulk-dialog__actions')).not.toBeNull();
     expect(
@@ -506,6 +506,11 @@ describe('Entire Vault annotation sidebar', () => {
       { expectedRevision: 1, id: 'one' },
       { expectedRevision: 1, id: 'two' },
     ]);
+    await vi.waitFor(() => {
+      expect(container.querySelector('button[aria-label="Done selecting"]')).toBeNull();
+      expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+      expect(container.querySelector('button[aria-label="More actions"]')).not.toBeNull();
+    });
   });
 
   it('shows visible feedback after copying a bulk selection', async () => {
@@ -851,6 +856,9 @@ describe('Entire Vault annotation sidebar', () => {
       ),
     );
     expect(container.textContent).toContain('1 selected');
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      '1 selected annotations could not be updated.',
+    );
   });
 
   it('keeps a failed bulk action open with retryable feedback', async () => {

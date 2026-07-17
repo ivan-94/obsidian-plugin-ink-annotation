@@ -15,22 +15,18 @@ interface DraftContents {
 
 export class AnnotationDraftSession {
   private contents: DraftContents;
-  private readonly debounceMs: number;
   private dirty = false;
   private draft: TextAnnotationRecord;
   private flushPromise: Promise<void> | null = null;
   private readonly onStateChange: (state: DraftPersistenceState) => void;
   private readonly service: AnnotationService;
   private state: DraftPersistenceState = { kind: 'idle' };
-  private timer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(input: {
-    readonly debounceMs?: number;
     readonly draft: TextAnnotationRecord;
     readonly onStateChange?: (state: DraftPersistenceState) => void;
     readonly service: AnnotationService;
   }) {
-    this.debounceMs = input.debounceMs ?? 500;
     this.draft = input.draft;
     this.onStateChange = input.onStateChange ?? (() => undefined);
     this.service = input.service;
@@ -55,11 +51,9 @@ export class AnnotationDraftSession {
     };
     this.dirty = true;
     this.setState({ kind: 'idle' });
-    this.scheduleFlush();
   }
 
   async flush(): Promise<void> {
-    this.clearTimer();
     if (this.flushPromise !== null) {
       await this.flushPromise;
       if (this.dirty) {
@@ -83,17 +77,9 @@ export class AnnotationDraftSession {
   }
 
   async close(): Promise<void> {
-    this.clearTimer();
     await this.flush();
     if (isEmptyDraft(this.draft)) {
       await this.service.discardEmptyDraft(this.draft);
-    }
-  }
-
-  private clearTimer(): void {
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
     }
   }
 
@@ -109,18 +95,10 @@ export class AnnotationDraftSession {
       this.setState({
         error,
         kind: 'error',
-        message: "Couldn't save locally. Retry.",
+        message: "Couldn't save locally.",
       });
       throw error;
     }
-  }
-
-  private scheduleFlush(): void {
-    this.clearTimer();
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      void this.flush().catch(() => undefined);
-    }, this.debounceMs);
   }
 
   private setState(state: DraftPersistenceState): void {

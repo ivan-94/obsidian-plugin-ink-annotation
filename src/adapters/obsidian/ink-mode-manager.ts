@@ -1,10 +1,10 @@
-import { MarkdownView, Notice } from 'obsidian';
-import type { App } from 'obsidian';
+import { MarkdownView, Notice, setIcon, setTooltip } from 'obsidian';
+import type { App, Menu } from 'obsidian';
 
 import { type InkSurfaceSessionSnapshot } from '../../application/ink-surface-session';
 import { KeyedSerialTaskQueue } from '../../runtime/keyed-serial-task-queue';
 import { InkDocumentSession } from '../../application/ink-document-session';
-import { ensureInkCanvasExtent } from '../../domain/ink-canvas-extent';
+import { ensureInkCanvasExtent, measureInkCanvasExtent } from '../../domain/ink-canvas-extent';
 import type { InkSurfaceRecord } from '../../domain/ink-surface';
 import { migrateInkSurfaceRecordsToV2 } from '../../domain/ink-surface-migration';
 import { INK_DOCUMENT_LOGICAL_WIDTH } from '../../domain/ink-workspace';
@@ -16,6 +16,9 @@ import type { InkSurfaceSummary } from '../../domain/ink-surface-summary';
 import type { LocalInkToolPreferenceStore } from '../../storage/local-ink-tool-preference';
 import { type InkRecoveryStore, planLocalInkRecovery } from '../../storage/local-ink-recovery';
 import { waitForInkLayoutReadiness } from './ink-layout-readiness';
+import { isAnnotationReadingView } from './markdown-view-mode';
+
+const INK_ENTRY_ICON = 'paintbrush';
 
 const NO_LOCAL_INK_RECOVERY: InkRecoveryStore = Object.freeze({
   claim: () => undefined,
@@ -57,6 +60,10 @@ export class ObsidianInkModeManager {
   private activeLeafEpoch = 0;
   private activeView: MarkdownView | null = null;
   private readonly actions = new Map<MarkdownView, HTMLElement>();
+  private readonly actionFilePaths = new Map<MarkdownView, string | null>();
+  private readonly hasInkViews = new Set<MarkdownView>();
+  private readonly hasInkStateVersions = new Map<MarkdownView, number>();
+  private readonly hiddenPreviewPaths = new Map<MarkdownView, string>();
   private readonly deferredRegistrations = new Map<
     MarkdownView,
     { readonly owner: RetainedInkSessionOwner; readonly resume: () => void }
@@ -66,6 +73,13 @@ export class ObsidianInkModeManager {
   private readonly fileMountQueue = new KeyedSerialTaskQueue<string>();
   private readonly lifecycleQueue = new KeyedSerialTaskQueue<'active-owner'>();
   private readonly mountQueue = new KeyedSerialTaskQueue<MarkdownView>();
+  private readonly paneMenuBindings = new Map<
+    MarkdownView,
+    {
+      readonly original: ((menu: Menu, source: string) => void) | undefined;
+      readonly wrapped: (menu: Menu, source: string) => void;
+    }
+  >();
   private readonly refreshQueue = new KeyedSerialTaskQueue<MarkdownView>();
   private readonly onIssue: (error: unknown) => void;
   private readonly onWillEnter: () => void;
@@ -128,28 +142,151 @@ export class ObsidianInkModeManager {
       return;
     }
     this.cancelDeferredRegistration(view);
+    const currentPath = view.file?.path;
+    const currentFileKey = currentPath === undefined ? null : normalizeVaultPath(currentPath);
+    const fileChanged =
+      this.actionFilePaths.has(view) && this.actionFilePaths.get(view) !== currentFileKey;
+    this.actionFilePaths.set(view, currentFileKey);
+    if (fileChanged) {
+      this.commitHasInkState(view, false);
+      this.hiddenPreviewPaths.delete(view);
+      this.previewViews.delete(view);
+      this.syncActions();
+    }
     if (this.actions.has(view)) {
+      this.syncActions();
       void this.refreshQueue
-        .schedule(view, () => this.refreshRegisteredView(view))
+        .schedule(view, async () => {
+          await this.refreshRegisteredView(view);
+          if (fileChanged && isAnnotationReadingView(view)) {
+            await this.initializeRegisteredView(view);
+          }
+        })
         .catch(this.onIssue);
       return;
     }
     view.contentEl
       .querySelectorAll<HTMLElement>('.inkstone-ink-surface')
       .forEach((surface) => surface.remove());
-    const action = view.addAction('paintbrush', 'Draw on this note', () => {
-      void this.toggle(view).catch(this.onIssue);
+    if (!isAnnotationReadingView(view)) return;
+    const hiddenPath = this.hiddenPreviewPaths.get(view);
+    if (
+      hiddenPath !== undefined &&
+      (currentPath === undefined || normalizeVaultPath(currentPath) !== hiddenPath)
+    ) {
+      this.hiddenPreviewPaths.delete(view);
+    }
+    const action = view.addAction(INK_ENTRY_ICON, '开始涂鸦', () => {
+      void this.activatePrimaryAction(view).catch(this.onIssue);
     });
     action.dataset.inkstoneInkAction = 'true';
-    action.setAttribute('aria-pressed', 'false');
+    setIcon(action, INK_ENTRY_ICON);
+    setTooltip(action, '开始涂鸦', { placement: 'bottom' });
+    action.setAttribute('aria-label', '开始涂鸦');
     this.actions.set(view, action);
-    if (this.previewByDefault) void this.showPreview(view).catch(this.onIssue);
+    this.installPaneMenu(view);
+    this.syncActions();
+    void this.initializeRegisteredView(view).catch(this.onIssue);
+  }
+
+  private async initializeRegisteredView(view: MarkdownView): Promise<void> {
+    const filePath = view.file?.path;
+    if (
+      !isAnnotationReadingView(view) ||
+      filePath === undefined ||
+      (typeof this.input.inkRepository.listSurfaces !== 'function' &&
+        typeof this.input.inkRepository.listSurfaceSummaries !== 'function')
+    ) {
+      if (this.previewByDefault) await this.showPreview(view);
+      return;
+    }
+    const expectedStateVersion = this.hasInkStateVersions.get(view) ?? 0;
+    const hasInk = await this.readCanonicalFileHasInkState(filePath);
+    if (
+      hasInk === null ||
+      this.disposed ||
+      !this.actions.has(view) ||
+      !isAnnotationReadingView(view) ||
+      view.file?.path !== filePath ||
+      (this.hasInkStateVersions.get(view) ?? 0) !== expectedStateVersion
+    ) {
+      return;
+    }
+    this.commitHasInkState(view, hasInk);
+    this.syncActions();
+    if (this.previewByDefault && hasInk) await this.showPreview(view);
+  }
+
+  private async activatePrimaryAction(view: MarkdownView): Promise<void> {
+    if (view !== this.activeView && !this.previewViews.has(view) && this.hasInkViews.has(view)) {
+      const filePath = view.file?.path;
+      if (filePath !== undefined) {
+        const hasInk = await this.scheduleLifecycle(() => this.reconcileFileHasInkState(filePath));
+        if (
+          this.disposed ||
+          view.file === null ||
+          normalizeVaultPath(view.file.path) !== normalizeVaultPath(filePath)
+        ) {
+          return;
+        }
+        if (hasInk === false) {
+          await this.toggle(view);
+          return;
+        }
+      }
+      await this.showPreview(view, true);
+      return;
+    }
+    await this.toggle(view);
+  }
+
+  private installPaneMenu(view: MarkdownView): void {
+    if (this.paneMenuBindings.has(view)) return;
+    const paneMenu = Reflect.get(view, 'onPaneMenu') as unknown;
+    const original =
+      typeof paneMenu === 'function'
+        ? (paneMenu as (menu: Menu, source: string) => void)
+        : undefined;
+    const wrapped = (menu: Menu, source: string): void => {
+      original?.call(view, menu, source);
+      if (source !== 'more-options' || !this.previewViews.has(view)) return;
+      menu.addItem((item) =>
+        item
+          .setTitle('关闭涂鸦预览')
+          .setIcon('eye-off')
+          .setSection('view')
+          .onClick(() => {
+            void this.closePreview(view).catch(this.onIssue);
+          }),
+      );
+    };
+    this.paneMenuBindings.set(view, { original, wrapped });
+    view.onPaneMenu = wrapped;
+  }
+
+  private closePreview(view: MarkdownView): Promise<void> {
+    return this.scheduleLifecycle(() => {
+      if (this.activeView === view || !this.previewViews.has(view)) return Promise.resolve();
+      const mounted = this.mounted.get(view);
+      if (mounted === undefined) return Promise.resolve();
+      const filePath = view.file?.path ?? mounted.filePath;
+      this.hiddenPreviewPaths.set(view, normalizeVaultPath(filePath));
+      this.commitHasInkState(view, true);
+      mounted.controller.hidePreview();
+      this.disposeMount(view);
+      this.syncActions();
+      return Promise.resolve();
+    });
   }
 
   toggle(view = this.input.app.workspace.getActiveViewOfType(MarkdownView)): Promise<void> {
     if (view === null) {
       new Notice('Open a Markdown note in Reading View to use Ink Mode.');
       return Promise.resolve();
+    }
+    if (!isAnnotationReadingView(view)) {
+      new Notice('Open a Markdown note in Reading View to use Ink Mode.');
+      return this.scheduleLifecycle(() => this.exitActiveView(true));
     }
     if (this.toggleTransition !== null) {
       const currentTransition = this.toggleTransition;
@@ -229,9 +366,7 @@ export class ObsidianInkModeManager {
       return;
     }
     const target =
-      !forceRaw && this.previewByDefault && mounted.session.snapshot().surface.strokes.length > 0
-        ? 'preview'
-        : 'raw';
+      !forceRaw && mounted.session.snapshot().surface.strokes.length > 0 ? 'preview' : 'raw';
     await this.exitMountedView(view, mounted, target);
   }
 
@@ -254,7 +389,12 @@ export class ObsidianInkModeManager {
     if (this.activeView !== view || this.mounted.get(view) !== mounted) return;
     this.pendingExit = null;
     this.activeView = null;
-    if (target === 'preview') this.previewViews.add(view);
+    if (target === 'preview') {
+      this.commitHasInkState(view, true);
+      this.previewViews.add(view);
+    } else if (mounted.session.snapshot().surface.strokes.length === 0) {
+      this.commitHasInkState(view, false);
+    }
     this.syncActions();
     if (target === 'raw') this.disposeMount(view);
     let reclaimError: unknown;
@@ -365,13 +505,14 @@ export class ObsidianInkModeManager {
     await this.exitMountedView(view, mounted, 'raw');
   }
 
-  /** Detaches stale Ink sessions after delete or restore; Reading View never mounts an overlay. */
+  /** Reconciles canonical Ink after delete, restore, or an external sidecar mutation. */
   async refreshFile(filePath: string): Promise<void> {
     await this.scheduleLifecycle(async () => {
       await this.prepareFileMutationNow(filePath);
       for (const [view, mounted] of this.mounted) {
         if (mounted.filePath === filePath) this.disposeMount(view);
       }
+      await this.reconcileFileHasInkState(filePath);
     });
   }
 
@@ -379,7 +520,8 @@ export class ObsidianInkModeManager {
     const file = this.input.app.vault.getFileByPath(summary.filePath);
     if (file === null) throw new Error(`Ink source file no longer exists: ${summary.filePath}`);
     const leaf = this.input.app.workspace.getLeaf(false);
-    await leaf.openFile(file);
+    const currentFilePath = leaf.view instanceof MarkdownView ? leaf.view.file?.path : undefined;
+    if (currentFilePath !== file.path) await leaf.openFile(file);
     if (!(leaf.view instanceof MarkdownView)) return;
     const root = leaf.view.contentEl.querySelector<HTMLElement>('.markdown-preview-sizer');
     if (root !== null) {
@@ -486,7 +628,16 @@ export class ObsidianInkModeManager {
     }
     for (const action of this.recoveryActions.values()) action.remove();
     this.recoveryActions.clear();
+    for (const [view, binding] of this.paneMenuBindings) {
+      if (view.onPaneMenu !== binding.wrapped) continue;
+      if (binding.original === undefined) Reflect.deleteProperty(view, 'onPaneMenu');
+      else view.onPaneMenu = binding.original;
+    }
+    this.paneMenuBindings.clear();
+    this.actionFilePaths.clear();
     this.actions.clear();
+    this.hasInkViews.clear();
+    this.hiddenPreviewPaths.clear();
     this.previewViews.clear();
   }
 
@@ -643,6 +794,12 @@ export class ObsidianInkModeManager {
 
   private async refreshRegisteredViewNow(view: MarkdownView): Promise<void> {
     if (this.disposed) return;
+    if (!isAnnotationReadingView(view)) {
+      if (this.activeView === view) await this.exitActiveView(true);
+      else if (this.mounted.has(view)) this.disposeMount(view);
+      this.syncActions();
+      return;
+    }
     if (this.activeView !== view) {
       if (this.previewByDefault) await this.showPreview(view);
       return;
@@ -688,15 +845,25 @@ export class ObsidianInkModeManager {
     );
   }
 
-  private async showPreview(view: MarkdownView): Promise<void> {
-    if (this.disposed || this.activeView === view) return;
+  private async showPreview(view: MarkdownView, manual = false): Promise<void> {
+    if (this.disposed || this.activeView === view || !isAnnotationReadingView(view)) return;
+    const filePath = view.file?.path;
+    if (
+      !manual &&
+      filePath !== undefined &&
+      this.hiddenPreviewPaths.get(view) === normalizeVaultPath(filePath)
+    ) {
+      return;
+    }
+    if (manual) this.hiddenPreviewPaths.delete(view);
     const mounted = await this.ensureMounted(view, false);
     if (mounted === null || this.disposed || this.activeView === view) return;
-    if (!this.previewByDefault) {
+    if (!manual && !this.previewByDefault) {
       if (this.mounted.get(view) === mounted) this.disposeMount(view);
       return;
     }
     mounted.controller.showPreview();
+    this.commitHasInkState(view, true);
     this.previewViews.add(view);
     this.syncActions();
   }
@@ -844,9 +1011,10 @@ export class ObsidianInkModeManager {
             sourceRevision,
             style,
           });
-    const preparedSurfaces = ensureInkCanvasExtent(baseSurfaces, minimumTotalHeight);
+    const canonicalSurfaces =
+      existing.length > 0 ? baseSurfaces : ensureInkCanvasExtent(baseSurfaces, minimumTotalHeight);
     if (existing.length === 0) {
-      for (const created of preparedSurfaces) {
+      for (const created of canonicalSurfaces) {
         await this.input.inkRepository.writeSurface(created);
       }
     }
@@ -876,7 +1044,7 @@ export class ObsidianInkModeManager {
       root.scrollHeight,
       root.getBoundingClientRect().height,
     );
-    const surfaces = ensureInkCanvasExtent(preparedSurfaces, minimumTotalHeight);
+    const transientSurfaces = ensureInkCanvasExtent(canonicalSurfaces, minimumTotalHeight);
 
     let controller: InkCanvasController | null = null;
     let recoveryGeneration: string | null = null;
@@ -928,12 +1096,15 @@ export class ObsidianInkModeManager {
         }
         controller?.sync(snapshot);
         if (snapshot.persistence.kind === 'saved-locally') {
+          this.commitFileHasInkState(filePath, hasVisibleInk(snapshot.surface));
           this.invalidateSiblingMounts(view, filePath, session);
+          this.syncActions();
         }
       },
-      surfaces,
+      surfaces: canonicalSurfaces,
       writer: this.input.inkRepository,
     });
+    session.ensureMinimumHeight(measureInkCanvasExtent(transientSurfaces));
     controller = new InkCanvasController({
       controlsHost: this.input.document.body,
       document: this.input.document,
@@ -958,6 +1129,7 @@ export class ObsidianInkModeManager {
       root: scrollContainer,
       scrollContainer,
       session,
+      viewportHost: view.contentEl,
     });
     const mounted = { complete: true, controller, filePath, session };
     this.mounted.set(view, mounted);
@@ -1022,26 +1194,125 @@ export class ObsidianInkModeManager {
     this.previewViews.delete(view);
   }
 
+  /**
+   * Commits an authoritative local Ink-presence observation and invalidates older async summaries.
+   * The version advances even when Set membership is unchanged: deleting the final stroke can
+   * confirm an already-empty state while an earlier sidecar summary is still in flight.
+   */
+  private commitHasInkState(view: MarkdownView, hasInk: boolean): void {
+    this.hasInkStateVersions.set(view, (this.hasInkStateVersions.get(view) ?? 0) + 1);
+    if (hasInk) this.hasInkViews.add(view);
+    else this.hasInkViews.delete(view);
+  }
+
+  /**
+   * Publishes one canonical save result to every registered view of the same file.
+   *
+   * Each view's version must advance independently so a summary request started before the save
+   * cannot restore stale Ink-presence UI in a sibling tab after the canonical state changed.
+   */
+  private commitFileHasInkState(filePath: string, hasInk: boolean): void {
+    const fileKey = normalizeVaultPath(filePath);
+    for (const view of this.actions.keys()) {
+      const currentPath = view.file?.path;
+      if (currentPath !== undefined && normalizeVaultPath(currentPath) === fileKey) {
+        this.commitHasInkState(view, hasInk);
+      }
+    }
+  }
+
+  /** Re-derives a file's presentation state from canonical surfaces, never from the summary cache. */
+  private async reconcileFileHasInkState(filePath: string): Promise<boolean | null> {
+    const fileKey = normalizeVaultPath(filePath);
+    const expectedVersions = new Map<MarkdownView, number>();
+    for (const view of this.actions.keys()) {
+      const currentPath = view.file?.path;
+      if (currentPath === undefined || normalizeVaultPath(currentPath) !== fileKey) continue;
+      const version = (this.hasInkStateVersions.get(view) ?? 0) + 1;
+      this.hasInkStateVersions.set(view, version);
+      expectedVersions.set(view, version);
+    }
+    const hasInk = await this.readCanonicalFileHasInkState(filePath);
+    if (hasInk === null) return null;
+    for (const [view, expectedVersion] of expectedVersions) {
+      const currentPath = view.file?.path;
+      if (
+        !this.actions.has(view) ||
+        currentPath === undefined ||
+        normalizeVaultPath(currentPath) !== fileKey ||
+        this.hasInkStateVersions.get(view) !== expectedVersion
+      ) {
+        continue;
+      }
+      this.commitHasInkState(view, hasInk);
+    }
+    this.syncActions();
+    return hasInk;
+  }
+
+  private async readCanonicalFileHasInkState(filePath: string): Promise<boolean | null> {
+    if (typeof this.input.inkRepository.listSurfaces === 'function') {
+      const loaded = await this.input.inkRepository.listSurfaces(filePath);
+      return loaded.records.some(hasVisibleInk);
+    }
+    if (typeof this.input.inkRepository.listSurfaceSummaries === 'function') {
+      const summaries = await this.input.inkRepository.listSurfaceSummaries(filePath);
+      return summaries.some(
+        (summary) => summary.deletedAt === undefined && summary.strokeCount > 0,
+      );
+    }
+    return null;
+  }
+
   private syncActions(): void {
     for (const [view, action] of this.actions) {
+      const readingView = isAnnotationReadingView(view);
+      action.hidden = !readingView;
+      action.toggleAttribute('aria-hidden', !readingView);
+      if (!readingView) {
+        action.setAttribute('aria-disabled', 'true');
+        action.toggleAttribute('disabled', true);
+        continue;
+      }
       const active = view === this.activeView;
       const pending = view === this.pendingView;
       const preview = !active && this.previewViews.has(view);
+      const hiddenInk = !active && !preview && this.hasInkViews.has(view);
+      const failed = active && this.pendingExit?.view === view;
       const label = pending
         ? this.pendingAction === 'exit'
-          ? 'Exiting Ink Mode…'
-          : 'Opening Ink Mode…'
-        : active
-          ? 'Exit Ink Mode'
-          : preview
-            ? 'Edit Ink'
-            : 'Draw on this note';
+          ? '正在保存涂鸦…'
+          : '正在打开涂鸦…'
+        : failed
+          ? '保存失败 · 重试'
+          : active
+            ? '完成涂鸦并预览'
+            : preview
+              ? '正在预览涂鸦 · 编辑'
+              : hiddenInk
+                ? '涂鸦已隐藏 · 显示预览'
+                : '开始涂鸦';
+      const icon = pending
+        ? 'loader-circle'
+        : failed
+          ? 'rotate-ccw'
+          : active
+            ? 'check'
+            : hiddenInk
+              ? 'eye'
+              : INK_ENTRY_ICON;
       action.classList.toggle('is-active', active);
       action.classList.toggle('is-preview', preview);
       action.classList.toggle('is-pending', pending);
-      action.setAttribute('aria-pressed', String(active));
+      action.classList.toggle('is-error', failed);
+      action.classList.toggle('has-hidden-ink', hiddenInk);
+      action.classList.toggle('is-saving', pending && this.pendingAction === 'exit');
+      setIcon(action, icon);
+      setTooltip(action, label, { placement: 'bottom' });
       action.setAttribute('aria-busy', String(pending));
+      action.setAttribute('aria-disabled', String(pending));
       action.setAttribute('aria-label', label);
+      action.toggleAttribute('disabled', pending);
       if (pending && this.pendingAction !== null) {
         action.dataset.inkstoneInkTransition = this.pendingAction;
       } else {
@@ -1050,6 +1321,12 @@ export class ObsidianInkModeManager {
       action.setAttribute('data-tooltip-position', 'bottom');
     }
   }
+}
+
+function hasVisibleInk(record: InkSurfaceRecord): boolean {
+  return (
+    record.deletedAt === undefined && record.strokes.some((stroke) => stroke.tool !== 'eraser')
+  );
 }
 
 function retainedInkSessionRegistry(): RetainedInkSessionRegistry {

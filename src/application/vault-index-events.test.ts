@@ -35,6 +35,35 @@ describe('Vault index canonical record events', () => {
     expect(index.snapshot()).toEqual([]);
   });
 
+  it('removes a live text projection that is multiple revisions behind its tombstone', () => {
+    const index = new VaultAnnotationIndex();
+    index.rebuild([textRecordToIndexEntry(record({ revision: 1 }))]);
+
+    expect(
+      applyCanonicalRecordChanged(
+        index,
+        record({ deletedAt: '2026-07-14T10:00:00.000Z', revision: 4 }),
+      ),
+    ).toBe('removed');
+    expect(index.snapshot()).toEqual([]);
+  });
+
+  it.each([4, 5])(
+    'preserves a live text projection at revision %s when a revision 4 tombstone arrives',
+    (projectedRevision) => {
+      const index = new VaultAnnotationIndex();
+      index.rebuild([textRecordToIndexEntry(record({ revision: projectedRevision }))]);
+
+      expect(
+        applyCanonicalRecordChanged(
+          index,
+          record({ deletedAt: '2026-07-14T10:00:00.000Z', revision: 4 }),
+        ),
+      ).toBe('stale');
+      expect(index.snapshot()).toMatchObject([{ revision: projectedRevision }]);
+    },
+  );
+
   it('removes physically deleted drafts only at the indexed revision', () => {
     const index = new VaultAnnotationIndex();
     const draft = record({ revision: 1 });
@@ -42,6 +71,14 @@ describe('Vault index canonical record events', () => {
 
     expect(applyCanonicalRecordRemoved(index, draft)).toBe('removed');
     expect(applyCanonicalRecordRemoved(index, draft)).toBe('missing');
+  });
+
+  it('removes a draft projection that is multiple revisions behind a physically removed record', () => {
+    const index = new VaultAnnotationIndex();
+    index.rebuild([textRecordToIndexEntry(record({ revision: 1 }))]);
+
+    expect(applyCanonicalRecordRemoved(index, record({ revision: 4 }))).toBe('removed');
+    expect(index.snapshot()).toEqual([]);
   });
 
   it('incrementally indexes Ink metadata and removes a surface tombstone without retaining points', () => {
@@ -68,6 +105,39 @@ describe('Vault index canonical record events', () => {
     ).toBe('removed');
     expect(index.snapshot()).toEqual([]);
   });
+
+  it('removes a live Ink projection that is multiple revisions behind its tombstone', () => {
+    const index = new VaultAnnotationIndex();
+    index.rebuild([]);
+    expect(applyCanonicalInkSurfaceChanged(index, inkSurface({ revision: 1 }))).toBe('applied');
+
+    expect(
+      applyCanonicalInkSurfaceChanged(index, {
+        ...inkSurface({ revision: 4 }),
+        deletedAt: '2026-07-14T10:00:00.000Z',
+      }),
+    ).toBe('removed');
+    expect(index.snapshot()).toEqual([]);
+  });
+
+  it.each([4, 5])(
+    'preserves a live Ink projection at revision %s when a revision 4 tombstone arrives',
+    (projectedRevision) => {
+      const index = new VaultAnnotationIndex();
+      index.rebuild([]);
+      expect(
+        applyCanonicalInkSurfaceChanged(index, inkSurface({ revision: projectedRevision })),
+      ).toBe('applied');
+
+      expect(
+        applyCanonicalInkSurfaceChanged(index, {
+          ...inkSurface({ revision: 4 }),
+          deletedAt: '2026-07-14T10:00:00.000Z',
+        }),
+      ).toBe('stale');
+      expect(index.snapshot()).toMatchObject([{ revision: projectedRevision }]);
+    },
+  );
 
   it('removes an Ink index entry when its last visible stroke is erased', () => {
     const index = new VaultAnnotationIndex();

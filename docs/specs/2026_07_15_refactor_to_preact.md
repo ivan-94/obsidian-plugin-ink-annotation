@@ -82,7 +82,7 @@ flowchart TD
 - 搜索、筛选、批量操作。
 - Inspector。
 - Quick Toolbar。
-- Note Composer。
+- Add note 的 Inspector 复用入口。
 - Ink Toolbar 的按钮部分。
 
 ## 三、框架层重构
@@ -154,7 +154,6 @@ interface ObsidianUiEnvironment {
 - `AnnotationSidebarStore`
 - `AnnotationInspectorStore`
 - `QuickToolbarStore`
-- `NoteComposerStore`
 - `InkToolbarStore`
 
 Signals 只属于 UI 层，不泄漏到 Domain/Application Interface。
@@ -558,7 +557,6 @@ src/ui/
     annotation-sidebar-store.ts
     annotation-inspector-store.ts
     quick-toolbar-store.ts
-    note-composer-store.ts
     ink-toolbar-store.ts
 
   models/
@@ -601,7 +599,6 @@ src/ui/
 
   floating/
     quick-highlight-toolbar-app.tsx
-    note-composer-app.tsx
     ink-toolbar-app.tsx
 
   canvas/
@@ -718,7 +715,7 @@ src/ui/
 
 完成标准：Entire Vault 完全由 Preact 渲染，Scope warm switch 不再明显卡顿。
 
-### R7：Inspector、Quick Toolbar、Note Composer
+### R7：Inspector、Quick Toolbar
 
 依赖：R1、R2。
 
@@ -727,9 +724,9 @@ src/ui/
 - [ ] 迁移 Overlap chooser。
 - [ ] 迁移 Mark Type、Style、Tags。
 - [ ] 迁移 Quick Toolbar。
-- [ ] 迁移 Note Composer。
+- [ ] Add note 复用 Inspector，并默认激活 Note、聚焦输入框。
 - [ ] 保存成功关闭。
-- [ ] 保存失败保持打开并聚焦 Retry。
+- [ ] 显式保存失败保持打开并聚焦 Retry；失焦保存失败放弃未提交修改并关闭。
 - [ ] 外部点击和 Escape 回归。
 - [ ] 删除旧 global listener 实现。
 

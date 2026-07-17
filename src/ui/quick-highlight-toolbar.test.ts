@@ -80,6 +80,90 @@ describe('quick highlight toolbar', () => {
     expect(actions).toEqual([{ kind: 'underline', styleId: 'highlight-violet' }]);
   });
 
+  it('does not steal focus or collapse the native selection in the mobile action bar', () => {
+    const paragraph = document.createElement('p');
+    paragraph.textContent = 'Keep this native selection visible.';
+    const focusedControl = document.createElement('button');
+    document.body.append(paragraph, focusedControl);
+    const text = paragraph.firstChild;
+    if (!(text instanceof Text)) throw new Error('Selection fixture is missing text.');
+    const range = document.createRange();
+    range.setStart(text, 0);
+    range.setEnd(text, 9);
+    focusedControl.focus();
+    document.getSelection()?.removeAllRanges();
+    document.getSelection()?.addRange(range);
+    expect(document.getSelection()?.toString()).toBe('Keep this');
+    const toolbar = new QuickHighlightToolbar({
+      document,
+      layout: 'mobile-action-bar',
+      onAction: () => Promise.resolve(),
+      onDismiss: () => undefined,
+    });
+
+    toolbar.show({
+      anchorRect: new DOMRect(100, 120, 80, 20),
+      presets: DEFAULT_STYLE_PRESETS,
+      recentStyleId: 'highlight-sun',
+    });
+
+    expect(document.activeElement).toBe(focusedControl);
+    expect(document.getSelection()?.toString()).toBe('Keep this');
+    expect(document.querySelector('[data-inkstone-quick-toolbar]')?.classList).toContain(
+      'inkstone-quick-toolbar--mobile-action-bar',
+    );
+
+    toolbar.close(false);
+    document.getSelection()?.removeAllRanges();
+    paragraph.remove();
+    focusedControl.remove();
+  });
+
+  it('docks the mobile action bar to the visual viewport instead of the native selection', () => {
+    const visualViewport = new EventTarget();
+    Object.defineProperties(visualViewport, {
+      height: { value: 700 },
+      offsetLeft: { value: 100 },
+      offsetTop: { value: 40 },
+      width: { value: 640 },
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    });
+    const rect = vi
+      .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+      .mockImplementation(function (this: HTMLElement) {
+        return this.classList.contains('inkstone-quick-toolbar')
+          ? new DOMRect(0, 0, 360, 50)
+          : new DOMRect();
+      });
+    const toolbar = new QuickHighlightToolbar({
+      document,
+      layout: 'mobile-action-bar',
+      onAction: () => Promise.resolve(),
+      onDismiss: () => undefined,
+    });
+
+    toolbar.show({
+      anchorRect: new DOMRect(101, 240, 20, 30),
+      presets: DEFAULT_STYLE_PRESETS,
+      recentStyleId: 'highlight-sun',
+    });
+
+    const element = document.querySelector<HTMLElement>('[data-inkstone-quick-toolbar]');
+    expect(element?.style.left).toBe('240px');
+    expect(element?.style.top).toBe('678px');
+    expect(element?.dataset.inkstonePlacement).toBe('bottom-action-bar');
+
+    toolbar.close(false);
+    rect.mockRestore();
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: undefined,
+    });
+  });
+
   it('keeps retry context when local persistence fails', async () => {
     let attempts = 0;
     let reportedError: unknown;
@@ -168,6 +252,50 @@ describe('quick highlight toolbar', () => {
     expect(dismissals).toBe(1);
     expect(document.querySelector('[data-inkstone-quick-toolbar]')).toBeNull();
     expect(remove).toHaveBeenCalledWith('keydown', expect.any(Function), true);
+  });
+
+  it('keeps the toolbar inside an offset visual viewport near the left edge', () => {
+    const visualViewport = new EventTarget();
+    Object.defineProperties(visualViewport, {
+      height: { value: 700 },
+      offsetLeft: { value: 100 },
+      offsetTop: { value: 40 },
+      width: { value: 640 },
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    });
+    const rect = vi
+      .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+      .mockImplementation(function (this: HTMLElement) {
+        return this.classList.contains('inkstone-quick-toolbar')
+          ? new DOMRect(0, 0, 360, 50)
+          : new DOMRect();
+      });
+    const toolbar = new QuickHighlightToolbar({
+      document,
+      onAction: () => Promise.resolve(),
+      onDismiss: () => undefined,
+    });
+
+    toolbar.show({
+      anchorRect: new DOMRect(101, 240, 20, 30),
+      presets: DEFAULT_STYLE_PRESETS,
+      recentStyleId: 'highlight-sun',
+    });
+
+    const element = document.querySelector<HTMLElement>('[data-inkstone-quick-toolbar]');
+    expect(element?.style.left).toBe('112px');
+    expect(element?.style.top).toBe('182px');
+    expect(element?.dataset.inkstonePlacement).toBe('above');
+
+    toolbar.close(false);
+    rect.mockRestore();
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: undefined,
+    });
   });
 
   it('shows a concise non-destructive reason for an unsupported selection', () => {

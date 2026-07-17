@@ -70,6 +70,34 @@ describe('Live Preview extension', () => {
     expect(view.dom.querySelector('.inkstone-editor-highlight')).toBeNull();
   });
 
+  it('does not attach annotation behavior when editor features are disabled', async () => {
+    const service = new FakeAnnotationService([
+      resolved(record('annotation-1', 0, 4, { kind: 'highlight', styleId: 'sun' })),
+    ]);
+    const coordinator = new LivePreviewAnnotationCoordinator({
+      contextForState: () => ({ filePath: 'Editor.md', livePreview: true }),
+      document,
+      enabled: false,
+      resolveDelayMs: 0,
+      service,
+    });
+    const view = createView('Edit without annotation work', coordinator);
+    view.dispatch({
+      changes: { from: view.state.doc.length, insert: '.' },
+      selection: { anchor: 0, head: 4 },
+    });
+    view.contentDOM.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(service.resolveCalls).toEqual([]);
+    expect(view.dom.querySelector('.inkstone-editor-highlight')).toBeNull();
+    expect(document.querySelector('[data-inkstone-quick-toolbar]')).toBeNull();
+    await expect(coordinator.commitSelection({ kind: 'highlight', styleId: 'sun' })).resolves.toBe(
+      false,
+    );
+  });
+
   it('refreshes on source/Live Preview switches without creating duplicate records', async () => {
     let livePreview = false;
     const service = new FakeAnnotationService([

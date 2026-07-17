@@ -23,7 +23,10 @@ const JOURNAL_TEMP_SUFFIX = '.inkstone-tmp';
 /** Uses Obsidian's mobile-safe DataAdapter because Vault intentionally does not index dot-folders. */
 export class ObsidianVaultTextFileStore implements TextFileStore {
   readonly coordinationScope: object;
-  private readonly recentWrites = new Map<string, number>();
+  private readonly recentWrites = new Map<
+    string,
+    { readonly contents: string; readonly inFlight: boolean; readonly writtenAt: number }
+  >();
 
   constructor(
     private readonly adapter: DataAdapterLike,
@@ -124,31 +127,115 @@ export class ObsidianVaultTextFileStore implements TextFileStore {
     if (separator > 0) {
       await this.mkdir(normalizedTo.slice(0, separator));
     }
-    await this.adapter.rename(normalizedFrom, normalizedTo);
+    if (!(await this.adapter.exists(normalizedFrom))) {
+      if (await this.adapter.exists(normalizedTo)) return;
+      throw new Error(`Cannot rename missing annotation storage path ${normalizedFrom}.`);
+    }
+    if (!(await this.adapter.exists(normalizedTo))) {
+      await this.adapter.rename(normalizedFrom, normalizedTo);
+      return;
+    }
+    await this.mergeDirectory(normalizedFrom, normalizedTo);
   }
 
   async write(path: string, contents: string): Promise<void> {
     const normalized = normalizeVaultPath(path);
-    this.recentWrites.set(normalized, Date.now());
-    const separator = normalized.lastIndexOf('/');
-    if (separator > 0) {
-      await this.mkdir(normalized.slice(0, separator));
+    const pending = { contents, inFlight: true, writtenAt: Date.now() };
+    this.recentWrites.set(normalized, pending);
+    try {
+      const separator = normalized.lastIndexOf('/');
+      if (separator > 0) {
+        await this.mkdir(normalized.slice(0, separator));
+      }
+      if (this.adapter.rename === undefined) {
+        await this.adapter.write(normalized, contents);
+      } else {
+        await this.writeJournaled(normalized, contents);
+      }
+    } catch (error) {
+      if (this.recentWrites.get(normalized) === pending) this.recentWrites.delete(normalized);
+      throw error;
     }
-    if (this.adapter.rename === undefined) {
-      await this.adapter.write(normalized, contents);
-      return;
+    if (this.recentWrites.get(normalized) === pending) {
+      this.recentWrites.set(normalized, {
+        contents,
+        inFlight: false,
+        writtenAt: Date.now(),
+      });
     }
-    await this.writeJournaled(normalized, contents);
   }
 
   wasRecentlyWritten(path: string, now = Date.now()): boolean {
     const normalized = normalizeVaultPath(path);
-    const writtenAt = this.recentWrites.get(normalized);
-    if (writtenAt === undefined) return false;
-    const age = now - writtenAt;
+    const recent = this.recentWrites.get(normalized);
+    if (recent === undefined) return false;
+    const age = now - recent.writtenAt;
     if (age >= 0 && age <= 5_000) return true;
     this.recentWrites.delete(normalized);
     return false;
+  }
+
+  async isUnchangedRecentWrite(path: string, now = Date.now()): Promise<boolean> {
+    const normalized = normalizeVaultPath(path);
+    const recent = this.recentWrites.get(normalized);
+    if (recent === undefined || !this.wasRecentlyWritten(normalized, now)) return false;
+    if (recent.inFlight) return true;
+    const current = (await this.adapter.exists(normalized))
+      ? await withTimeout(
+          this.adapter.read(normalized),
+          this.readTimeoutMs,
+          `compare recent write ${normalized}`,
+        )
+      : null;
+    if (current === recent.contents) return true;
+    this.recentWrites.delete(normalized);
+    return false;
+  }
+
+  private async mergeDirectory(from: string, to: string): Promise<void> {
+    const rename = this.adapter.rename?.bind(this.adapter);
+    if (rename === undefined) {
+      throw new Error('The Obsidian data adapter does not support rename.');
+    }
+    const listed = await this.adapter.list(from);
+    for (const sourceFolder of listed.folders) {
+      const destinationFolder = `${to}/${basename(sourceFolder)}`;
+      if (await this.adapter.exists(destinationFolder)) {
+        await this.mergeDirectory(sourceFolder, destinationFolder);
+      } else {
+        await rename(sourceFolder, destinationFolder);
+      }
+    }
+    for (const sourceFile of listed.files) {
+      const destinationFile = `${to}/${basename(sourceFile)}`;
+      if (!(await this.adapter.exists(destinationFile))) {
+        await rename(sourceFile, destinationFile);
+        continue;
+      }
+      const [sourceContents, destinationContents] = await Promise.all([
+        this.adapter.read(sourceFile),
+        this.adapter.read(destinationFile),
+      ]);
+      if (sourceContents === destinationContents) {
+        await this.adapter.remove(sourceFile);
+        continue;
+      }
+      const preserved = await this.nextRenameConflictPath(destinationFile);
+      await rename(destinationFile, preserved);
+      await rename(sourceFile, destinationFile);
+    }
+    await this.adapter.remove(from);
+  }
+
+  private async nextRenameConflictPath(path: string): Promise<string> {
+    const extensionAt = path.lastIndexOf('.');
+    const base = extensionAt > path.lastIndexOf('/') ? path.slice(0, extensionAt) : path;
+    const extension = extensionAt > path.lastIndexOf('/') ? path.slice(extensionAt) : '';
+    for (let index = 1; index < 10_000; index += 1) {
+      const candidate = `${base} rename-conflict-${index}${extension}`;
+      if (!(await this.adapter.exists(candidate))) return candidate;
+    }
+    throw new Error(`Cannot preserve rename collision for ${path}.`);
   }
 
   async writeBinary(path: string, contents: ArrayBuffer): Promise<void> {

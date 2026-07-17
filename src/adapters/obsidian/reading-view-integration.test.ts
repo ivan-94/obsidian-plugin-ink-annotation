@@ -2,8 +2,12 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { AnnotationService } from '../../application/annotation-service';
+import {
+  AnnotationService,
+  type ResolveHighlightsResult,
+} from '../../application/annotation-service';
 import { SidecarRepository, type TextFileStore } from '../../storage/sidecar-repository';
+import { AnnotationInspector } from '../../ui/annotation-inspector';
 import {
   ReadingViewIntegration,
   sourceOffsetAtLine,
@@ -191,6 +195,67 @@ describe('Reading View integration', () => {
     readingView.remove();
   });
 
+  it('ignores selections while Reading View remounts after an edit instead of using a cleaned source context', async () => {
+    const beforeSource = 'Before edit.';
+    const afterSource = 'After edit.';
+    const issues: unknown[] = [];
+    const integration = new ReadingViewIntegration({
+      document,
+      onIssue: (issue) => issues.push(issue),
+      service: new AnnotationService({
+        repository: new SidecarRepository(new MemoryTextFileStore()),
+      }),
+    });
+    const readingView = document.createElement('div');
+    readingView.className = 'markdown-reading-view';
+    const before = document.createElement('section');
+    before.innerHTML = `<p>${beforeSource}</p>`;
+    readingView.append(before);
+    document.body.append(readingView);
+    const cleanupBefore = await integration.mountSection({
+      filePath: 'Edited.md',
+      getFullSource: () => Promise.resolve(beforeSource),
+      getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: beforeSource }),
+      root: before,
+    });
+    cleanupBefore();
+    before.remove();
+
+    const after = document.createElement('section');
+    after.innerHTML = `<p>${afterSource}</p>`;
+    readingView.append(after);
+    const paragraph = after.querySelector('p');
+    const text = paragraph?.firstChild;
+    if (!(paragraph instanceof HTMLElement) || !(text instanceof Text)) {
+      throw new Error('Edited Reading View fixture is missing text.');
+    }
+    const range = document.createRange();
+    range.setStart(text, 0);
+    range.setEnd(text, 'After'.length);
+    document.getSelection()?.addRange(range);
+
+    paragraph.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(issues).toEqual([]);
+    expect(document.querySelector('[data-inkstone-quick-toolbar]')).toBeNull();
+
+    await integration.mountSection({
+      filePath: 'Edited.md',
+      getFullSource: () => Promise.resolve(afterSource),
+      getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: afterSource }),
+      root: after,
+    });
+    paragraph.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    await vi.waitFor(() =>
+      expect(document.querySelector('button[aria-label="Highlight: Sun"]')).not.toBeNull(),
+    );
+
+    document.getSelection()?.removeAllRanges();
+    integration.dispose();
+    readingView.remove();
+  });
+
   it('skips block source mapping when the file has no text annotations', async () => {
     const source = 'Unannotated long-document block.';
     const integration = createIntegration(new MemoryTextFileStore());
@@ -208,7 +273,7 @@ describe('Reading View integration', () => {
     integration.dispose();
   });
 
-  it('opens the mobile composer only after Add note has persisted its draft target', async () => {
+  it('opens Add note in the shared inspector after persisting its draft target', async () => {
     const source = 'A note target in reading view.';
     const store = new MemoryTextFileStore();
     const ids = ['note-1', 'draft-1'];
@@ -216,7 +281,30 @@ describe('Reading View integration', () => {
       createId: () => ids.shift() ?? 'unexpected-id',
       repository: new SidecarRepository(store),
     });
-    const integration = new ReadingViewIntegration({ document, isMobile: true, service });
+    const inspector = new AnnotationInspector({
+      document,
+      onDelete: (record) => Promise.resolve(record),
+      onDiscard: (record) => service.discardEmptyDraft(record),
+      onNavigate: () => undefined,
+      onSave: (record, changes) =>
+        service.updateAnnotationContents(record.filePath, record.id, changes),
+      onUndo: (record) => Promise.resolve(record),
+      presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
+      writeClipboard: () => Promise.resolve(),
+    });
+    const integration = new ReadingViewIntegration({
+      document,
+      isMobile: true,
+      onNoteDraft: (draft, target) => {
+        inspector.show({
+          anchorRect: target.anchorRect,
+          initialFocus: 'note',
+          invoker: target.block,
+          records: [draft],
+        });
+      },
+      service,
+    });
     const root = document.createElement('p');
     root.textContent = source;
     document.body.append(root);
@@ -238,30 +326,38 @@ describe('Reading View integration', () => {
     await vi.waitFor(() =>
       expect(document.querySelector('button[aria-label="Add note"]')).not.toBeNull(),
     );
+    expect(
+      document
+        .querySelector('[data-inkstone-quick-toolbar]')
+        ?.classList.contains('inkstone-quick-toolbar--mobile-action-bar'),
+    ).toBe(true);
 
     document.querySelector<HTMLButtonElement>('button[aria-label="Add note"]')?.click();
 
     await vi.waitFor(() =>
-      expect(
-        document
-          .querySelector('[data-inkstone-note-composer]')
-          ?.classList.contains('inkstone-note-composer--bottom-sheet'),
-      ).toBe(true),
+      expect(document.querySelector('[data-inkstone-annotation-inspector]')).not.toBeNull(),
     );
+    expect(document.querySelector('[data-inkstone-note-composer]')).toBeNull();
     const loaded = await new SidecarRepository(store).listAnnotations('Composer Integration.md');
     expect(loaded.records).toHaveLength(1);
     expect(loaded.records[0]).toMatchObject({ id: 'draft-1', status: 'draft' });
+    expect(
+      document
+        .querySelector<HTMLButtonElement>('[data-inkstone-mark-type="note"]')
+        ?.getAttribute('aria-pressed'),
+    ).toBe('true');
     const textarea = document.querySelector<HTMLTextAreaElement>(
-      '[data-inkstone-note-composer] textarea',
+      '[data-inkstone-annotation-inspector] textarea[aria-label="Note"]',
     );
-    if (textarea === null) {
-      throw new Error('Composer did not provide a note field.');
-    }
-    textarea.value = 'Note-only annotations get a distinct anchor.';
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
-    document.querySelector<HTMLButtonElement>('button[aria-label="Close note"]')?.click();
-    await vi.waitFor(() => expect(root.querySelector('.inkstone-note-anchor')).not.toBeNull());
-    expect(root.querySelector('.inkstone-text-highlight')).toBeNull();
+    expect(document.activeElement).toBe(textarea);
+
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-inkstone-annotation-inspector]')).toBeNull(),
+    );
+    expect(
+      (await new SidecarRepository(store).listAnnotations('Composer Integration.md')).records,
+    ).toHaveLength(0);
     integration.dispose();
   });
 
@@ -376,6 +472,101 @@ describe('Reading View integration', () => {
         ?.style.getPropertyValue('--text-highlight-bg'),
     ).toBe('#a35a12');
     await expect(repository.readAnnotation('Custom Style.md', record.id)).resolves.toEqual(record);
+    integration.dispose();
+  });
+
+  it('keeps a deleted mark cleared when an older Reading View refresh resolves last', async () => {
+    const source = 'Refresh race target.';
+    const filePath = 'Refresh Race.md';
+    const store = new MemoryTextFileStore();
+    const service = new AnnotationService({
+      createId: () => 'annotation-race',
+      repository: new SidecarRepository(store),
+    });
+    const record = await service.createHighlight({
+      filePath,
+      selection: { end: 'Refresh'.length, scope: {}, start: 0 },
+      source,
+      styleId: 'highlight-sun',
+    });
+    const integration = new ReadingViewIntegration({ document, service });
+    const root = document.createElement('p');
+    root.textContent = source;
+    await integration.mountSection({
+      filePath,
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: source }),
+      root,
+    });
+    expect(root.querySelector('.inkstone-text-highlight')?.textContent).toBe('Refresh');
+
+    const staleResult = await service.resolveHighlights({ filePath, source });
+    await service.deleteAnnotation(filePath, record.id);
+    const freshResult = await service.resolveHighlights({ filePath, source });
+    let releaseStaleResult: ((result: ResolveHighlightsResult) => void) | undefined;
+    const delayedStaleResult = new Promise<ResolveHighlightsResult>((resolve) => {
+      releaseStaleResult = resolve;
+    });
+    const resolveHighlights = vi
+      .spyOn(service, 'resolveHighlights')
+      .mockReturnValueOnce(delayedStaleResult)
+      .mockResolvedValueOnce(freshResult);
+
+    const olderRefresh = integration.refreshAnnotations(filePath);
+    await vi.waitFor(() => expect(resolveHighlights).toHaveBeenCalledTimes(1));
+    const newerRefresh = integration.refreshAnnotations(filePath);
+    await newerRefresh;
+    expect(root.querySelector('.inkstone-text-highlight')).toBeNull();
+
+    releaseStaleResult?.(staleResult);
+    await olderRefresh;
+
+    expect(root.querySelector('.inkstone-text-highlight')).toBeNull();
+    integration.dispose();
+  });
+
+  it('invalidates an initial section render when deletion refreshes it before mount completes', async () => {
+    const source = 'Pending mount target.';
+    const filePath = 'Pending Mount.md';
+    const store = new MemoryTextFileStore();
+    const service = new AnnotationService({
+      createId: () => 'pending-mount-annotation',
+      repository: new SidecarRepository(store),
+    });
+    const record = await service.createHighlight({
+      filePath,
+      selection: { end: 'Pending'.length, scope: {}, start: 0 },
+      source,
+      styleId: 'highlight-sun',
+    });
+    const staleResult = await service.resolveHighlights({ filePath, source });
+    let releaseInitial: ((result: ResolveHighlightsResult) => void) | undefined;
+    const delayedInitial = new Promise<ResolveHighlightsResult>((resolve) => {
+      releaseInitial = resolve;
+    });
+    const resolveHighlights = vi
+      .spyOn(service, 'resolveHighlights')
+      .mockReturnValueOnce(delayedInitial);
+    const integration = new ReadingViewIntegration({ document, service });
+    const root = document.createElement('p');
+    root.textContent = source;
+
+    const mounting = integration.mountSection({
+      filePath,
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: source }),
+      root,
+    });
+    await vi.waitFor(() => expect(resolveHighlights).toHaveBeenCalledTimes(1));
+    await service.deleteAnnotation(filePath, record.id, record.revision);
+
+    await integration.refreshAnnotations(filePath);
+    expect(resolveHighlights).toHaveBeenCalledTimes(2);
+    expect(root.querySelector('.inkstone-text-highlight')).toBeNull();
+
+    releaseInitial?.(staleResult);
+    await mounting;
+    expect(root.querySelector('.inkstone-text-highlight')).toBeNull();
     integration.dispose();
   });
 
@@ -722,6 +913,11 @@ class MemoryTextFileStore implements TextFileStore {
 
   read(path: string): Promise<string | null> {
     return Promise.resolve(this.files.get(path) ?? null);
+  }
+
+  remove(path: string): Promise<void> {
+    this.files.delete(path);
+    return Promise.resolve();
   }
 
   write(path: string, contents: string): Promise<void> {

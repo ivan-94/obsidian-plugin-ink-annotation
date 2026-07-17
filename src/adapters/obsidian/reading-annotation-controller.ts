@@ -6,7 +6,11 @@ import { mapRenderedRangeToSource } from '../../domain/rendered-source-map';
 import { DEFAULT_STYLE_PRESETS, type StylePreset } from '../../domain/style-preset';
 import type { TextStructuralScope } from '../../domain/text-annotation';
 import type { TextAnnotationRecord } from '../../domain/text-annotation';
-import { QuickHighlightToolbar, type QuickToolbarAction } from '../../ui/quick-highlight-toolbar';
+import {
+  QuickHighlightToolbar,
+  type QuickToolbarAction,
+  type QuickToolbarLayout,
+} from '../../ui/quick-highlight-toolbar';
 import { renderHighlight } from '../../ui/reading-highlight-renderer';
 import { captureReadingSelection } from './reading-selection';
 
@@ -104,7 +108,9 @@ export class ReadingAnnotationController {
     ) => Promise<boolean>;
     readonly service: AnnotationService;
     readonly presets?: readonly StylePreset[];
+    readonly toolbarLayout?: QuickToolbarLayout;
   }) {
+    const mobileActionBar = input.toolbarLayout === 'mobile-action-bar';
     this.collapseSelection = input.collapseSelection;
     this.onCommitted = input.onCommitted ?? (() => undefined);
     this.onNoteDraft = input.onNoteDraft ?? (() => Promise.resolve());
@@ -119,12 +125,14 @@ export class ReadingAnnotationController {
     this.recentStyleId = defaultStyleId;
     this.toolbar = new QuickHighlightToolbar({
       document: input.document,
+      ...(input.toolbarLayout === undefined ? {} : { layout: input.toolbarLayout }),
       onAction: async (action) => this.commit(action),
       onDismiss: () => {
         const pending = this.pending;
         this.pending = null;
         if (pending !== null) {
-          focusReadingBlock(pending.block);
+          this.collapseSelection();
+          if (!mobileActionBar) focusReadingBlock(pending.block);
         }
       },
       onError: input.onIssue ?? (() => undefined),

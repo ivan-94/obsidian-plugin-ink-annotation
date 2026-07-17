@@ -17,13 +17,14 @@ this file, this file is authoritative.
 
 ## Product Decisions
 
-| ID        | Decision                                                                                                                                                                | Status            | Rationale                                                                                                                                    |
-| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| INK-V1-01 | Ink Mode uses one per-note fixed logical content width on a continuous vertical canvas with no pages or visible tiles.                                                  | Confirmed by user | Fixed width gives Ink a usable horizontal coordinate basis without committing v1 to a complete fixed document renderer.                      |
-| INK-V1-02 | The fixed-width workspace and coordinate-bound Ink overlay exist only while Ink Mode is active. Leaving Ink Mode restores Obsidian's normal view and hides the overlay. | Confirmed by user | Normal reading remains native to Obsidian; showing spatial Ink over a different responsive layout would imply alignment v1 cannot guarantee. |
-| INK-V1-03 | V1 does not automatically move, rebase, orphan, or reattach Ink after Markdown, font, theme, or other layout changes.                                                   | Confirmed by user | Content-aware spatial reconciliation is complex and can silently place Ink on the wrong content.                                             |
-| INK-V1-04 | Ink Mode provides transient Select/Move with single selection, additive multi-selection, and drag repositioning of the selected set.                                    | Confirmed by user | Manual correction is explicit, understandable, and keeps the user in control.                                                                |
-| INK-V1-05 | V1 fixes width only. Fixed typography, line metrics, theme, pagination, and a complete fixed document layout are deferred.                                              | Confirmed by user | The first release should validate the simpler model before freezing more of Obsidian's renderer.                                             |
+| ID        | Decision                                                                                                                                                                | Status            | Rationale                                                                                                                                      |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| INK-V1-01 | Ink Mode uses one per-note fixed logical content width on a continuous vertical canvas with no pages or visible tiles.                                                  | Confirmed by user | Fixed width gives Ink a usable horizontal coordinate basis without committing v1 to a complete fixed document renderer.                        |
+| INK-V1-02 | The fixed-width workspace and coordinate-bound Ink overlay exist only while Ink Mode is active. Leaving Ink Mode restores Obsidian's normal view and hides the overlay. | Confirmed by user | Normal reading remains native to Obsidian; showing spatial Ink over a different responsive layout would imply alignment v1 cannot guarantee.   |
+| INK-V1-03 | V1 does not automatically move, rebase, orphan, or reattach Ink after Markdown, font, theme, or other layout changes.                                                   | Confirmed by user | Content-aware spatial reconciliation is complex and can silently place Ink on the wrong content.                                               |
+| INK-V1-04 | Ink Mode provides transient Select/Move with single selection, additive multi-selection, and drag repositioning of the selected set.                                    | Confirmed by user | Manual correction is explicit, understandable, and keeps the user in control.                                                                  |
+| INK-V1-05 | V1 fixes width only. Fixed typography, line metrics, theme, pagination, and a complete fixed document layout are deferred.                                              | Confirmed by user | The first release should validate the simpler model before freezing more of Obsidian's renderer.                                               |
+| INK-V1-06 | Select/Move exposes a direct delete action only while one or more logical strokes are selected.                                                                         | Confirmed by user | Selection already establishes destructive intent; one undoable batch command is faster and safer than switching to the eraser for each stroke. |
 
 ## User-Visible Contract
 
@@ -83,6 +84,11 @@ This decision applies only to Ink. Compound text anchors continue to resolve, be
 - Desktop `Shift`/platform-modifier click toggles a stroke in the selection.
 - A visible `Multiple` control in Select/Move provides the same additive toggle without requiring a
   hardware keyboard.
+- Once at least one logical stroke is selected, the toolbar reveals `Delete selected Ink strokes`.
+  The action is absent from the active control set when selection is empty.
+- Delete removes the complete selected logical stroke IDs, including linked fragments in different
+  chunks, clears transient selection, and records the whole batch as one Undo/Redo command. It does
+  not require confirmation because Undo immediately restores the complete batch.
 - Clicking empty workspace clears the selection.
 - `Escape` cancels an active drag preview first, then clears the selection, then exits Ink Mode.
 
@@ -162,7 +168,7 @@ Invariants:
 The Ink dock order becomes:
 
 ```text
-Exit | Pen | Highlighter | Stroke eraser | Select/Move | Color | Width | Undo | Redo | More
+Exit | Pen | Highlighter | Stroke eraser | Select/Move | Multiple | Delete selected | Color | Width | Undo | Redo | More
 ```
 
 - Select/Move has a distinct icon, tooltip, accessible name, and pressed state.
@@ -191,6 +197,8 @@ Exit | Pen | Highlighter | Stroke eraser | Select/Move | Color | Width | Undo | 
   revision, or bytes.
 - One stroke and an additive multi-selection can each be dragged, cancelled, undone/redone, saved,
   and reconstructed after reload.
+- A selected single stroke or additive multi-selection can be deleted in one action; selection
+  clears, unrelated strokes remain, and one Undo restores the entire deleted set.
 - Cross-chunk movement preserves one logical stroke identity and visual/temporal continuity.
 - A multi-chunk write failure or stale revision never leaves a silent half-move and never discards
   the live result.
@@ -270,6 +278,8 @@ Exit | Pen | Highlighter | Stroke eraser | Select/Move | Color | Width | Undo | 
   single/multi-selection and dragging; full fixed layout deferred.
 - User instruction in the current Codex task: extract these new decisions into a new specification
   instead of accumulating them in the two historical master documents.
+- User request in the 2026-07-17 Codex conversation: once Select/Move has selected strokes, add a
+  direct delete button.
 - `docs/specs/2026-07-14-obsidian-annotation-plugin-design.md`
 - `docs/specs/2026-07-14-obsidian-annotation-plugin-execution-plan.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`

@@ -1,4 +1,5 @@
 import type { InkModeState } from '../domain/ink-mode-state';
+import { logicalStrokeIdsCoveredByPolygon } from '../domain/ink-closed-loop-erase';
 import type { InkPoint, InkStroke, InkSurfaceRecord } from '../domain/ink-surface';
 import { splitInkStrokeIntoSurfaceFragments } from '../domain/ink-surface-layout';
 import {
@@ -208,6 +209,16 @@ export class InkDocumentSession {
     return true;
   }
 
+  deleteSelectedStrokes(): readonly string[] {
+    const selectedStrokeIds = this.selectedStrokeIds();
+    if (selectedStrokeIds.length === 0) return [];
+    this.selectedStrokeIdsSet.clear();
+    this.selectionMovePreview = null;
+    const deletedStrokeIds = this.eraseLogicalStrokeIds(selectedStrokeIds);
+    if (deletedStrokeIds.length === 0) this.emit();
+    return deletedStrokeIds;
+  }
+
   previewSelectionMove(dx: number, dy: number): { readonly dx: number; readonly dy: number } {
     if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
       throw new Error('Ink selection translation must be finite.');
@@ -318,19 +329,36 @@ export class InkDocumentSession {
         (candidate) => distanceToStroke(point, candidate.points) <= radius + candidate.width / 2,
       );
     if (stroke === undefined) return null;
+    this.eraseLogicalStrokeIds([stroke.id]);
+    return stroke.id;
+  }
 
+  eraseStrokesInPolygon(polygon: readonly InkPoint[]): readonly string[] {
+    const strokeIds = logicalStrokeIdsCoveredByPolygon(this.snapshot().surface.strokes, polygon);
+    return this.eraseLogicalStrokeIds(strokeIds);
+  }
+
+  private eraseLogicalStrokeIds(strokeIds: readonly string[]): readonly string[] {
+    const uniqueStrokeIds = [...new Set(strokeIds)];
+    if (uniqueStrokeIds.length === 0) return [];
     const before = this.captureStrokeSets();
+    const identities = new Set(uniqueStrokeIds);
+    let changed = false;
     for (const bounded of this.bounded) {
       const current = bounded.session.snapshot().surface.strokes;
       const retained = current.filter(
-        (candidate) => (candidate.linkedStrokeId ?? candidate.id) !== stroke.id,
+        (candidate) => !identities.has(candidate.linkedStrokeId ?? candidate.id),
       );
-      if (retained.length !== current.length) bounded.session.replaceStrokes(retained);
+      if (retained.length !== current.length) {
+        bounded.session.replaceStrokes(retained);
+        changed = true;
+      }
     }
+    if (!changed) return [];
     this.undoStack.push({ after: this.captureStrokeSets(), before });
     this.redoStack.length = 0;
     this.emit();
-    return stroke.id;
+    return uniqueStrokeIds;
   }
 
   async background(): Promise<void> {
@@ -390,7 +418,7 @@ class CoalescingInkSurfaceWriter implements InkSurfaceWriter {
       record: InkSurfaceRecord;
       readonly waiters: Array<{
         readonly reject: (reason?: unknown) => void;
-        readonly resolve: () => void;
+        readonly resolve: (record?: InkSurfaceRecord) => void;
       }>;
     }
   >();
@@ -398,8 +426,11 @@ class CoalescingInkSurfaceWriter implements InkSurfaceWriter {
 
   constructor(private readonly target: InkSurfaceWriter) {}
 
-  updateSurface(record: InkSurfaceRecord, expectedBase?: InkSurfaceRecord): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
+  updateSurface(
+    record: InkSurfaceRecord,
+    expectedBase?: InkSurfaceRecord,
+  ): Promise<InkSurfaceRecord | void> {
+    return new Promise<InkSurfaceRecord | void>((resolve, reject) => {
       const existing = this.pending.get(record.id);
       if (existing === undefined) {
         this.pending.set(record.id, { expectedBase, record, waiters: [{ reject, resolve }] });
@@ -436,20 +467,24 @@ class CoalescingInkSurfaceWriter implements InkSurfaceWriter {
           (expectedBase): expectedBase is InkSurfaceRecord => expectedBase !== undefined,
         );
         try {
+          let committed: readonly (InkSurfaceRecord | undefined)[];
           if (records.length > 1 && this.target.updateSurfacesAtomically !== undefined) {
-            await this.target.updateSurfacesAtomically(
+            const batch = await this.target.updateSurfacesAtomically(
               records,
               hasEveryExpectedBase ? expectedBases : undefined,
             );
+            const byId = new Map(batch?.map((record) => [record.id, record]) ?? []);
+            committed = records.map(({ id }) => byId.get(id));
           } else {
-            await Promise.all(
+            const results = await Promise.all(
               records.map((record, index) =>
                 this.target.updateSurface(record, expectedBases[index]),
               ),
             );
+            committed = results.map((result) => result ?? undefined);
           }
-          for (const item of pending) {
-            for (const waiter of item.waiters) waiter.resolve();
+          for (const [index, item] of pending.entries()) {
+            for (const waiter of item.waiters) waiter.resolve(committed[index]);
           }
         } catch (error) {
           const blocked = [...this.pending.values()];

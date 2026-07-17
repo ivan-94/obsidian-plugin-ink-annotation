@@ -3,6 +3,7 @@ import {
   encodeInkSurfaceRecord,
   type InkSurfaceRecord,
 } from '../domain/ink-surface';
+import { planConcurrentInkAppendMerge } from '../domain/ink-concurrent-append-merge';
 
 interface LocalInkRecoveryCheckpointBase {
   readonly capturedAt: string;
@@ -291,7 +292,35 @@ export function planLocalInkRecovery(
       continue;
     }
 
-    if (!sameRecord(persisted, expectedBase)) {
+    const appendMerge = planConcurrentInkAppendMerge({
+      base: expectedBase,
+      local: sameRecordContent(recovered, pendingAttempt)
+        ? pendingAttempt
+        : {
+            ...recovered,
+            revision: expectedBase.revision + 1,
+            updatedAt: pendingAttempt.updatedAt,
+          },
+      remote: persisted,
+    });
+    if (appendMerge.kind === 'merge') {
+      const candidate = { ...appendMerge.record, updatedAt: now };
+      records.push(candidate);
+      writes.push(candidate);
+      expectedBases.push(persisted);
+      continue;
+    }
+    if (appendMerge.kind === 'already-merged') {
+      records.push(appendMerge.record);
+      continue;
+    }
+
+    const effectiveExpectedBase = sameRecord(persisted, expectedBase)
+      ? expectedBase
+      : sameRecordExceptExpandedLogicalHeight(persisted, expectedBase)
+        ? persisted
+        : null;
+    if (effectiveExpectedBase === null) {
       return {
         kind: 'conflict',
         message: `Local Ink recovery surface ${recovered.id} diverged from its expected canonical base.`,
@@ -302,12 +331,12 @@ export function planLocalInkRecovery(
       ? pendingAttempt
       : {
           ...recovered,
-          revision: expectedBase.revision + 1,
+          revision: effectiveExpectedBase.revision + 1,
           updatedAt: now,
         };
     records.push(candidate);
     writes.push(candidate);
-    expectedBases.push(expectedBase);
+    expectedBases.push(effectiveExpectedBase);
   }
   return {
     expectedBases,
@@ -319,6 +348,20 @@ export function planLocalInkRecovery(
 
 function sameRecord(left: InkSurfaceRecord, right: InkSurfaceRecord): boolean {
   return encodeInkSurfaceRecord(left) === encodeInkSurfaceRecord(right);
+}
+
+function sameRecordExceptExpandedLogicalHeight(
+  canonical: InkSurfaceRecord,
+  checkpointBase: InkSurfaceRecord,
+): boolean {
+  if (checkpointBase.layout.logicalHeight <= canonical.layout.logicalHeight) return false;
+  return sameRecord(canonical, {
+    ...checkpointBase,
+    layout: {
+      ...checkpointBase.layout,
+      logicalHeight: canonical.layout.logicalHeight,
+    },
+  });
 }
 
 type EncodedCheckpoint =

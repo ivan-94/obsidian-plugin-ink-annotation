@@ -788,7 +788,11 @@ function VaultBulkDialog(
       }
       confirmLabel={dialog.kind === 'delete' ? 'Delete' : 'Apply'}
       danger={dialog.kind === 'delete'}
-      description={dialog.kind === 'delete' ? 'This action cannot be undone.' : undefined}
+      description={
+        dialog.kind === 'delete'
+          ? 'Deleted annotations can be restored for a short time.'
+          : undefined
+      }
       feedback={state.bulkFeedback.value}
       icon={dialog.kind === 'delete' ? 'trash-2' : dialog.kind === 'tags' ? 'tag' : 'scan-text'}
       onCancel={close}
@@ -854,6 +858,9 @@ function retainFailed(
   state.selectedKeys.value = new Set(
     failed.map((item) => `${item.noteId}\u0000${item.id}`).filter((key) => available.has(key)),
   );
+  state.bulkSelectionMode.value = failed.length > 0;
+  state.bulkFeedback.value =
+    failed.length === 0 ? null : `${failed.length} selected annotations could not be updated.`;
 }
 
 function updateFilter(

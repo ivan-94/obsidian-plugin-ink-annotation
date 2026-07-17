@@ -9,6 +9,7 @@ import type { InkSurfaceSummary } from '../domain/ink-surface-summary';
 import { inkSummaryToIndexEntry } from '../domain/vault-annotation-index';
 
 export interface CanonicalVaultAnnotationSource {
+  isSourceAvailable?(filePath: string): boolean;
   listAnnotations(filePath: string): Promise<{
     readonly conflicts: readonly RepositoryConflict[];
     readonly issues: readonly RepositoryIssue[];
@@ -28,6 +29,14 @@ export interface VaultIndexCachePort {
   } | null>;
   save(entries: readonly AnnotationIndexEntry[], generatedAt: string): Promise<void>;
 }
+
+export interface VaultIndexRebuildResult {
+  readonly indexed: number;
+  readonly issues: readonly RepositoryIssue[];
+  readonly status: 'committed' | 'superseded';
+}
+
+const MAX_REBUILD_ATTEMPTS = 2;
 
 export class VaultIndexBuilder {
   private readonly index: VaultAnnotationIndex;
@@ -71,76 +80,88 @@ export class VaultIndexBuilder {
       }) => void;
       readonly signal?: AbortSignal;
     } = {},
-  ): Promise<{ readonly indexed: number; readonly issues: readonly RepositoryIssue[] }> {
+  ): Promise<VaultIndexRebuildResult> {
     const concurrency = input.concurrency ?? 4;
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32) {
       throw new Error('Vault index concurrency must be an integer between 1 and 32.');
     }
-    throwIfAborted(input.signal);
-    const discovered = await this.source.listNotes();
-    const notes = [...discovered.notes].sort((left, right) =>
-      left.filePath.localeCompare(right.filePath),
-    );
-    const entries: AnnotationIndexEntry[] = [];
-    const issues: RepositoryIssue[] = [...discovered.issues];
-    let completed = 0;
-    let cursor = 0;
-    input.onProgress?.({ completed, total: notes.length });
+    for (let attempt = 0; attempt < MAX_REBUILD_ATTEMPTS; attempt += 1) {
+      throwIfAborted(input.signal);
+      const startVersion = this.index.isReady() ? this.index.version : null;
+      const discovered = await this.source.listNotes();
+      const notes = discovered.notes
+        .filter(
+          (note) =>
+            note.sourceMissingAt === undefined &&
+            (this.source.isSourceAvailable?.(note.filePath) ?? true),
+        )
+        .sort((left, right) => left.filePath.localeCompare(right.filePath));
+      const entries: AnnotationIndexEntry[] = [];
+      const issues: RepositoryIssue[] = [...discovered.issues];
+      let completed = 0;
+      let cursor = 0;
+      input.onProgress?.({ completed, total: notes.length });
 
-    const worker = async (): Promise<void> => {
-      while (true) {
-        throwIfAborted(input.signal);
-        const noteIndex = cursor;
-        cursor += 1;
-        const note = notes[noteIndex];
-        if (note === undefined) {
-          return;
-        }
-        const [loaded, inkSummaries] = await Promise.all([
-          this.source.listAnnotations(note.filePath),
-          this.source.listSurfaceSummaries(note.filePath),
-        ]);
-        throwIfAborted(input.signal);
-        issues.push(...loaded.issues);
-        const divergentIds = new Set(
-          loaded.conflicts
-            .filter((conflict) => conflict.kind === 'same-revision-divergence')
-            .map((conflict) => conflict.annotationId),
-        );
-        for (const record of loaded.records) {
-          if (record.deletedAt !== undefined) {
-            continue;
+      const worker = async (): Promise<void> => {
+        while (true) {
+          throwIfAborted(input.signal);
+          const noteIndex = cursor;
+          cursor += 1;
+          const note = notes[noteIndex];
+          if (note === undefined) {
+            return;
           }
-          const styleId = record.mark?.styleId;
-          const resolvedStyleName = styleId === undefined ? undefined : this.styleName(styleId);
-          entries.push(
-            textRecordToIndexEntry(record, {
-              conflict: divergentIds.has(record.id),
-              ...(resolvedStyleName === undefined ? {} : { styleName: resolvedStyleName }),
-            }),
+          const [loaded, inkSummaries] = await Promise.all([
+            this.source.listAnnotations(note.filePath),
+            this.source.listSurfaceSummaries(note.filePath),
+          ]);
+          throwIfAborted(input.signal);
+          issues.push(...loaded.issues);
+          const divergentIds = new Set(
+            loaded.conflicts
+              .filter((conflict) => conflict.kind === 'same-revision-divergence')
+              .map((conflict) => conflict.annotationId),
           );
-        }
-        for (const summary of inkSummaries) {
-          if (summary.deletedAt === undefined && summary.strokeCount > 0) {
-            entries.push(inkSummaryToIndexEntry(summary, note.noteId));
+          for (const record of loaded.records) {
+            if (record.deletedAt !== undefined) {
+              continue;
+            }
+            const styleId = record.mark?.styleId;
+            const resolvedStyleName = styleId === undefined ? undefined : this.styleName(styleId);
+            entries.push(
+              textRecordToIndexEntry(record, {
+                conflict: divergentIds.has(record.id),
+                ...(resolvedStyleName === undefined ? {} : { styleName: resolvedStyleName }),
+              }),
+            );
           }
+          for (const summary of inkSummaries) {
+            if (summary.deletedAt === undefined && summary.strokeCount > 0) {
+              entries.push(inkSummaryToIndexEntry(summary, note.noteId));
+            }
+          }
+          completed += 1;
+          input.onProgress?.({ completed, total: notes.length });
         }
-        completed += 1;
-        input.onProgress?.({ completed, total: notes.length });
-      }
-    };
+      };
 
-    await Promise.all(
-      Array.from({ length: Math.min(concurrency, Math.max(1, notes.length)) }, () => worker()),
-    );
-    throwIfAborted(input.signal);
-    this.index.rebuild(entries);
-    try {
-      await this.cache?.save(this.index.snapshot(), this.now());
-    } catch (error) {
-      this.onCacheIssue(error);
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, Math.max(1, notes.length)) }, () => worker()),
+      );
+      throwIfAborted(input.signal);
+      if (startVersion !== null && this.index.version !== startVersion) {
+        if (attempt + 1 < MAX_REBUILD_ATTEMPTS) continue;
+        return { indexed: this.index.snapshot().length, issues, status: 'superseded' };
+      }
+      this.index.rebuild(entries);
+      try {
+        await this.cache?.save(this.index.snapshot(), this.now());
+      } catch (error) {
+        this.onCacheIssue(error);
+      }
+      return { indexed: entries.length, issues, status: 'committed' };
     }
-    return { indexed: entries.length, issues };
+    throw new Error('Vault index rebuild exhausted its retry budget.');
   }
 }
 

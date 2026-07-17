@@ -29,7 +29,10 @@ import {
 } from '../../ui/sidebar/annotation-sidebar-app';
 import { createPreactIsland, type UiIsland } from '../../ui/runtime/mount-preact-island';
 import { AnnotationSidebarStore } from '../../ui/stores/annotation-sidebar-store';
-import type { AnnotationSidebarCommands } from './annotation-sidebar-commands';
+import type {
+  AnnotationSidebarCommands,
+  AnnotationSidebarDeletedItem,
+} from './annotation-sidebar-commands';
 
 export const ANNOTATION_SIDEBAR_VIEW_TYPE = 'inkstone-annotation-sidebar';
 
@@ -49,9 +52,12 @@ export class AnnotationSidebarView extends ItemView {
   private readonly sidebarIsland: UiIsland<AnnotationSidebarAppProps> =
     createPreactIsland(AnnotationSidebarApp);
   private readonly sidebarStore = new AnnotationSidebarStore();
+  private currentRefreshGeneration = 0;
   private readonly commands: Required<Pick<AnnotationSidebarCommands, 'closed' | 'issue'>> &
     Omit<AnnotationSidebarCommands, 'closed' | 'issue'>;
   private readonly conflictDialog: AnnotationConflictDialog;
+  private recentDeletion: readonly AnnotationSidebarDeletedItem[] = [];
+  private recentDeletionTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly inkRepository: InkSurfaceRepository;
   private readonly service: AnnotationService;
   private readonly stylePresets: readonly StylePreset[];
@@ -117,6 +123,9 @@ export class AnnotationSidebarView extends ItemView {
         this.vaultIndexFresh = false;
         void this.refreshVaultIndex();
       },
+      onRestoreRecentDeletion: () => {
+        void this.restoreRecentDeletion();
+      },
       onScopeChange: (scope) => {
         if (scope === 'current-file') {
           void this.showCurrentFile();
@@ -138,6 +147,7 @@ export class AnnotationSidebarView extends ItemView {
   override onClose(): Promise<void> {
     this.vaultBuildAbort?.abort();
     this.vaultBuildAbort = null;
+    this.clearRecentDeletion();
     this.currentComponent?.dispose();
     this.currentComponent = null;
     this.vaultComponent?.dispose();
@@ -169,6 +179,21 @@ export class AnnotationSidebarView extends ItemView {
     await this.refreshCurrentFile();
   }
 
+  async followActiveFile(): Promise<void> {
+    const filePath = this.commands.getCurrentFilePath();
+    if (this.sidebarStore.scope.value === 'entire-vault') {
+      if (this.sidebarStore.current.filePath.peek() !== filePath) this.currentFileStale = true;
+      return;
+    }
+    if (
+      this.currentComponent === null ||
+      (!this.currentFileStale && this.sidebarStore.current.filePath.peek() === filePath)
+    ) {
+      return;
+    }
+    await this.refreshCurrentFile();
+  }
+
   async refreshAfterCanonicalSidecarChange(): Promise<void> {
     this.currentFileStale = true;
     this.vaultIndexFresh = false;
@@ -177,6 +202,20 @@ export class AnnotationSidebarView extends ItemView {
       return;
     }
     await this.refreshCurrentFile();
+  }
+
+  async refreshAfterCanonicalMutation(filePath: string): Promise<void> {
+    const currentFilePath = this.commands.getCurrentFilePath();
+    if (this.currentCache?.filePath === filePath || currentFilePath === filePath) {
+      this.currentFileStale = true;
+    }
+    if (
+      this.sidebarStore.scope.value === 'current-file' &&
+      this.currentComponent !== null &&
+      currentFilePath === filePath
+    ) {
+      await this.refreshCurrentFile();
+    }
   }
 
   applyInkSurfaceChanged(record: InkSurfaceRecord): void {
@@ -260,17 +299,11 @@ export class AnnotationSidebarView extends ItemView {
         );
       },
       onBulkDelete: async (selection) => {
-        const textSelection = selection.filter((item) => item.type !== 'ink');
-        const inkSelection = selection.filter((item) => item.type === 'ink');
-        const [textOutcome, inkOutcome] = await Promise.all([
-          this.service.bulkDelete(textSelection),
-          this.commands.bulkDeleteInk(inkSelection),
-        ]);
-        await this.refreshCurrentFile();
-        const failed = [...textOutcome.failed, ...inkOutcome.failed];
+        const outcome = await this.commands.bulkDelete(selection);
+        this.showRecentDeletion(outcome.succeeded);
         return {
           failed: selection.filter((item) =>
-            failed.some(
+            outcome.failed.some(
               (candidate) => candidate.filePath === item.filePath && candidate.id === item.id,
             ),
           ),
@@ -292,17 +325,19 @@ export class AnnotationSidebarView extends ItemView {
         this.commands.exportVaultEntries(entries.flat(), invoker);
       },
       onEntireVault: () => this.showEntireVault(),
-      onDeleteAnnotation: (annotationId) => {
-        const filePath = this.commands.getCurrentFilePath();
-        if (filePath !== null) {
-          void this.commands.deleteAnnotation(filePath, annotationId).catch(this.commands.issue);
-        }
-      },
-      onDeleteInk: (surfaceId) => {
+      onDeleteAnnotation: (annotationId, expectedRevision) => {
         const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
           void this.commands
-            .deleteInk(filePath, surfaceId)
+            .deleteAnnotation(filePath, annotationId, expectedRevision)
+            .catch(this.commands.issue);
+        }
+      },
+      onDeleteInk: (surfaceId, expectedRevision) => {
+        const filePath = this.commands.getCurrentFilePath();
+        if (filePath !== null) {
+          void this.commands
+            .deleteInk(filePath, surfaceId, expectedRevision)
             .then(() => this.refreshCurrentFile(), this.commands.issue);
         }
       },
@@ -346,11 +381,11 @@ export class AnnotationSidebarView extends ItemView {
           }),
       onRetry: () => void this.refreshCurrentFile(),
       onReviewConflicts: (invoker) => this.showConflictDialog(invoker),
-      onRestoreInk: (surfaceId) => {
+      onRestoreInk: (surfaceId, expectedRevision) => {
         const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
           void this.commands
-            .restoreInk(filePath, surfaceId)
+            .restoreInk(filePath, surfaceId, expectedRevision)
             .then(() => this.refreshCurrentFile(), this.commands.issue);
         }
       },
@@ -384,6 +419,7 @@ export class AnnotationSidebarView extends ItemView {
     if (component === null) {
       return;
     }
+    const generation = ++this.currentRefreshGeneration;
     const filePath = this.commands.getCurrentFilePath();
     this.sidebarStore.current.filePath.value = filePath;
     if (filePath === null) {
@@ -396,17 +432,22 @@ export class AnnotationSidebarView extends ItemView {
       }
       return;
     }
-    this.sidebarStore.current.status.value = 'loading';
+    if (
+      this.sidebarStore.current.status.peek() !== 'ready' ||
+      this.currentCache?.filePath !== filePath
+    ) {
+      this.sidebarStore.current.status.value = 'loading';
+    }
     try {
       const [loaded, inkSummaries] = await Promise.all([
         this.service.listCurrentFile(filePath),
         this.inkRepository.listSurfaceSummaries(filePath),
       ]);
-      if (this.currentComponent !== component) {
+      if (this.currentComponent !== component || generation !== this.currentRefreshGeneration) {
         return;
       }
       loaded.issues.forEach(this.commands.issue);
-      this.currentConflicts = loaded.conflicts.filter(
+      const currentConflicts = loaded.conflicts.filter(
         (conflict) => conflict.kind === 'same-revision-divergence',
       );
       const inkConflicts = inkSummaries.some((summary) => summary.conflict === true)
@@ -414,17 +455,19 @@ export class AnnotationSidebarView extends ItemView {
             (conflict) => conflict.kind === 'same-revision-divergence',
           )
         : [];
-      if (this.currentComponent !== component) return;
+      if (this.currentComponent !== component || generation !== this.currentRefreshGeneration)
+        return;
+      this.currentConflicts = currentConflicts;
       this.currentInkConflicts = inkConflicts;
       const health = {
-        conflictCount: this.currentConflicts.length + this.currentInkConflicts.length,
+        conflictCount: currentConflicts.length + inkConflicts.length,
         readIssueCount: loaded.issues.filter((issue) => issue.kind === 'corrupt-record').length,
       };
       this.currentCache = { filePath, health, inkSummaries, model: loaded.model };
       this.currentFileStale = false;
       component.render(loaded.model, health, inkSummaries);
     } catch (error) {
-      if (this.currentComponent !== component) {
+      if (this.currentComponent !== component || generation !== this.currentRefreshGeneration) {
         return;
       }
       this.commands.issue(error);
@@ -497,24 +540,18 @@ export class AnnotationSidebarView extends ItemView {
         );
       },
       onBulkDelete: async (selection) => {
-        const textSelection = selection.filter((item) => item.type !== 'ink');
-        const inkSelection = selection.filter((item) => item.type === 'ink');
-        const [textOutcome, inkOutcome] = await Promise.all([
-          this.service.bulkDelete(textSelection),
-          this.commands.bulkDeleteInk(inkSelection),
-        ]);
-        for (const record of textOutcome.succeeded) {
-          this.vaultIndex.remove({
-            expectedRevision: record.revision - 1,
+        const outcome = await this.commands.bulkDelete(selection);
+        for (const record of outcome.succeeded) {
+          if (record.noteId === undefined) continue;
+          this.vaultIndex.removeAtOrBelow({
             id: record.id,
+            maximumRevision: record.deletedRevision - 1,
             noteId: record.noteId,
           });
         }
+        this.showRecentDeletion(outcome.succeeded);
         return {
-          failed: [
-            ...retainFailures(textSelection, textOutcome.failed),
-            ...retainFailures(inkSelection, inkOutcome.failed),
-          ],
+          failed: retainFailures(selection, outcome.failed),
         };
       },
       onCurrentFile: () => this.showCurrentFile(),
@@ -586,7 +623,7 @@ export class AnnotationSidebarView extends ItemView {
       } else {
         component.showBuilding({ completed: 0, total: 0 });
       }
-      await this.vaultIndexBuilder.rebuild({
+      const rebuild = await this.vaultIndexBuilder.rebuild({
         onProgress: (progress) => {
           if (!abort.signal.aborted && !hasUsableIndex && this.vaultComponent === component) {
             component.showBuilding(progress);
@@ -595,7 +632,7 @@ export class AnnotationSidebarView extends ItemView {
         signal: abort.signal,
       });
       if (!abort.signal.aborted && this.vaultComponent === component) {
-        this.vaultIndexFresh = true;
+        this.vaultIndexFresh = rebuild.status !== 'superseded';
         component.showReady();
       }
     } catch (error) {
@@ -675,6 +712,80 @@ export class AnnotationSidebarView extends ItemView {
       },
     });
   }
+
+  private showRecentDeletion(items: readonly AnnotationSidebarDeletedItem[]): void {
+    if (items.length === 0) return;
+    const now = Date.now();
+    const currentState = this.sidebarStore.recentDeletion.peek();
+    const previousItems =
+      currentState !== null && !currentState.pending && currentState.expiresAt > now
+        ? this.recentDeletion
+        : [];
+    this.recentDeletion = mergeDeletedItems(previousItems, items);
+    this.scheduleRecentDeletionExpiry({
+      count: this.recentDeletion.length,
+      error: null,
+      expiresAt: now + 5_000,
+      pending: false,
+    });
+  }
+
+  private async restoreRecentDeletion(): Promise<void> {
+    const receipt = this.recentDeletion;
+    if (receipt.length === 0 || this.sidebarStore.recentDeletion.peek()?.pending === true) return;
+    if (this.recentDeletionTimer !== null) {
+      clearTimeout(this.recentDeletionTimer);
+      this.recentDeletionTimer = null;
+    }
+    this.sidebarStore.recentDeletion.value = {
+      count: receipt.length,
+      error: null,
+      expiresAt: Number.POSITIVE_INFINITY,
+      pending: true,
+    };
+    try {
+      const outcome = await this.commands.restoreDeleted(receipt);
+      if (this.recentDeletion !== receipt) return;
+      if (outcome.failed.length === 0) {
+        this.clearRecentDeletion();
+        return;
+      }
+      this.recentDeletion = outcome.failed;
+      this.scheduleRecentDeletionExpiry({
+        count: outcome.failed.length,
+        error: `${outcome.failed.length} ${outcome.failed.length === 1 ? 'annotation' : 'annotations'} could not be restored.`,
+        expiresAt: Date.now() + 5_000,
+        pending: false,
+      });
+    } catch (error) {
+      if (this.recentDeletion !== receipt) return;
+      this.scheduleRecentDeletionExpiry({
+        count: receipt.length,
+        error: error instanceof Error ? error.message : String(error),
+        expiresAt: Date.now() + 5_000,
+        pending: false,
+      });
+      this.commands.issue(error);
+    }
+  }
+
+  private scheduleRecentDeletionExpiry(state: {
+    readonly count: number;
+    readonly error: string | null;
+    readonly expiresAt: number;
+    readonly pending: boolean;
+  }): void {
+    if (this.recentDeletionTimer !== null) clearTimeout(this.recentDeletionTimer);
+    this.sidebarStore.recentDeletion.value = state;
+    this.recentDeletionTimer = setTimeout(() => this.clearRecentDeletion(), 5_000);
+  }
+
+  private clearRecentDeletion(): void {
+    if (this.recentDeletionTimer !== null) clearTimeout(this.recentDeletionTimer);
+    this.recentDeletionTimer = null;
+    this.recentDeletion = [];
+    this.sidebarStore.recentDeletion.value = null;
+  }
 }
 
 function replaceInkSummary(
@@ -684,6 +795,20 @@ function replaceInkSummary(
   const index = summaries.findIndex((summary) => summary.id === replacement.id);
   if (index < 0) return [...summaries, replacement];
   return summaries.map((summary, position) => (position === index ? replacement : summary));
+}
+
+function mergeDeletedItems(
+  current: readonly AnnotationSidebarDeletedItem[],
+  added: readonly AnnotationSidebarDeletedItem[],
+): readonly AnnotationSidebarDeletedItem[] {
+  const merged = new Map<string, AnnotationSidebarDeletedItem>();
+  for (const item of [...current, ...added]) {
+    merged.set(
+      `${item.type}\u0000${item.filePath}\u0000${item.id}\u0000${item.deletedRevision}`,
+      item,
+    );
+  }
+  return [...merged.values()];
 }
 
 function storageFailureMessage(error: unknown): string {

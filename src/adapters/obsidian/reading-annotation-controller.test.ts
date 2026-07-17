@@ -224,6 +224,58 @@ describe('Reading annotation controller', () => {
     expect(document.querySelector('[data-inkstone-quick-toolbar]')).toBeNull();
   });
 
+  it('clears the native selection when an outside tap dismisses the mobile action bar', async () => {
+    const store = new MemoryTextFileStore();
+    const { range, root } = selectionFixture();
+    document.getSelection()?.removeAllRanges();
+    document.getSelection()?.addRange(range);
+    const controller = new ReadingAnnotationController({
+      collapseSelection: () => document.getSelection()?.removeAllRanges(),
+      document,
+      service: new AnnotationService({ repository: new SidecarRepository(store) }),
+      toolbarLayout: 'mobile-action-bar',
+    });
+    await showFixture(controller, range, root);
+    expect(document.getSelection()?.toString()).toBe('Mutable Markdown');
+
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    document.body.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+
+    expect(document.querySelector('[data-inkstone-quick-toolbar]')).toBeNull();
+    expect(document.getSelection()?.rangeCount).toBe(0);
+  });
+
+  it('keeps the mobile selection active while a native selection handle is dragged', async () => {
+    const store = new MemoryTextFileStore();
+    const { range, root } = selectionFixture();
+    document.getSelection()?.removeAllRanges();
+    document.getSelection()?.addRange(range);
+    const collapseSelection = vi.fn(() => document.getSelection()?.removeAllRanges());
+    const controller = new ReadingAnnotationController({
+      collapseSelection,
+      document,
+      service: new AnnotationService({ repository: new SidecarRepository(store) }),
+      toolbarLayout: 'mobile-action-bar',
+    });
+    await showFixture(controller, range, root);
+
+    document.body.dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, clientX: 20, clientY: 20, pointerId: 4 }),
+    );
+    document.body.dispatchEvent(
+      new PointerEvent('pointermove', { bubbles: true, clientX: 44, clientY: 20, pointerId: 4 }),
+    );
+    document.body.dispatchEvent(
+      new PointerEvent('pointerup', { bubbles: true, clientX: 44, clientY: 20, pointerId: 4 }),
+    );
+
+    expect(collapseSelection).not.toHaveBeenCalled();
+    expect(document.getSelection()?.toString()).toBe('Mutable Markdown');
+    expect(document.querySelector('[data-inkstone-quick-toolbar]')).not.toBeNull();
+    controller.dispose();
+    document.getSelection()?.removeAllRanges();
+  });
+
   it('persists and renders a simple cross-paragraph selection as block-local fragments', async () => {
     const source = 'First paragraph.\n\nSecond paragraph.';
     const store = new MemoryTextFileStore();

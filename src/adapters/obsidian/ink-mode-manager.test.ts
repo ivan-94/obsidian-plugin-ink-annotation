@@ -1,16 +1,27 @@
 // @vitest-environment jsdom
 
-import type { MarkdownView } from 'obsidian';
+import { MarkdownView } from 'obsidian';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { InkSurfaceRecord } from '../../domain/ink-surface';
+import { encodeInkSurfaceRecord, type InkSurfaceRecord } from '../../domain/ink-surface';
+import type { InkSurfaceSummary } from '../../domain/ink-surface-summary';
 import { ObsidianInkModeManager } from './ink-mode-manager';
+
+interface LoadedInkSurfacesForTest {
+  readonly conflicts: readonly [];
+  readonly issues: readonly [];
+  readonly records: readonly InkSurfaceRecord[];
+}
 
 vi.mock('obsidian', () => ({
   MarkdownView: class {},
   Notice: class {},
-  setIcon: () => undefined,
-  setTooltip: () => undefined,
+  setIcon: (element: HTMLElement, icon: string) => {
+    element.dataset.icon = icon;
+  },
+  setTooltip: (element: HTMLElement, tooltip: string) => {
+    element.dataset.tooltip = tooltip;
+  },
 }));
 
 afterEach(() => {
@@ -20,7 +31,129 @@ afterEach(() => {
   );
 });
 
+function menuRecorder<Item extends { icon?: string; onClick?: () => void; title?: string }>(
+  items: Item[],
+) {
+  return {
+    addItem(configure: (item: unknown) => void) {
+      const record: Item = {} as Item;
+      const item = {
+        onClick(callback: () => void) {
+          record.onClick = callback;
+          return item;
+        },
+        setIcon(icon: string) {
+          record.icon = icon;
+          return item;
+        },
+        setSection() {
+          return item;
+        },
+        setTitle(title: string) {
+          record.title = title;
+          return item;
+        },
+      };
+      configure(item);
+      items.push(record);
+    },
+  };
+}
+
 describe('Obsidian Ink Mode action', () => {
+  it('locates Ink in the current Markdown file without reopening that file', async () => {
+    const file = { path: 'Ink.md' };
+    const view = Object.assign(new MarkdownView({} as never), {
+      contentEl: document.createElement('div'),
+      file,
+    });
+    const openFile = vi.fn(() => Promise.resolve());
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { getFileByPath: () => file },
+        workspace: { getLeaf: () => ({ openFile, view }), getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+
+    await manager.navigateToSurface(inkSummary());
+
+    expect(openFile).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it('presents Raw without Ink as an explicit start action instead of a toggle', () => {
+    const action = document.createElement('button');
+    let registeredIcon = '';
+    let registeredTitle = '';
+    const view = {
+      addAction: (icon: string, title: string): HTMLElement => {
+        registeredIcon = icon;
+        registeredTitle = title;
+        return action;
+      },
+      contentEl: document.createElement('div'),
+    } as unknown as MarkdownView;
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+
+    manager.registerView(view);
+
+    expect(registeredIcon).toBe('paintbrush');
+    expect(registeredTitle).toBe('开始涂鸦');
+    expect(action.dataset.icon).toBe('paintbrush');
+    expect(action.dataset.tooltip).toBe('开始涂鸦');
+    expect(action.getAttribute('aria-label')).toBe('开始涂鸦');
+    expect(action.hasAttribute('aria-pressed')).toBe(false);
+    manager.dispose();
+  });
+
+  it('keeps Ink discovery and controls dormant until the Markdown view enters Reading View', async () => {
+    let mode = 'source';
+    const action = document.createElement('button');
+    const addAction = vi.fn(() => action);
+    const listSurfaceSummaries = vi.fn(() => Promise.resolve([{ strokeCount: 1 }]));
+    const view = {
+      addAction,
+      contentEl: document.createElement('div'),
+      file: { path: 'Ink.md' },
+      getMode: () => mode,
+    } as unknown as MarkdownView;
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { listSurfaceSummaries } as never,
+      preferenceStore: {} as never,
+      showInkPreviewByDefault: true,
+      textRepository: {} as never,
+    });
+
+    manager.registerView(view);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(addAction).not.toHaveBeenCalled();
+    expect(listSurfaceSummaries).not.toHaveBeenCalled();
+
+    mode = 'preview';
+    manager.registerView(view);
+
+    await vi.waitFor(() => expect(listSurfaceSummaries).toHaveBeenCalledOnce());
+    expect(addAction).toHaveBeenCalledOnce();
+    expect(action.hidden).toBe(false);
+    manager.dispose();
+  });
+
   it('refreshes the active Ink attachment when Obsidian reports a layout change', async () => {
     const contentEl = document.createElement('div');
     const view = {
@@ -140,7 +273,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Ink.md',
-      session: {},
+      session: { snapshot: () => ({ surface: { strokes: [] } }) },
     });
     privateManager.ensureMounted = ensureMounted;
 
@@ -182,7 +315,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Old.md',
-      session: {},
+      session: { snapshot: () => ({ surface: { strokes: [] } }) },
     });
 
     file = { path: 'New.md' };
@@ -197,8 +330,9 @@ describe('Obsidian Ink Mode action', () => {
 
   it('flushes and detaches active Ink when the same Markdown view leaves Reading View', async () => {
     let mode = 'preview';
+    const action = document.createElement('button');
     const view = {
-      addAction: () => document.createElement('button'),
+      addAction: () => action,
       contentEl: document.createElement('div'),
       file: { path: 'Ink.md' },
       getMode: () => mode,
@@ -223,15 +357,92 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Ink.md',
-      session: {},
+      session: { snapshot: () => ({ surface: { strokes: [] } }) },
     });
 
     mode = 'source';
     manager.registerView(view);
 
+    expect(action.hidden).toBe(true);
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith('raw'));
     expect(dispose).toHaveBeenCalledTimes(1);
     expect(privateManager.activeView).toBeNull();
+    manager.dispose();
+  });
+
+  it('uses a programmatic Ink toggle in editing mode only to flush a stale active session', async () => {
+    const view = {
+      contentEl: document.createElement('div'),
+      file: { path: 'Ink.md' },
+      getMode: () => 'source',
+    } as unknown as MarkdownView;
+    const exit = vi.fn(() => Promise.resolve());
+    const dispose = vi.fn();
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { reclaimEmptySurfaces: () => Promise.resolve([]) } as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = view;
+    privateManager.mounted.set(view, {
+      complete: true,
+      controller: { dispose, exit },
+      filePath: 'Ink.md',
+      session: { snapshot: () => ({ surface: { strokes: [{ id: 'saved' }] } }) },
+    });
+
+    await manager.toggle(view);
+
+    expect(exit).toHaveBeenCalledWith('raw');
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(privateManager.activeView).toBeNull();
+    manager.dispose();
+  });
+
+  it('detaches a passive Ink preview when the Markdown view enters editing mode', async () => {
+    let mode = 'preview';
+    const action = document.createElement('button');
+    const view = {
+      addAction: () => action,
+      contentEl: document.createElement('div'),
+      file: { path: 'Ink.md' },
+      getMode: () => mode,
+    } as unknown as MarkdownView;
+    const dispose = vi.fn();
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+    manager.registerView(view);
+    const privateManager = manager as unknown as {
+      mounted: Map<MarkdownView, unknown>;
+      previewViews: Set<MarkdownView>;
+    };
+    privateManager.mounted.set(view, {
+      complete: true,
+      controller: { dispose },
+      filePath: 'Ink.md',
+      session: {},
+    });
+    privateManager.previewViews.add(view);
+
+    mode = 'source';
+    manager.registerView(view);
+
+    expect(action.hidden).toBe(true);
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+    expect(privateManager.mounted.has(view)).toBe(false);
     manager.dispose();
   });
 
@@ -313,7 +524,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Old.md',
-      session: {},
+      session: { snapshot: () => ({ surface: { strokes: [] } }) },
     });
 
     manager.registerView(view);
@@ -576,6 +787,91 @@ describe('Obsidian Ink Mode action', () => {
     getContext.mockRestore();
   });
 
+  it('saves after reopening canonical Ink on a taller rendered document', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const canonical = inkSurface('Ink.md');
+    let persisted = canonical;
+    const updateSurface = vi.fn(
+      (record: InkSurfaceRecord, expectedBase?: InkSurfaceRecord): Promise<void> => {
+        if (
+          expectedBase === undefined ||
+          encodeInkSurfaceRecord(expectedBase) !== encodeInkSurfaceRecord(persisted)
+        ) {
+          return Promise.reject(new Error('Ink surface changed since the expected base was read.'));
+        }
+        persisted = record;
+        return Promise.resolve();
+      },
+    );
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_800));
+    const view = {
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () => Promise.resolve({ conflicts: [], records: [canonical] }),
+        updateSurface,
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      recoveryStore: {
+        claim: () => undefined,
+        clear: () => undefined,
+        load: () => null,
+        save: () => 'generation-a',
+      },
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: canonical.noteId }),
+      } as never,
+    });
+    const mounted = await (
+      manager as unknown as {
+        mountView: (
+          view: MarkdownView,
+          createIfMissing: boolean,
+        ) => Promise<{
+          session: {
+            addStroke: (stroke: InkSurfaceRecord['strokes'][number]) => void;
+            background: () => Promise<void>;
+          };
+        }>;
+      }
+    ).mountView(view, true);
+
+    mounted.session.addStroke(inkStroke('after-transient-extent'));
+    await mounted.session.background();
+
+    const [savedRecord, savedExpectedBase] = updateSurface.mock.calls[0] ?? [];
+    expect(savedRecord).toMatchObject({
+      layout: { logicalHeight: 1_800 },
+      revision: 2,
+    });
+    expect(savedExpectedBase).toBe(canonical);
+    expect(persisted).toMatchObject({
+      layout: { logicalHeight: 1_800 },
+      revision: 2,
+      strokes: [
+        canonical.strokes[0],
+        expect.objectContaining({ linkedStrokeId: 'after-transient-extent' }),
+      ],
+    });
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
   it('opens existing Ink in preview when the default preview preference is enabled', async () => {
     const contentEl = document.createElement('div');
     const action = document.createElement('button');
@@ -606,9 +902,265 @@ describe('Obsidian Ink Mode action', () => {
     await vi.waitFor(() => expect(showPreview).toHaveBeenCalledTimes(1));
 
     expect(ensureMounted).toHaveBeenCalledWith(view, false);
-    expect(action.getAttribute('aria-label')).toBe('Edit Ink');
+    expect(action.dataset.icon).toBe('paintbrush');
+    expect(action.dataset.tooltip).toBe('正在预览涂鸦 · 编辑');
+    expect(action.getAttribute('aria-label')).toBe('正在预览涂鸦 · 编辑');
+    expect(action.hasAttribute('aria-pressed')).toBe(false);
     expect(action.classList.contains('is-preview')).toBe(true);
     manager.dispose();
+  });
+
+  it('presents hidden Ink as Show Preview and opens Preview instead of Edit', async () => {
+    const action = document.createElement('button');
+    const view = {
+      addAction: (_icon: string, _title: string, callback: (event: MouseEvent) => void) => {
+        action.addEventListener('click', callback);
+        return action;
+      },
+      contentEl: document.createElement('div'),
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const showPreview = vi.fn();
+    const enter = vi.fn();
+    const mounted = {
+      complete: true,
+      controller: { dispose: vi.fn(), enter, showPreview },
+      filePath: 'Ink.md',
+      session: {},
+    };
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaceSummaries: () => Promise.resolve([{ deletedAt: undefined, strokeCount: 2 }]),
+      } as never,
+      preferenceStore: {} as never,
+      showInkPreviewByDefault: false,
+      textRepository: {} as never,
+    });
+    (
+      manager as unknown as {
+        ensureMounted: () => Promise<typeof mounted>;
+        mounted: Map<MarkdownView, typeof mounted>;
+      }
+    ).ensureMounted = vi.fn(() => {
+      (
+        manager as unknown as {
+          mounted: Map<MarkdownView, typeof mounted>;
+        }
+      ).mounted.set(view, mounted);
+      return Promise.resolve(mounted);
+    });
+
+    manager.registerView(view);
+
+    await vi.waitFor(() => expect(action.dataset.icon).toBe('eye'));
+    expect(action.classList.contains('has-hidden-ink')).toBe(true);
+    expect(action.dataset.tooltip).toBe('涂鸦已隐藏 · 显示预览');
+    expect(action.getAttribute('aria-label')).toBe('涂鸦已隐藏 · 显示预览');
+    action.click();
+    await vi.waitFor(() => expect(showPreview).toHaveBeenCalledTimes(1));
+
+    expect(enter).not.toHaveBeenCalled();
+    expect(action.classList.contains('is-preview')).toBe(true);
+    manager.dispose();
+  });
+
+  it('does not let a stale derived summary claim that canonical Ink still exists', async () => {
+    const action = document.createElement('button');
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_200));
+    const view = {
+      addAction: () => action,
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaceSummaries: () => Promise.resolve([{ strokeCount: 1 }]),
+        listSurfaces: () => Promise.resolve({ conflicts: [], issues: [], records: [] }),
+      } as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+
+    manager.registerView(view);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(action.getAttribute('aria-label')).toBe('开始涂鸦');
+    expect(action.dataset.icon).toBe('paintbrush');
+    manager.dispose();
+  });
+
+  it('turns a stale Show Preview click into Start drawing when canonical Ink disappeared', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const action = document.createElement('button');
+    let activate!: () => void;
+    let hasCanonicalInk = true;
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_200));
+    const view = {
+      addAction: (_icon: string, _title: string, callback: () => void) => {
+        activate = callback;
+        return action;
+      },
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const writeSurface = vi.fn(() => Promise.resolve());
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: {
+          getActiveViewOfType: () => view,
+          getLeavesOfType: () => [],
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          Promise.resolve({
+            conflicts: [],
+            issues: [],
+            records: hasCanonicalInk ? [inkSurface('Ink.md')] : [],
+          }),
+        writeSurface,
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: 'note-a' }),
+      } as never,
+    });
+    manager.registerView(view);
+    await vi.waitFor(() => expect(action.getAttribute('aria-label')).toBe('涂鸦已隐藏 · 显示预览'));
+
+    hasCanonicalInk = false;
+    activate();
+
+    await vi.waitFor(() => expect(action.getAttribute('aria-label')).toBe('完成涂鸦并预览'));
+    expect(writeSurface).toHaveBeenCalled();
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
+  it('recomputes the next action when an existing Markdown view changes files', async () => {
+    const action = document.createElement('button');
+    let file = { path: 'Ink.md' };
+    const view = {
+      addAction: () => action,
+      contentEl: document.createElement('div'),
+      get file() {
+        return file;
+      },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const listSurfaceSummaries = vi.fn((filePath: string) =>
+      Promise.resolve(filePath === 'Ink.md' ? [{ strokeCount: 1 }] : []),
+    );
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { listSurfaceSummaries } as never,
+      preferenceStore: {} as never,
+      showInkPreviewByDefault: false,
+      textRepository: {} as never,
+    });
+    manager.registerView(view);
+    await vi.waitFor(() => expect(action.dataset.icon).toBe('eye'));
+
+    file = { path: 'Empty.md' };
+    manager.registerView(view);
+
+    await vi.waitFor(() => expect(listSurfaceSummaries).toHaveBeenCalledWith('Empty.md'));
+    expect(action.dataset.icon).toBe('paintbrush');
+    expect(action.getAttribute('aria-label')).toBe('开始涂鸦');
+    manager.dispose();
+  });
+
+  it('places Close Preview only in the native more-options menu and returns to hidden Raw', async () => {
+    const action = document.createElement('button');
+    const originalPaneMenu = vi.fn();
+    const view = {
+      addAction: () => action,
+      contentEl: document.createElement('div'),
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+      onPaneMenu: originalPaneMenu,
+    } as unknown as MarkdownView;
+    const dispose = vi.fn();
+    const hidePreview = vi.fn();
+    const showPreview = vi.fn();
+    const mounted = {
+      complete: true,
+      controller: { dispose, hidePreview, showPreview },
+      filePath: 'Ink.md',
+      session: {},
+    };
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaceSummaries: () => Promise.resolve([{ deletedAt: undefined, strokeCount: 2 }]),
+      } as never,
+      preferenceStore: {} as never,
+      showInkPreviewByDefault: true,
+      textRepository: {} as never,
+    });
+    (
+      manager as unknown as {
+        ensureMounted: () => Promise<typeof mounted>;
+        mounted: Map<MarkdownView, typeof mounted>;
+      }
+    ).ensureMounted = vi.fn(() => {
+      (
+        manager as unknown as {
+          mounted: Map<MarkdownView, typeof mounted>;
+        }
+      ).mounted.set(view, mounted);
+      return Promise.resolve(mounted);
+    });
+    manager.registerView(view);
+    await vi.waitFor(() => expect(showPreview).toHaveBeenCalledTimes(1));
+
+    const tabItems: Array<{ title: string }> = [];
+    const moreItems: Array<{
+      icon: string;
+      onClick: () => void;
+      title: string;
+    }> = [];
+    view.onPaneMenu(menuRecorder(tabItems) as never, 'tab-header');
+    view.onPaneMenu(menuRecorder(moreItems) as never, 'more-options');
+
+    expect(originalPaneMenu).toHaveBeenCalledTimes(2);
+    expect(tabItems).toEqual([]);
+    expect(moreItems).toHaveLength(1);
+    expect(moreItems[0]).toMatchObject({ icon: 'eye-off', title: '关闭涂鸦预览' });
+    moreItems[0]?.onClick();
+    await vi.waitFor(() => expect(hidePreview).toHaveBeenCalledTimes(1));
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(action.dataset.icon).toBe('eye');
+    expect(action.getAttribute('aria-label')).toBe('涂鸦已隐藏 · 显示预览');
+    manager.registerView(view);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(showPreview).toHaveBeenCalledTimes(1);
+    manager.dispose();
+    expect(Reflect.get(view, 'onPaneMenu')).toBe(originalPaneMenu);
   });
 
   it('registers the Ink action without observing passive Reading DOM mutations', () => {
@@ -632,7 +1184,7 @@ describe('Obsidian Ink Mode action', () => {
     manager.dispose();
   });
 
-  it('uses a distinct paintbrush icon and deduplicates an in-flight toggle', async () => {
+  it('shows progress while entering and presents Edit as an explicit completion action', async () => {
     const contentEl = document.createElement('div');
     const action = document.createElement('button');
     let registeredIcon = '';
@@ -676,7 +1228,10 @@ describe('Obsidian Ink Mode action', () => {
     await vi.waitFor(() => expect(ensureMounted).toHaveBeenCalledTimes(1));
     expect(action.classList.contains('is-pending')).toBe(true);
     expect(action.getAttribute('aria-busy')).toBe('true');
-    expect(action.getAttribute('aria-label')).toBe('Opening Ink Mode…');
+    expect(action.getAttribute('aria-disabled')).toBe('true');
+    expect(action.hasAttribute('disabled')).toBe(true);
+    expect(action.dataset.icon).toBe('loader-circle');
+    expect(action.getAttribute('aria-label')).toBe('正在打开涂鸦…');
 
     const mounted = {
       controller: {
@@ -698,7 +1253,59 @@ describe('Obsidian Ink Mode action', () => {
     expect(enter).toHaveBeenCalledTimes(1);
     expect(action.classList.contains('is-pending')).toBe(false);
     expect(action.getAttribute('aria-busy')).toBe('false');
-    expect(action.getAttribute('aria-pressed')).toBe('true');
+    expect(action.getAttribute('aria-disabled')).toBe('false');
+    expect(action.hasAttribute('disabled')).toBe(false);
+    expect(action.dataset.icon).toBe('check');
+    expect(action.dataset.tooltip).toBe('完成涂鸦并预览');
+    expect(action.getAttribute('aria-label')).toBe('完成涂鸦并预览');
+    expect(action.hasAttribute('aria-pressed')).toBe(false);
+    manager.dispose();
+  });
+
+  it('keeps Edit visible after a failed completion save and turns the action into Retry', async () => {
+    const action = document.createElement('button');
+    const view = {
+      addAction: () => action,
+      contentEl: document.createElement('div'),
+    } as unknown as MarkdownView;
+    const saveError = new Error('disk unavailable');
+    const exit = vi.fn().mockRejectedValueOnce(saveError).mockResolvedValueOnce(undefined);
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { reclaimEmptySurfaces: () => Promise.resolve([]) } as never,
+      preferenceStore: {} as never,
+      showInkPreviewByDefault: true,
+      textRepository: {} as never,
+    });
+    manager.registerView(view);
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = view;
+    privateManager.mounted.set(view, {
+      complete: true,
+      controller: { dispose: vi.fn(), exit },
+      filePath: 'Ink.md',
+      session: { snapshot: () => ({ surface: { strokes: [{ id: 'saved' }] } }) },
+    });
+
+    await expect(manager.toggle(view)).rejects.toBe(saveError);
+
+    expect(privateManager.activeView).toBe(view);
+    expect(action.dataset.icon).toBe('rotate-ccw');
+    expect(action.dataset.tooltip).toBe('保存失败 · 重试');
+    expect(action.getAttribute('aria-label')).toBe('保存失败 · 重试');
+    expect(action.hasAttribute('aria-pressed')).toBe(false);
+
+    await manager.toggle(view);
+
+    expect(exit).toHaveBeenCalledTimes(2);
+    expect(privateManager.activeView).toBeNull();
+    expect(action.dataset.icon).toBe('paintbrush');
+    expect(action.getAttribute('aria-label')).toBe('正在预览涂鸦 · 编辑');
     manager.dispose();
   });
 
@@ -805,7 +1412,7 @@ describe('Obsidian Ink Mode action', () => {
     expect(exit).toHaveBeenNthCalledWith(2, 'raw');
     expect(privateManager.activeView).toBeNull();
     expect(dispose).toHaveBeenCalledTimes(1);
-    expect(action.getAttribute('aria-pressed')).toBe('false');
+    expect(action.hasAttribute('aria-pressed')).toBe(false);
     manager.dispose();
   });
 
@@ -1670,6 +2277,67 @@ describe('Obsidian Ink Mode action', () => {
     manager.dispose();
   });
 
+  it('recomputes the primary action from canonical Ink after a whole-surface deletion', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const action = document.createElement('button');
+    let activate!: () => void;
+    let hasCanonicalInk = true;
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_200));
+    const view = {
+      addAction: (_icon: string, _title: string, callback: () => void) => {
+        activate = callback;
+        return action;
+      },
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const writeSurface = vi.fn(() => Promise.resolve());
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: {
+          getActiveViewOfType: () => view,
+          getLeavesOfType: () => [],
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          Promise.resolve({
+            conflicts: [],
+            issues: [],
+            records: hasCanonicalInk ? [inkSurface('Ink.md')] : [],
+          }),
+        writeSurface,
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: 'note-a' }),
+      } as never,
+    });
+    manager.registerView(view);
+    await vi.waitFor(() => expect(action.getAttribute('aria-label')).toBe('涂鸦已隐藏 · 显示预览'));
+
+    hasCanonicalInk = false;
+    await manager.refreshFile('Ink.md');
+
+    expect(action.getAttribute('aria-label')).toBe('开始涂鸦');
+    activate();
+    await vi.waitFor(() => expect(action.getAttribute('aria-label')).toBe('完成涂鸦并预览'));
+    expect(writeSurface).toHaveBeenCalled();
+
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
   it('reclaims empty canonical surfaces only after Ink exit has flushed', async () => {
     const view = { contentEl: document.createElement('div') } as unknown as MarkdownView;
     const exit = vi.fn(() => Promise.resolve());
@@ -1693,7 +2361,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Ink.md',
-      session: {},
+      session: { snapshot: () => ({ surface: { strokes: [] } }) },
     });
     privateManager.ensureMounted = vi.fn(() => Promise.resolve(null));
 
@@ -1708,7 +2376,225 @@ describe('Obsidian Ink Mode action', () => {
     manager.dispose();
   });
 
-  it('finishes Ink edit into preview when saved Ink exists and preview is enabled', async () => {
+  it('recreates an editable Ink surface after the final stroke is erased and the action is clicked again', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const action = document.createElement('button');
+    let activate!: () => void;
+    let resolveInitialDiscovery!: (value: LoadedInkSurfacesForTest) => void;
+    const initialDiscovery = new Promise<LoadedInkSurfacesForTest>((resolve) => {
+      resolveInitialDiscovery = resolve;
+    });
+    const staleInitialRecord = inkSurface('Ink.md');
+    let persisted = structuredClone(staleInitialRecord);
+    let surfaceRead = 0;
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_200));
+    const view = {
+      addAction: (_icon: string, _title: string, callback: () => void) => {
+        activate = callback;
+        return action;
+      },
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: {
+          getActiveViewOfType: () => view,
+          getLeavesOfType: () => [],
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          surfaceRead++ === 0
+            ? initialDiscovery
+            : Promise.resolve({ conflicts: [], issues: [], records: [persisted] }),
+        reclaimEmptySurfaces: () => Promise.resolve([]),
+        updateSurface: (record: InkSurfaceRecord) => {
+          persisted = record;
+          return Promise.resolve();
+        },
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      recoveryStore: {
+        claim: () => undefined,
+        clear: () => undefined,
+        load: () => null,
+        save: () => 'generation-a',
+      },
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: persisted.noteId }),
+      } as never,
+    });
+    manager.registerView(view);
+    await manager.toggle(view);
+    const firstMount = (
+      manager as unknown as {
+        mounted: Map<
+          MarkdownView,
+          {
+            session: {
+              eraseStrokeAt: (
+                point: { pressure: number; time: number; x: number; y: number },
+                radius: number,
+              ) => string | null;
+            };
+          }
+        >;
+      }
+    ).mounted.get(view);
+
+    expect(firstMount).toBeDefined();
+    firstMount?.session.eraseStrokeAt({ pressure: 0.5, time: 1, x: 20, y: 20 }, 8);
+    await manager.toggle(view);
+    expect(persisted.strokes).toEqual([]);
+
+    resolveInitialDiscovery({ conflicts: [], issues: [], records: [staleInitialRecord] });
+    await initialDiscovery;
+    await Promise.resolve();
+    expect((manager as unknown as { hasInkViews: Set<MarkdownView> }).hasInkViews.has(view)).toBe(
+      false,
+    );
+
+    activate();
+
+    await vi.waitFor(() =>
+      expect((manager as unknown as { activeView: MarkdownView | null }).activeView).toBe(view),
+    );
+    const reopened = (
+      manager as unknown as {
+        mounted: Map<MarkdownView, { session: { snapshot: () => { surface: InkSurfaceRecord } } }>;
+      }
+    ).mounted.get(view);
+    expect(reopened).toBeDefined();
+    expect(reopened).not.toBe(firstMount);
+    expect(reopened?.session.snapshot().surface.strokes).toEqual([]);
+    expect(action.getAttribute('aria-label')).toBe('完成涂鸦并预览');
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
+  it('propagates final-stroke removal to another tab before its stale discovery lands', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const actions = new Map<MarkdownView, HTMLButtonElement>();
+    const activations = new Map<MarkdownView, () => void>();
+    const discoveryResolvers: Array<(value: LoadedInkSurfacesForTest) => void> = [];
+    const discoveryRequests = Array.from(
+      { length: 2 },
+      () =>
+        new Promise<LoadedInkSurfacesForTest>((resolve) => {
+          discoveryResolvers.push(resolve);
+        }),
+    );
+    let surfaceRead = 0;
+    const staleInitialRecord = inkSurface('Ink.md');
+    let persisted = structuredClone(staleInitialRecord);
+    const createView = (): MarkdownView => {
+      const contentEl = document.createElement('div');
+      contentEl.append(readingHost(1_200));
+      const view = {
+        addAction: (_icon: string, _title: string, callback: () => void) => {
+          const action = document.createElement('button');
+          actions.set(view, action);
+          activations.set(view, callback);
+          return action;
+        },
+        contentEl,
+        file: { path: 'Ink.md' },
+        getMode: () => 'preview',
+      } as unknown as MarkdownView;
+      return view;
+    };
+    const ownerView = createView();
+    const siblingView = createView();
+    let activeWorkspaceView = ownerView;
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: {
+          getActiveViewOfType: () => activeWorkspaceView,
+          getLeavesOfType: () => [],
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          discoveryRequests[surfaceRead++] ??
+          Promise.resolve({ conflicts: [], issues: [], records: [persisted] }),
+        reclaimEmptySurfaces: () => Promise.resolve([]),
+        updateSurface: (record: InkSurfaceRecord) => {
+          persisted = record;
+          return Promise.resolve();
+        },
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      recoveryStore: {
+        claim: () => undefined,
+        clear: () => undefined,
+        load: () => null,
+        save: () => 'generation-a',
+      },
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: persisted.noteId }),
+      } as never,
+    });
+    manager.registerView(ownerView);
+    manager.registerView(siblingView);
+    await manager.toggle(ownerView);
+    const ownerMount = (
+      manager as unknown as {
+        mounted: Map<
+          MarkdownView,
+          {
+            session: {
+              eraseStrokeAt: (
+                point: { pressure: number; time: number; x: number; y: number },
+                radius: number,
+              ) => string | null;
+            };
+          }
+        >;
+      }
+    ).mounted.get(ownerView);
+
+    expect(ownerMount).toBeDefined();
+    ownerMount?.session.eraseStrokeAt({ pressure: 0.5, time: 1, x: 20, y: 20 }, 8);
+    await manager.toggle(ownerView);
+    expect(persisted.strokes).toEqual([]);
+
+    for (const resolve of discoveryResolvers) {
+      resolve({ conflicts: [], issues: [], records: [staleInitialRecord] });
+    }
+    await Promise.all(discoveryRequests);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(actions.get(siblingView)?.getAttribute('aria-label')).toBe('开始涂鸦');
+    activeWorkspaceView = siblingView;
+    activations.get(siblingView)?.();
+    await vi.waitFor(() =>
+      expect(actions.get(siblingView)?.getAttribute('aria-label')).toBe('完成涂鸦并预览'),
+    );
+
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
+  it('finishes Ink edit into Preview even when default-on-open Preview is disabled', async () => {
     const view = { contentEl: document.createElement('div') } as unknown as MarkdownView;
     const exit = vi.fn(() => Promise.resolve());
     const dispose = vi.fn();
@@ -1719,7 +2605,7 @@ describe('Obsidian Ink Mode action', () => {
       document,
       inkRepository: { reclaimEmptySurfaces } as never,
       preferenceStore: {} as never,
-      showInkPreviewByDefault: true,
+      showInkPreviewByDefault: false,
       textRepository: {} as never,
     });
     const privateManager = manager as unknown as {
@@ -1816,6 +2702,22 @@ describe('Obsidian Ink Mode action', () => {
     manager.dispose();
   });
 });
+
+function inkSummary(): InkSurfaceSummary {
+  return {
+    filePath: 'Ink.md',
+    headingPath: ['Document'],
+    id: 'surface-1',
+    logicalHeight: 800,
+    logicalWidth: 704,
+    position: 0,
+    revision: 1,
+    status: 'active',
+    strokeCount: 8,
+    thumbnailSvg: '<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+    updatedAt: '2026-07-16T10:24:00.000Z',
+  };
+}
 
 function readingHost(height: number): HTMLElement {
   const host = document.createElement('div');

@@ -86,6 +86,7 @@ export class LivePreviewAnnotationCoordinator {
   constructor(input: {
     readonly contextForState: (state: EditorState) => LivePreviewContext;
     readonly document?: Document;
+    readonly enabled?: boolean;
     readonly onAnnotationHit?: (annotationIds: readonly string[], invoker: HTMLElement) => void;
     readonly onAnnotationsChanged?: (filePath: string) => void | Promise<void>;
     readonly onIssue?: (error: unknown) => void;
@@ -98,6 +99,7 @@ export class LivePreviewAnnotationCoordinator {
     readonly service: LivePreviewAnnotationService;
     readonly styleColor?: (styleId: string) => string | undefined;
   }) {
+    const enabled = input.enabled ?? true;
     this.contextForState = input.contextForState;
     this.onAnnotationHit = input.onAnnotationHit ?? (() => undefined);
     this.onAnnotationsChanged = input.onAnnotationsChanged ?? (() => undefined);
@@ -109,7 +111,7 @@ export class LivePreviewAnnotationCoordinator {
     this.presets = input.presets ?? DEFAULT_STYLE_PRESETS;
     this.recentStyleId = this.presets[0]?.id ?? 'highlight-sun';
     this.toolbar =
-      input.document === undefined
+      !enabled || input.document === undefined
         ? null
         : new QuickHighlightToolbar({
             document: input.document,
@@ -117,25 +119,27 @@ export class LivePreviewAnnotationCoordinator {
             onDismiss: () => this.activeInstance()?.view.focus(),
             onError: this.onIssue,
           });
-    this.extension = ViewPlugin.define((view) => new LivePreviewAnnotationPluginValue(view, this), {
-      decorations: (value) => value.decorations,
-      eventHandlers: {
-        click: (event, view) => {
-          this.activate(view);
-          this.handleAnnotationHit(event);
-        },
-        focus: (_event, view) => {
-          this.activate(view);
-        },
-        keyup: (_event, view) => {
-          this.scheduleToolbarForKeyboardSelection(view);
-        },
-        mouseup: (_event, view) => {
-          this.clearSelectionToolbarTimer();
-          this.showToolbarForSelection(view);
-        },
-      },
-    });
+    this.extension = enabled
+      ? ViewPlugin.define((view) => new LivePreviewAnnotationPluginValue(view, this), {
+          decorations: (value) => value.decorations,
+          eventHandlers: {
+            click: (event, view) => {
+              this.activate(view);
+              this.handleAnnotationHit(event);
+            },
+            focus: (_event, view) => {
+              this.activate(view);
+            },
+            keyup: (_event, view) => {
+              this.scheduleToolbarForKeyboardSelection(view);
+            },
+            mouseup: (_event, view) => {
+              this.clearSelectionToolbarTimer();
+              this.showToolbarForSelection(view);
+            },
+          },
+        })
+      : [];
   }
 
   async commitSelection(mark: NonNullable<TextAnnotationRecord['mark']>): Promise<boolean> {

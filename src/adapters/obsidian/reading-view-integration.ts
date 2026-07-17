@@ -17,12 +17,13 @@ import {
 import { ReadingAnnotationController } from './reading-annotation-controller';
 import { captureReadingSelection, SUPPORTED_BLOCK_SELECTOR } from './reading-selection';
 import type { DiagnosticMetricName } from '../../runtime/diagnostics';
-import { NoteComposer } from '../../ui/note-composer';
 import {
   DEFAULT_STYLE_PRESETS,
   StylePresetCatalog,
   type StylePreset,
 } from '../../domain/style-preset';
+import type { TextAnnotationRecord } from '../../domain/text-annotation';
+import type { NoteDraftRenderTarget } from './reading-annotation-controller';
 
 export interface ReadingSectionInfo {
   readonly lineEnd: number;
@@ -40,11 +41,11 @@ export interface ReadingSectionMountInput {
 interface ReadingViewDelegate {
   context: ReadingSectionMountInput;
   dispose: () => void;
+  sectionRoot: HTMLElement;
 }
 
 export class ReadingViewIntegration {
   private readonly controller: ReadingAnnotationController;
-  private readonly composers = new Set<NoteComposer>();
   private readonly document: Document;
   private readonly onIssue: (error: unknown) => void;
   private readonly onAnnotationHit: (
@@ -70,6 +71,8 @@ export class ReadingViewIntegration {
   private readonly viewDelegates = new Map<HTMLElement, ReadingViewDelegate>();
   private readonly sectionCleanups = new Set<() => void>();
   private readonly sectionCleanupByRoot = new Map<HTMLElement, () => void>();
+  private readonly sectionRestoreEpochs = new WeakMap<HTMLElement, number>();
+  private readonly pendingSections = new Map<HTMLElement, ReadingSectionMountInput>();
   private readonly autoPrunableSections = new Set<HTMLElement>();
   private readonly sectionObserver: MutationObserver | null;
   private sectionPruneTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -82,6 +85,10 @@ export class ReadingViewIntegration {
     readonly now?: () => number;
     readonly onAnnotationHit?: (annotationIds: readonly string[], invoker: HTMLElement) => void;
     readonly onIssue?: (error: unknown) => void;
+    readonly onNoteDraft?: (
+      draft: TextAnnotationRecord,
+      target: NoteDraftRenderTarget,
+    ) => Promise<void> | void;
     readonly onRecordsChanged?: (filePath: string) => void;
     readonly presets?: readonly StylePreset[];
     readonly recordDuration?: (name: DiagnosticMetricName, durationMs: number) => void;
@@ -113,24 +120,7 @@ export class ReadingViewIntegration {
       onIssue: this.onIssue,
       onOpenDetails: (record, invoker) => this.onAnnotationHit([record.id], invoker),
       onNoteDraft: async (draft, target) => {
-        for (const composer of [...this.composers]) {
-          await composer.close();
-        }
-        const composer = new NoteComposer({
-          anchorRect: target.anchorRect,
-          document: this.document,
-          draft,
-          layout: input.isMobile === true ? 'bottom-sheet' : 'anchored',
-          onClose: () => {
-            this.composers.delete(composer);
-            onRecordsChanged(draft.filePath);
-            void this.refreshFile(draft.filePath).catch(this.onIssue);
-          },
-          onIssue: this.onIssue,
-          service: input.service,
-        });
-        this.composers.add(composer);
-        composer.show();
+        await input.onNoteDraft?.(draft, target);
       },
       onRenderCommitted: async (record) => {
         const mounted = [...this.sections.values()].some(
@@ -144,15 +134,28 @@ export class ReadingViewIntegration {
       },
       service: input.service,
       presets: this.presets,
+      toolbarLayout: input.isMobile === true ? 'mobile-action-bar' : 'anchored',
     });
   }
 
   async mountSection(input: ReadingSectionMountInput): Promise<() => void> {
     const startedAt = this.now();
-    await this.restoreSection(input);
+    this.pendingSections.set(input.root, input);
+    try {
+      await this.restoreSection(input);
+    } catch (error) {
+      if (this.pendingSections.get(input.root) === input) {
+        this.pendingSections.delete(input.root);
+      }
+      throw error;
+    }
+    if (this.pendingSections.get(input.root) !== input) {
+      return () => undefined;
+    }
+    this.pendingSections.delete(input.root);
     this.recordDuration('reading-section-render', this.now() - startedAt);
-    const delegateRoot = input.root.closest<HTMLElement>('.markdown-reading-view') ?? input.root;
-    this.ensureViewDelegate(delegateRoot, { ...input, root: delegateRoot });
+    const delegateRoot = readingViewDelegateRoot(input.root);
+    this.ensureViewDelegate(delegateRoot, { ...input, root: delegateRoot }, input.root);
     this.sections.set(input.root, input);
 
     const cleanup = (): void => {
@@ -161,12 +164,10 @@ export class ReadingViewIntegration {
       }
       this.sectionCleanupByRoot.delete(input.root);
       this.autoPrunableSections.delete(input.root);
-      if (delegateRoot === input.root) this.removeViewDelegate(delegateRoot);
       this.sections.delete(input.root);
-      for (const composer of this.composers) {
-        void composer.close();
-      }
+      this.releaseViewDelegate(delegateRoot, input.root);
       this.controller.disposeSection(input.root);
+      this.invalidateSectionRestore(input.root);
       cleanupHighlights(input.root);
     };
     this.sectionCleanups.add(cleanup);
@@ -183,6 +184,8 @@ export class ReadingViewIntegration {
     for (const cleanup of [...this.sectionCleanups]) {
       cleanup();
     }
+    for (const root of this.pendingSections.keys()) this.invalidateSectionRestore(root);
+    this.pendingSections.clear();
     for (const delegate of this.viewDelegates.values()) delegate.dispose();
     this.viewDelegates.clear();
     this.resolvedCache.clear();
@@ -191,10 +194,6 @@ export class ReadingViewIntegration {
       clearTimeout(timeout);
     }
     this.pulseTimeouts.clear();
-    for (const composer of this.composers) {
-      composer.dispose();
-    }
-    this.composers.clear();
     this.controller.dispose();
   }
 
@@ -211,10 +210,15 @@ export class ReadingViewIntegration {
     }, 10_000);
   }
 
-  private ensureViewDelegate(root: HTMLElement, context: ReadingSectionMountInput): void {
+  private ensureViewDelegate(
+    root: HTMLElement,
+    context: ReadingSectionMountInput,
+    sectionRoot: HTMLElement,
+  ): void {
     const existing = this.viewDelegates.get(root);
     if (existing !== undefined) {
       existing.context = context;
+      existing.sectionRoot = sectionRoot;
       return;
     }
     const delegate = {} as ReadingViewDelegate;
@@ -223,6 +227,7 @@ export class ReadingViewIntegration {
     };
     const inspectAnnotations = (event: Event): void => this.inspectAnnotationEvent(event);
     delegate.context = context;
+    delegate.sectionRoot = sectionRoot;
     delegate.dispose = () => {
       root.removeEventListener('mouseup', showToolbar);
       root.removeEventListener('touchend', showToolbar);
@@ -234,6 +239,20 @@ export class ReadingViewIntegration {
     root.addEventListener('keyup', showToolbar);
     root.addEventListener('click', inspectAnnotations);
     this.viewDelegates.set(root, delegate);
+  }
+
+  private releaseViewDelegate(root: HTMLElement, sectionRoot: HTMLElement): void {
+    const delegate = this.viewDelegates.get(root);
+    if (delegate === undefined || delegate.sectionRoot !== sectionRoot) return;
+    const replacement = [...this.sections.values()]
+      .reverse()
+      .find((candidate) => readingViewDelegateRoot(candidate.root) === root);
+    if (replacement === undefined) {
+      this.removeViewDelegate(root);
+      return;
+    }
+    delegate.context = { ...replacement, root };
+    delegate.sectionRoot = replacement.root;
   }
 
   private removeViewDelegate(root: HTMLElement): void {
@@ -340,10 +359,13 @@ export class ReadingViewIntegration {
   }
 
   private async restoreSection(input: ReadingSectionMountInput): Promise<void> {
+    const restoreEpoch = this.beginSectionRestore(input.root);
     cleanupHighlights(input.root);
     const source = await input.getFullSource();
+    if (!this.isCurrentSectionRestore(input.root, restoreEpoch)) return;
     const artifacts = this.artifactsFor(input.filePath, source);
     const loaded = await this.loadResolved(input.filePath, source);
+    if (!this.isCurrentSectionRestore(input.root, restoreEpoch)) return;
     for (const issue of loaded.issues) {
       this.onIssue(issue);
     }
@@ -431,6 +453,20 @@ export class ReadingViewIntegration {
     }
   }
 
+  private beginSectionRestore(root: HTMLElement): number {
+    const epoch = (this.sectionRestoreEpochs.get(root) ?? 0) + 1;
+    this.sectionRestoreEpochs.set(root, epoch);
+    return epoch;
+  }
+
+  private invalidateSectionRestore(root: HTMLElement): void {
+    this.sectionRestoreEpochs.set(root, (this.sectionRestoreEpochs.get(root) ?? 0) + 1);
+  }
+
+  private isCurrentSectionRestore(root: HTMLElement, epoch: number): boolean {
+    return this.sectionRestoreEpochs.get(root) === epoch;
+  }
+
   private loadResolved(filePath: string, source: string): Promise<ResolveHighlightsResult> {
     const cached = this.resolvedCache.get(filePath);
     if (cached !== undefined && cached.source === source) {
@@ -443,7 +479,11 @@ export class ReadingViewIntegration {
 
   private async refreshFile(filePath: string): Promise<void> {
     this.resolvedCache.delete(filePath);
-    for (const section of this.sections.values()) {
+    const sections = new Map<HTMLElement, ReadingSectionMountInput>([
+      ...this.pendingSections,
+      ...this.sections,
+    ]);
+    for (const section of sections.values()) {
       if (section.filePath === filePath) {
         await this.restoreSection(section);
       }
@@ -577,6 +617,10 @@ function commonAncestorElement(range: Range): HTMLElement {
   const parent = ancestor.parentElement;
   if (parent === null) throw new Error('Reading selection has no common element ancestor.');
   return parent;
+}
+
+function readingViewDelegateRoot(root: HTMLElement): HTMLElement {
+  return root.closest<HTMLElement>('.markdown-reading-view') ?? root;
 }
 
 export function sourceOffsetAtLine(source: string, zeroBasedLine: number): number {

@@ -33,6 +33,24 @@ describe('Ink fixed-width workspace CSS', () => {
     expect(styles).not.toMatch(/\.inkstone-ink-canvas-active\s*\{[^}]*touch-action:\s*none/u);
   });
 
+  it('keeps the pane-wide surface pointer-transparent so native Reading View scrolling remains available', () => {
+    expect(styles).toMatch(/\.inkstone-ink-surface\s*\{[^}]*pointer-events:\s*none/u);
+    expect(styles).not.toMatch(
+      /\.is-ink-(?:mode|preview)\s+\.inkstone-ink-surface\s*\{[^}]*pointer-events:\s*auto/u,
+    );
+    expect(styles).not.toMatch(/\.is-ink-mode\s+\.inkstone-ink-surface\s*\{[^}]*touch-action:/u);
+  });
+
+  it('does not turn Apple Pencil input into native touch scrolling', () => {
+    expect(styles).not.toMatch(/(?:^|\})\s*\.inkstone-ink-workspace\s*\{[^}]*user-select:\s*none/u);
+    expect(styles).not.toMatch(
+      /\.is-ink-mode\s+\.inkstone-ink-workspace\s*\{[^}]*user-select:\s*none/u,
+    );
+    expect(styles).not.toMatch(
+      /\.is-ink-mode\s+\.inkstone-ink-workspace\s*\{[^}]*touch-action:\s*none/u,
+    );
+  });
+
   it('removes the native horizontal track in Fit without disabling manual zoom scrolling', () => {
     expect(styles).toMatch(/\.inkstone-ink-host\.is-ink-fit\s*\{[^}]*overflow-x:\s*hidden/u);
     expect(styles).not.toMatch(/\.inkstone-ink-host\s*\{[^}]*overflow-x:\s*hidden/u);
@@ -51,11 +69,39 @@ describe('Ink fixed-width workspace CSS', () => {
     expect(styles).not.toMatch(/\.inkstone-ink-controls\s*\{[^}]*overflow:\s*hidden/u);
   });
 
+  it('uses the full visible brush-width control as a native dropdown hit target', () => {
+    expect(styles).toMatch(
+      /\.inkstone-ink-controls__width\s+select\s*\{[^}]*position:\s*absolute[^}]*inset:\s*0[^}]*width:\s*100%[^}]*height:\s*100%[^}]*opacity:\s*0/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-ink-controls__width-preview\s*\{[^}]*width:\s*16px[^}]*min-height:\s*1px[^}]*border-radius:\s*999px/u,
+    );
+    expect(styles).not.toContain('inkstone-ink-controls__width-sample');
+  });
+
   it('does not draw an empty double-divider slot between the drag handle and Done action', () => {
     const doneRule = styles.match(/\.inkstone-ink-controls__done\s*\{([^}]*)\}/u)?.[1] ?? '';
     const dragRule = styles.match(/\.inkstone-ink-controls__drag-handle\s*\{([^}]*)\}/u)?.[1] ?? '';
 
     expect(doneRule).not.toMatch(/margin-left|border-left/u);
     expect(dragRule).not.toMatch(/margin-right|border-right/u);
+  });
+
+  it('distinguishes Preview, Edit, hidden Ink, saving, and error on the next-action button', () => {
+    expect(styles).toMatch(
+      /\.view-action\[data-inkstone-ink-action='true'\]\.is-preview\s*\{[^}]*color:\s*var\(--interactive-accent\)[^}]*background:\s*color-mix/u,
+    );
+    expect(styles).toMatch(
+      /\.view-action\[data-inkstone-ink-action='true'\]\.is-active,\s*\.view-action\[data-inkstone-ink-action='true'\]\.is-active:hover\s*\{[^}]*color:\s*var\(--text-on-accent\)[^}]*background:\s*var\(--interactive-accent\)/u,
+    );
+    expect(styles).toMatch(
+      /\.view-action\[data-inkstone-ink-action='true'\]\.has-hidden-ink::after\s*\{[^}]*background:\s*var\(--interactive-accent\)/u,
+    );
+    expect(styles).toMatch(
+      /\.view-action\[data-inkstone-ink-action='true'\]\.is-pending\s+svg\s*\{[^}]*animation:\s*inkstone-spin/u,
+    );
+    expect(styles).toMatch(
+      /\.view-action\[data-inkstone-ink-action='true'\]\.is-error\s*\{[^}]*color:\s*var\(--text-error\)/u,
+    );
   });
 });

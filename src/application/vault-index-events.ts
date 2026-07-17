@@ -18,9 +18,9 @@ export function applyCanonicalInkSurfaceChanged(
     record.deletedAt !== undefined ||
     !record.strokes.some((stroke) => stroke.tool !== 'eraser')
   ) {
-    return index.remove({
-      expectedRevision: record.revision - 1,
+    return index.removeAtOrBelow({
       id: record.id,
+      maximumRevision: record.revision - 1,
       noteId: record.noteId,
     });
   }
@@ -36,9 +36,9 @@ export function applyCanonicalRecordChanged(
     return 'not-ready';
   }
   if (record.deletedAt !== undefined) {
-    return index.remove({
-      expectedRevision: record.revision - 1,
+    return index.removeAtOrBelow({
       id: record.id,
+      maximumRevision: record.revision - 1,
       noteId: record.noteId,
     });
   }
@@ -57,9 +57,9 @@ export function applyCanonicalRecordRemoved(
   if (!index.isReady()) {
     return 'not-ready';
   }
-  return index.remove({
-    expectedRevision: record.revision,
+  return index.removeAtOrBelow({
     id: record.id,
+    maximumRevision: record.revision,
     noteId: record.noteId,
   });
 }

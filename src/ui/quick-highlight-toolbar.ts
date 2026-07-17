@@ -13,6 +13,8 @@ export type QuickToolbarAction =
   | { readonly kind: 'more' }
   | { readonly kind: 'underline'; readonly styleId: string };
 
+export type QuickToolbarLayout = 'anchored' | 'mobile-action-bar';
+
 export interface QuickToolbarShowInput {
   readonly anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>;
   readonly presets: readonly StylePreset[];
@@ -32,15 +34,18 @@ export class QuickHighlightToolbar {
   private readonly onAction: (action: QuickToolbarAction) => Promise<void>;
   private readonly onDismiss: () => void;
   private readonly onError: (error: unknown) => void;
+  private readonly layout: QuickToolbarLayout;
   private readonly store = createQuickToolbarStore();
 
   constructor(input: {
     readonly document: Document;
+    readonly layout?: QuickToolbarLayout;
     readonly onAction: (action: QuickToolbarAction) => Promise<void>;
     readonly onDismiss: () => void;
     readonly onError?: (error: unknown) => void;
   }) {
     this.document = input.document;
+    this.layout = input.layout ?? 'anchored';
     this.onAction = input.onAction;
     this.onDismiss = input.onDismiss;
     this.onError = input.onError ?? (() => undefined);
@@ -71,6 +76,7 @@ export class QuickHighlightToolbar {
     this.host = host;
     this.island.mount(host, {
       document: this.document,
+      layout: this.layout,
       model,
       onAction: this.onAction,
       onDismiss: () => this.close(true),

@@ -10,6 +10,32 @@ import { AnnotationSidebarApp } from './annotation-sidebar-app';
 describe('AnnotationSidebarApp', () => {
   afterEach(() => document.body.replaceChildren());
 
+  it('renders initial loading as a compact list skeleton instead of a stretched status banner', async () => {
+    const container = document.createElement('div');
+    const store = new AnnotationSidebarStore();
+    const island = createPreactIsland(AnnotationSidebarApp);
+
+    await act(() =>
+      island.mount(container, {
+        onCurrentContentMount: () => undefined,
+        onCurrentHeaderActionsMount: () => undefined,
+        onScopeChange: () => undefined,
+        onVaultContentMount: () => undefined,
+        onVaultHeaderActionsMount: () => undefined,
+        store,
+      }),
+    );
+
+    const loading = container.querySelector('[aria-label="Loading annotations"]');
+    expect(loading?.classList.contains('inkstone-sidebar__loading')).toBe(true);
+    expect(loading?.getAttribute('role')).toBe('status');
+    expect(loading?.textContent).toContain('Loading annotations…');
+    expect(loading?.querySelectorAll('.inkstone-sidebar__loading-row')).toHaveLength(3);
+    expect(container.querySelector('.inkstone-status-banner')).toBeNull();
+
+    await act(() => island.unmount());
+  });
+
   it('keeps one shell and content host while switching the active scope', async () => {
     const container = document.createElement('div');
     document.body.append(container);
@@ -168,6 +194,158 @@ describe('AnnotationSidebarApp', () => {
     expect(retry).toHaveBeenCalledTimes(1);
 
     await act(() => island.unmount());
+  });
+
+  it('keeps a recent deletion Restore action visible while switching sidebar scopes', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    const container = document.createElement('div');
+    const restore = vi.fn();
+    const store = new AnnotationSidebarStore();
+    store.current.status.value = 'ready';
+    store.vault.status.value = 'ready';
+    store.recentDeletion.value = {
+      count: 3,
+      error: null,
+      expiresAt: Date.now() + 5_000,
+      pending: false,
+    };
+    const island = createPreactIsland(AnnotationSidebarApp);
+
+    await act(() =>
+      island.mount(container, {
+        onCurrentContentMount: () => undefined,
+        onCurrentHeaderActionsMount: () => undefined,
+        onRestoreRecentDeletion: restore,
+        onScopeChange: () => undefined,
+        onVaultContentMount: () => undefined,
+        onVaultHeaderActionsMount: () => undefined,
+        store,
+      }),
+    );
+
+    const banner = container.querySelector('[data-inkstone-recent-deletion]');
+    expect(banner?.textContent).toContain('3 annotations deleted');
+    banner
+      ?.querySelector<HTMLButtonElement>('button[aria-label="Restore deleted annotations"]')
+      ?.click();
+    expect(restore).toHaveBeenCalledTimes(1);
+
+    await act(() => clickScope(container, 'Entire Vault'));
+    expect(container.querySelector('[data-inkstone-recent-deletion]')).toBe(banner);
+    expect(container.textContent).toContain('3 annotations deleted');
+
+    await act(() => island.unmount());
+    vi.useRealTimers();
+  });
+
+  it('expires a recent deletion receipt after its Restore window closes', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    const container = document.createElement('div');
+    const store = new AnnotationSidebarStore();
+    store.current.status.value = 'ready';
+    store.recentDeletion.value = {
+      count: 1,
+      error: null,
+      expiresAt: Date.now() + 5_000,
+      pending: false,
+    };
+    const island = createPreactIsland(AnnotationSidebarApp);
+
+    await act(() =>
+      island.mount(container, {
+        onCurrentContentMount: () => undefined,
+        onCurrentHeaderActionsMount: () => undefined,
+        onScopeChange: () => undefined,
+        onVaultContentMount: () => undefined,
+        onVaultHeaderActionsMount: () => undefined,
+        store,
+      }),
+    );
+    expect(container.textContent).toContain('1 annotation deleted');
+
+    await act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(store.recentDeletion.value).toBeNull();
+    expect(container.querySelector('[data-inkstone-recent-deletion]')).toBeNull();
+
+    await act(() => island.unmount());
+    vi.useRealTimers();
+  });
+
+  it('disables repeat Restore requests while a recent deletion is restoring', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    const container = document.createElement('div');
+    const store = new AnnotationSidebarStore();
+    store.current.status.value = 'ready';
+    store.recentDeletion.value = {
+      count: 2,
+      error: null,
+      expiresAt: Date.now() + 5_000,
+      pending: true,
+    };
+    const island = createPreactIsland(AnnotationSidebarApp);
+
+    await act(() =>
+      island.mount(container, {
+        onCurrentContentMount: () => undefined,
+        onCurrentHeaderActionsMount: () => undefined,
+        onScopeChange: () => undefined,
+        onVaultContentMount: () => undefined,
+        onVaultHeaderActionsMount: () => undefined,
+        store,
+      }),
+    );
+
+    const restore = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Restore deleted annotations"]',
+    );
+    expect(restore?.disabled).toBe(true);
+    expect(restore?.textContent).toBe('Restoring…');
+
+    await act(() => island.unmount());
+    vi.useRealTimers();
+  });
+
+  it('keeps a failed recent deletion Restore visible and retryable', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    const container = document.createElement('div');
+    const store = new AnnotationSidebarStore();
+    store.current.status.value = 'ready';
+    store.recentDeletion.value = {
+      count: 2,
+      error: "Couldn't restore annotations locally.",
+      expiresAt: Date.now() + 5_000,
+      pending: false,
+    };
+    const island = createPreactIsland(AnnotationSidebarApp);
+
+    await act(() =>
+      island.mount(container, {
+        onCurrentContentMount: () => undefined,
+        onCurrentHeaderActionsMount: () => undefined,
+        onScopeChange: () => undefined,
+        onVaultContentMount: () => undefined,
+        onVaultHeaderActionsMount: () => undefined,
+        store,
+      }),
+    );
+
+    expect(container.querySelector('[data-inkstone-recent-deletion]')).not.toBeNull();
+    expect(container.querySelector('[data-inkstone-recent-deletion-error]')?.textContent).toBe(
+      "Couldn't restore annotations locally.",
+    );
+    expect(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Restore deleted annotations"]')
+        ?.disabled,
+    ).toBe(false);
+
+    await act(() => island.unmount());
+    vi.useRealTimers();
   });
 });
 

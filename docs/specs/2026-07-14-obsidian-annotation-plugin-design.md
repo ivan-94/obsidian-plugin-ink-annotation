@@ -235,8 +235,9 @@ Notes and invariants:
 - An active record must contain at least one of `mark`, a non-empty `body`, or one or more `tags`.
 - A note-only annotation renders a small note-anchor indicator rather than inventing an implicit
   background highlight.
-- Tapping `Add note` persists the target first as a `draft`, then autosaves body changes. Leaving an
-  empty draft removes it safely.
+- Tapping `Add note` persists the target first as a `draft`, then opens the shared annotation
+  inspector with `Note` active and the note field focused. Body and tag edits remain in memory until
+  explicit Save. Leaving an empty draft removes it safely.
 - `styleId` carries a stable presentation-preset identity. Its color and optional user-facing name
   may change without rewriting the annotation target.
 - `tags` are independent from color and style.
@@ -710,7 +711,7 @@ stateDiagram-v2
     TextSelected --> Reading: Escape / collapse / invalid target
     TextSelected --> Annotated: Color / underline
     TextSelected --> Composing: Add note
-    Composing --> Annotated: Body autosaved / done
+    Composing --> Annotated: Save / protected close
     Annotated --> Inspecting: Click or tap annotation
     Inspecting --> Reading: Close
 
@@ -729,13 +730,13 @@ open during Reading, Inspecting, or Ink Mode, but it must not steal focus during
 
 ### Adaptive Interaction Surfaces
 
-| Task                        | Desktop                                              | iPad / mobile                                                                                              |
-| --------------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| New text annotation         | Selection-anchored quick toolbar                     | Selection-anchored toolbar when safe; stable bottom action bar when native UI or viewport collisions occur |
-| Add/edit a short note       | Anchored compact composer, approximately 360 px wide | Keyboard-aware bottom sheet                                                                                |
-| Edit an existing annotation | Anchored annotation inspector                        | Tap inspector or bottom sheet depending on available space                                                 |
-| Ink tools                   | Collapsible vertical palette beside the content      | Bottom floating palette above the safe area                                                                |
-| Current/global management   | Obsidian side pane                                   | Obsidian drawer/narrow pane with the same scope model                                                      |
+| Task                        | Desktop                                         | iPad / mobile                                                                                              |
+| --------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| New text annotation         | Selection-anchored quick toolbar                | Selection-anchored toolbar when safe; stable bottom action bar when native UI or viewport collisions occur |
+| Add/edit a short note       | Shared anchored annotation inspector            | The same edge-aware inspector, constrained to the visual viewport                                          |
+| Edit an existing annotation | Shared anchored annotation inspector            | The same edge-aware inspector, constrained to the visual viewport                                          |
+| Ink tools                   | Collapsible vertical palette beside the content | Bottom floating palette above the safe area                                                                |
+| Current/global management   | Obsidian side pane                              | Obsidian drawer/narrow pane with the same scope model                                                      |
 
 Container fallback is selected once per interaction. A toolbar must not jump repeatedly between
 anchored and bottom positions while the user adjusts native selection handles.
@@ -771,7 +772,8 @@ Behavior:
 - Clicking a color creates a highlight immediately with that preset.
 - Clicking `Underline` creates an underline using the current or most recently used style preset.
 - A secondary control may expose other underline colors without widening the default toolbar.
-- Clicking `Add note` first persists the target as a draft, then opens the note composer.
+- Clicking `Add note` first persists the target as a draft, then opens the shared annotation
+  inspector with `Note` selected and the note textarea focused.
 - `More` contains tag, copy quote, copy annotation link, export, and context-specific commands
   rather than another duplicate color picker.
 - A committed mark is its own success feedback; do not show a success toast for every highlight.
@@ -779,22 +781,34 @@ Behavior:
 - Tooltips and accessible names describe both mark type and preset name; color alone is never the
   only label.
 
-### Note Composer
+### Shared Annotation Inspector
 
 - Treat note content as optional Markdown attached to the same target as the mark.
 - Keep one or two lines of quoted source visible at the top so focus and keyboard changes do not
   erase context.
 - Persist the anchor as a `draft` before moving focus into the editor.
-- Autosave body changes with a short debounce and force a flush on close, navigation, app
-  background, or plugin unload.
+- New-note creation and existing-annotation editing use the same inspector implementation. There is
+  no separate Note Composer surface.
+- Editing body or tags changes only the live inspector state; elapsed time never writes the draft.
+- Keep `Save` as the stable primary action. Clicking it writes the latest body and tags through the
+  local persistence path and closes the inspector only after that write succeeds. An explicit Save
+  failure keeps the inspector open, preserves its live body and tags, shows a concise error beside
+  the action, and focuses the retryable Save action.
+- Outside click, `Escape`, or focus dismissal attempts a final save for valid dirty edits. If
+  validation or persistence fails during dismissal, abandon the in-memory changes and hide the
+  inspector rather than trapping the user in an invalid editor. A clean empty new draft is removed.
 - Display `Saved locally`, `Saving…`, or a persistent actionable save error. Do not claim `Synced`
   based only on a completed file write.
+- Present the quoted target as one restrained context row and render Tags as one icon-led field.
+  Native Obsidian button chrome must not create extra raised controls.
+- On iPad, position and size the shared inspector against the current visual viewport so the
+  software keyboard cannot leave required controls below the visible area.
 - Closing an empty new draft removes it safely. Closing a non-empty draft promotes it to `active`.
 - A long note can move into or expand within the sidebar without creating a second record.
 - A note-only target renders a restrained note-anchor indicator; it does not silently become a
   yellow highlight.
 
-### Existing Annotation Inspector
+#### Existing annotation entry
 
 - Clicking or tapping an existing mark opens the inspector rather than starting another selection
   workflow.
@@ -804,6 +818,8 @@ Behavior:
   depends on hover.
 - If multiple annotations overlap, the first inspector presents every matching record with quote,
   style, and note preview. The user chooses the record to edit.
+- Each overlap choice reserves stable space for its mark label; a long quote is visually truncated
+  inside the remaining row width instead of crossing or displacing that label.
 - Background-fill composition may still use specificity and update time for rendering, but visual
   z-order never decides which record is edited.
 - Closing the inspector restores focus to the annotated text or the invoking sidebar row.
@@ -974,8 +990,8 @@ Entire-Vault behavior:
 
 - Selecting text without choosing an action leaves no sidecar record.
 - A default highlight can be created with one action after selection.
-- A note can coexist with either a highlight or underline and survives app backgrounding after local
-  autosave.
+- A note can coexist with either a highlight or underline; routine editing remains in memory until
+  Save, while app backgrounding performs the documented protective flush.
 - The quick toolbar never remains detached from a collapsed or different selection.
 - Existing and overlapping annotations can be selected deterministically.
 - Inactive Ink never blocks links, text selection, or scrolling.
@@ -1018,6 +1034,12 @@ pass:
   practice where possible instead of inventing unnecessary custom behavior.
 - User acceptance in the current Codex task on 2026-07-14: write the proposed UI/UX model into the
   specification, including the recommended fixed annotation layout while Ink is visible.
+- User request in the 2026-07-17 Codex conversation: remove the mobile-only Note Composer and route
+  Add note through the shared annotation inspector with Note active and its textarea focused.
+- User follow-up in the 2026-07-17 Codex conversation: keep explicit Save semantics; a successful
+  Save closes the inspector, while a failed dismissal abandons invalid changes and hides it.
+- User follow-up in the 2026-07-17 Codex conversation: keep the shared inspector visible above the
+  iPad software keyboard and prevent long overlap-choice text from overflowing its row.
 - [Apple Books on iPad](https://support.apple.com/en-ae/guide/ipad/ipade2f8027b/ipados):
   selection-adjacent Highlight, Add Note, Translate, Search, Copy, and Share actions.
 - [Apple Books on Mac](https://support.apple.com/en-kw/guide/books/ibks3975f128/mac): select text,
@@ -1120,6 +1142,9 @@ pass:
   `motivation` semantics, and retained one consolidated Source Manifest.
 - Relocated this specification and its UI v2 source images from the external AI Wiki into the plugin
   repository on 2026-07-15 so downstream agents use one repository-local source of truth.
+- The 2026-07-17 annotation editor and overlap-choice follow-up passed focused DOM/state/CSS tests,
+  the full 103-file / 718 test coverage suite, 10 performance tests, formatting, lint, typecheck,
+  production/mobile build, `git diff --check`, and development Vault installation.
 
 ### Open Questions / Risks
 

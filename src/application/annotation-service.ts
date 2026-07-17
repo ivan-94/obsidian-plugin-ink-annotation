@@ -224,10 +224,17 @@ export class AnnotationService {
     await this.repository.deleteAnnotation(draft.filePath, draft.id);
   }
 
-  async deleteAnnotation(filePath: string, annotationId: string): Promise<TextAnnotationRecord> {
+  async deleteAnnotation(
+    filePath: string,
+    annotationId: string,
+    expectedRevision?: number,
+  ): Promise<TextAnnotationRecord> {
     const record = await this.repository.readAnnotation(filePath, annotationId);
     if (record === null) {
       throw new Error(`Cannot delete missing annotation ${annotationId}.`);
+    }
+    if (expectedRevision !== undefined && record.revision !== expectedRevision) {
+      throw new Error(`Annotation ${annotationId} changed since it was selected.`);
     }
     const deleted = this.authored(tombstoneAnnotation(record, this.now()));
     await this.repository.updateAnnotation(deleted);
@@ -506,7 +513,13 @@ export class AnnotationService {
     const failed: BulkAnnotationFailure[] = [];
     const succeeded: TextAnnotationRecord[] = [];
     for (const item of selection) {
-      const record = await this.repository.readAnnotation(item.filePath, item.id);
+      let record: TextAnnotationRecord | null;
+      try {
+        record = await this.repository.readAnnotation(item.filePath, item.id);
+      } catch {
+        failed.push({ ...item, reason: 'write-failed' });
+        continue;
+      }
       if (record === null || record.deletedAt !== undefined) {
         failed.push({ ...item, reason: 'missing' });
         continue;

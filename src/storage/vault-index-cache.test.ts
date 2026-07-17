@@ -19,6 +19,22 @@ describe('disposable Vault index cache', () => {
     await expect(cache.load()).resolves.toBeNull();
     expect([...store.files.keys()].some((path) => path.includes('/annotations/'))).toBe(false);
   });
+
+  it('rejects lifecycle-unaware v1 caches before they can show missing sources', async () => {
+    const store = new MemoryStore();
+    const cache = new VaultIndexCache(store);
+    await store.write(
+      '.obsidian-annotations/v1/index.json',
+      JSON.stringify({
+        derived: true,
+        entries: [entry()],
+        generatedAt: '2026-07-14T10:00:00.000Z',
+        schemaVersion: 1,
+      }),
+    );
+
+    await expect(cache.load()).resolves.toBeNull();
+  });
 });
 
 function entry(): AnnotationIndexEntry {

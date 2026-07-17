@@ -32,6 +32,30 @@ describe('Obsidian DataAdapter text-file store', () => {
     await expect(store.exists(path)).resolves.toBe(true);
   });
 
+  it('merges a renamed sidecar into a destination folder created by a rename race', async () => {
+    const adapter = new MemoryDataAdapter();
+    const store = new ObsidianVaultTextFileStore(adapter);
+    const source = '.obsidian-annotations/v1/notes/old-hash';
+    const destination = '.obsidian-annotations/v1/notes/new-hash';
+
+    await store.mkdir(`${source}/annotations`);
+    await store.write(`${source}/meta.json`, 'old note identity');
+    await store.write(`${source}/annotations/annotation-1.json`, 'annotation');
+    await store.mkdir(`${destination}/annotations`);
+    await store.write(`${destination}/meta.json`, 'concurrent destination identity');
+
+    await store.rename(source, destination);
+
+    await expect(store.read(`${destination}/meta.json`)).resolves.toBe('old note identity');
+    await expect(store.read(`${destination}/annotations/annotation-1.json`)).resolves.toBe(
+      'annotation',
+    );
+    await expect(store.read(`${destination}/meta rename-conflict-1.json`)).resolves.toBe(
+      'concurrent destination identity',
+    );
+    await expect(store.exists(source)).resolves.toBe(false);
+  });
+
   it('turns a stalled hydrated-file read into a retryable timeout', async () => {
     const adapter = new MemoryDataAdapter(true);
     await adapter.write('.obsidian-annotations/stalled.json', 'visible but not hydrated');
@@ -75,6 +99,7 @@ describe('Obsidian DataAdapter text-file store', () => {
     adapter.failNextPromotion();
 
     await expect(store.write(target, 'revision 2')).rejects.toThrow('Injected promotion failure');
+    expect(store.wasRecentlyWritten(target)).toBe(false);
     await expect(store.read(target)).resolves.toBe('revision 1');
 
     await store.write(target, 'revision 2');
@@ -94,6 +119,20 @@ describe('Obsidian DataAdapter text-file store', () => {
 
     expect(store.wasRecentlyWritten(target, writtenAt)).toBe(true);
     expect(store.wasRecentlyWritten(target, writtenAt + 5_001)).toBe(false);
+  });
+
+  it('does not suppress a different iCloud payload that arrives at a recently written path', async () => {
+    const adapter = new MemoryDataAdapter();
+    const store = new ObsidianVaultTextFileStore(adapter);
+    const target = '.obsidian-annotations/v1/notes/hash/annotations/annotation-1.json';
+
+    await store.write(target, 'local revision 2');
+    await expect(store.isUnchangedRecentWrite(target)).resolves.toBe(true);
+
+    await adapter.write(target, 'remote revision 3');
+
+    await expect(store.isUnchangedRecentWrite(target)).resolves.toBe(false);
+    expect(store.wasRecentlyWritten(target)).toBe(false);
   });
 });
 
@@ -150,6 +189,12 @@ class MemoryDataAdapter {
 
   remove(path: string): Promise<void> {
     this.files.delete(path);
+    for (const candidate of [...this.files.keys()]) {
+      if (candidate.startsWith(`${path}/`)) this.files.delete(candidate);
+    }
+    for (const candidate of [...this.folders]) {
+      if (candidate === path || candidate.startsWith(`${path}/`)) this.folders.delete(candidate);
+    }
     return Promise.resolve();
   }
 
@@ -158,10 +203,26 @@ class MemoryDataAdapter {
       this.failPromotion = false;
       return Promise.reject(new Error('Injected promotion failure'));
     }
+    if (this.files.has(to) || this.folders.has(to)) {
+      return Promise.reject(new Error('Destination file already exists!'));
+    }
     const contents = this.files.get(from);
-    if (contents === undefined) return Promise.reject(new Error(`Missing file ${from}.`));
-    this.files.delete(from);
-    this.files.set(to, contents);
+    if (contents !== undefined) {
+      this.files.delete(from);
+      this.files.set(to, contents);
+      return Promise.resolve();
+    }
+    if (!this.folders.has(from)) return Promise.reject(new Error(`Missing file ${from}.`));
+    const folders = [...this.folders]
+      .filter((candidate) => candidate === from || candidate.startsWith(`${from}/`))
+      .sort((left, right) => left.length - right.length);
+    const files = [...this.files.entries()].filter(([candidate]) =>
+      candidate.startsWith(`${from}/`),
+    );
+    for (const folder of folders) this.folders.delete(folder);
+    for (const [path] of files) this.files.delete(path);
+    for (const folder of folders) this.folders.add(`${to}${folder.slice(from.length)}`);
+    for (const [path, value] of files) this.files.set(`${to}${path.slice(from.length)}`, value);
     return Promise.resolve();
   }
 

@@ -2,6 +2,7 @@ import type { AnnotationIndexEntry } from '../domain/vault-annotation-index';
 import type { TextFileStore } from './sidecar-repository';
 
 const VAULT_INDEX_PATH = '.obsidian-annotations/v1/index.json';
+const VAULT_INDEX_SCHEMA_VERSION = 2;
 
 export class VaultIndexCache {
   constructor(private readonly store: TextFileStore) {}
@@ -18,7 +19,7 @@ export class VaultIndexCache {
       const parsed: unknown = JSON.parse(contents);
       if (
         !isRecord(parsed) ||
-        parsed.schemaVersion !== 1 ||
+        parsed.schemaVersion !== VAULT_INDEX_SCHEMA_VERSION ||
         parsed.derived !== true ||
         typeof parsed.generatedAt !== 'string' ||
         !Array.isArray(parsed.entries) ||
@@ -39,7 +40,11 @@ export class VaultIndexCache {
     await this.store.mkdir('.obsidian-annotations/v1');
     await this.store.write(
       VAULT_INDEX_PATH,
-      `${JSON.stringify({ derived: true, entries, generatedAt, schemaVersion: 1 }, null, 2)}\n`,
+      `${JSON.stringify(
+        { derived: true, entries, generatedAt, schemaVersion: VAULT_INDEX_SCHEMA_VERSION },
+        null,
+        2,
+      )}\n`,
     );
   }
 

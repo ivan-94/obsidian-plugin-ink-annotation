@@ -182,6 +182,43 @@ describe('Ink pointer persistence round-trip', () => {
       expect(encodeInkSurfaceRecord(unchanged)).toBe(persistedBytes);
     },
   );
+
+  it('persists one closed-loop batch erase while retaining a crossing stroke at 50%', async () => {
+    const store = new MemoryTextFileStore();
+    const meta = await new SidecarRepository(store).getOrCreateNote({
+      createId: () => 'note-circle-erase',
+      filePath: 'Scale.md',
+      now: '2026-07-17T08:00:00.000Z',
+      sourceFingerprint: 'source-circle-erase',
+    });
+    const repository = new InkSurfaceRepository(store);
+    const base = fixedSurface(meta.noteId);
+    const initial: InkSurfaceRecord = {
+      ...base,
+      strokes: [
+        storedStroke('inside-a', [logicalPoint(140, 290), logicalPoint(180, 320)]),
+        storedStroke('inside-b', [logicalPoint(190, 340), logicalPoint(220, 370)]),
+        storedStroke('crossing', [logicalPoint(150, 330), logicalPoint(320, 330)]),
+      ],
+    };
+    await repository.writeSurface(initial);
+    const { controller, root } = scaledController({ repository, scale: 0.5, surface: initial });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+    const client = (x: number, y: number) => ({ x: 80 + x * 0.5, y: 100 + y * 0.5 });
+    const loop = [client(100, 250), client(260, 250), client(260, 420), client(100, 420)];
+
+    root.dispatchEvent(pointer('pointerdown', loop[0]?.x ?? 0, loop[0]?.y ?? 0, 10));
+    root.dispatchEvent(pointer('pointermove', loop[1]?.x ?? 0, loop[1]?.y ?? 0, 20));
+    root.dispatchEvent(pointer('pointermove', loop[2]?.x ?? 0, loop[2]?.y ?? 0, 30));
+    root.dispatchEvent(pointer('pointermove', loop[3]?.x ?? 0, loop[3]?.y ?? 0, 40));
+    root.dispatchEvent(pointer('pointerup', loop[0]?.x ?? 0, loop[0]?.y ?? 0, 50));
+    await controller.exit();
+    controller.dispose();
+
+    const persisted = await repository.readSurface(initial.filePath, initial.id);
+    expect(persisted?.strokes.map(({ id }) => id)).toEqual(['crossing']);
+  });
 });
 
 function scaledController(input: {
@@ -304,6 +341,14 @@ function fixedSurface(noteId: string): InkSurfaceRecord {
   };
 }
 
+function storedStroke(id: string, points: InkSurfaceRecord['strokes'][number]['points']) {
+  return { color: '#4f46d8', id, points, tool: 'pen' as const, width: 4 };
+}
+
+function logicalPoint(x: number, y: number) {
+  return { pressure: 0.5, time: x + y, x, y };
+}
+
 function pointer(type: string, x: number, y: number, timeStamp: number): Event {
   const event = new MouseEvent(type, { bubbles: true, button: 0, clientX: x, clientY: y });
   Object.defineProperties(event, {
@@ -346,6 +391,7 @@ function contextFixture(): ContextFixture {
   const setTransform = vi.fn();
   const stroke = vi.fn();
   const context = {
+    arc: vi.fn(),
     beginPath: vi.fn(),
     clearRect: vi.fn(),
     lineCap: 'round',
@@ -355,6 +401,7 @@ function contextFixture(): ContextFixture {
     restore: vi.fn(),
     save: vi.fn(),
     scale: vi.fn(),
+    setLineDash: vi.fn(),
     setTransform,
     stroke,
     strokeStyle: '#000',

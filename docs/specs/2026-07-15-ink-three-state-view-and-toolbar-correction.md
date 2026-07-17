@@ -25,14 +25,15 @@ The user-provided native Obsidian screenshots show four release-blocking failure
 
 ## Product Decisions
 
-| ID          | Decision                                                                                                                                                                  | Status            |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
-| INK-V1.1-01 | Ink has three explicit view states: `raw`, `ink-preview`, and `ink-edit`.                                                                                                 | Confirmed by user |
-| INK-V1.1-02 | A Reading View note with canonical Ink opens in `ink-preview` by default. A setting named `Show Ink preview by default` controls this behavior and defaults to enabled.   | Confirmed by user |
-| INK-V1.1-03 | `raw` is untouched Obsidian Reading View: no fixed width, Canvas, Ink toolbar, or pointer interception.                                                                   | Confirmed by user |
-| INK-V1.1-04 | `ink-preview` uses the same fixed logical coordinate plane as edit, shows committed Ink, hides edit chrome, and remains pointer-transparent so Reading interactions work. | Confirmed by user |
-| INK-V1.1-05 | `ink-edit` adds the active Canvas and compact edit dock to the same coordinate plane. Finishing edit returns to preview when the preference is enabled, otherwise to raw. | Confirmed by user |
-| INK-V1.1-06 | Ink toolbar actions are icon-only in the dock. Full names remain in `aria-label`, tooltip, and focus semantics.                                                           | Confirmed by user |
+| ID          | Decision                                                                                                                                                                                                 | Status            |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
+| INK-V1.1-01 | Ink has three explicit view states: `raw`, `ink-preview`, and `ink-edit`.                                                                                                                                | Confirmed by user |
+| INK-V1.1-02 | A Reading View note with canonical Ink opens in `ink-preview` by default. A setting named `Show Ink preview by default` controls this behavior and defaults to enabled.                                  | Confirmed by user |
+| INK-V1.1-03 | `raw` is untouched Obsidian Reading View: no fixed width, Canvas, Ink toolbar, or pointer interception.                                                                                                  | Confirmed by user |
+| INK-V1.1-04 | `ink-preview` uses the same fixed logical coordinate plane as edit, shows committed Ink, hides edit chrome, and remains pointer-transparent so Reading interactions work.                                | Confirmed by user |
+| INK-V1.1-05 | `ink-edit` adds the active Canvas and compact edit dock to the same coordinate plane. Finishing edit returns to preview when the preference is enabled, otherwise to raw.                                | Confirmed by user |
+| INK-V1.1-06 | Ink toolbar actions are icon-only in the dock. Full names remain in `aria-label`, tooltip, and focus semantics.                                                                                          | Confirmed by user |
+| INK-V1.1-07 | Pen, Highlighter, and Stroke eraser each own an independent device-local color and width slot. Switching tools restores that tool's most recent values, including after controller recreation or reload. | Confirmed by user |
 
 ## Width and Alignment Contract
 
@@ -78,6 +79,13 @@ The user-provided native Obsidian screenshots show four release-blocking failure
 
 - `Select/Move` uses a recognizable move icon. `Multiple` uses a distinct multi-selection icon.
 - The dock may scroll horizontally on narrow viewports but never clips half a label or control.
+- Pen, Highlighter, and Stroke eraser each remember their own Color and Width values. Changing one
+  tool never overwrites either value for another tool, and the visible controls update immediately
+  when the active drawing tool changes.
+- The three style slots are stored in the existing device-local Ink preference, never in the Vault
+  sidecar or iCloud data. A legacy preference with one shared color initializes all three slots with
+  that color; its width remains assigned to the formerly active tool while the other tools retain
+  their established default widths.
 
 ## Settings and Commands
 
@@ -98,6 +106,10 @@ The user-provided native Obsidian screenshots show four release-blocking failure
 - Toolbar has no visible `Select/Move`, `Multiple`, or retry prose in the normal dock; icons share
   an 18 px visual slot and accessible names remain complete.
 - Toolbar is usable without clipped controls at desktop width and at 320/360/480 px.
+- Assigning distinct Color/Width pairs to Pen, Highlighter, and Stroke eraser restores the correct
+  pair after arbitrary tool switching and after recreating the Ink controller.
+- Legacy device-local preferences without per-tool slots load without data loss and become per-tool
+  preferences on the next toolbar change.
 - Targeted tests, full `npm run check`, package gate, and a native Obsidian screenshot loop pass.
 
 ## Execution Plan
@@ -109,6 +121,10 @@ The user-provided native Obsidian screenshots show four release-blocking failure
 5. Add toolbar DOM/CSS tests for icon-only controls, icon slots, and narrow overflow behavior.
 6. Build/install into the fixture Vault and perform a real Obsidian visual walkthrough of all three
    states, default settings, and toolbar interactions.
+7. Add a controller regression proving independent Pen/Highlighter/Eraser Color and Width
+   restoration within one session and after controller recreation.
+8. Extend the device-local preference additively with validated per-tool style slots and a legacy
+   shared-style fallback.
 
 ## Non-Goals
 
@@ -123,6 +139,8 @@ The user-provided native Obsidian screenshots show four release-blocking failure
 
 - User feedback and two native Obsidian screenshots supplied in the current Codex task on
   2026-07-15.
+- User feedback and toolbar screenshot supplied on 2026-07-17 showing that Color and Width must be
+  remembered independently for every drawing tool.
 - `docs/specs/2026-07-15-ink-fixed-width-manual-repositioning.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`
 - `docs/delivery/slices/S16-ink-fixed-width-manual-move/`
@@ -142,6 +160,8 @@ The user-provided native Obsidian screenshots show four release-blocking failure
 - `docs/delivery/slices/S17-ink-three-state-view-toolbar-correction/`
 - Three-state lifecycle, fixed-width alignment, preview setting, toolbar icon, and regression-test
   changes under `src/` and `styles.css`.
+- Per-tool style-slot persistence under `src/storage/local-ink-tool-preference.ts` and tool-switch
+  restoration under `src/ui/ink-canvas-controller.ts`.
 
 ### Key decisions
 
@@ -149,6 +169,8 @@ The user-provided native Obsidian screenshots show four release-blocking failure
 - Keep stored logical width authoritative; fix coordinate origins and box alignment without a silent
   vector migration.
 - Preserve accessible prose while removing visible prose from the compact dock.
+- Keep tool styles device-local and additive to the existing preference format; do not modify Ink
+  sidecars or synchronize UI preferences through the Vault.
 
 ### Verification evidence
 
@@ -165,3 +187,4 @@ The user-provided native Obsidian screenshots show four release-blocking failure
 
 - A universal default logical width remains deferred; the current fixture is 513 logical px.
 - Real iPad Pencil/finger behavior remains a separate physical-device gate.
+- Per-tool Color/Width switching still requires physical-iPad toolbar confirmation.

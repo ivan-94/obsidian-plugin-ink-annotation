@@ -2,14 +2,17 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { InkStroke, InkSurfaceRecord } from '../domain/ink-surface';
+import type { InkPoint, InkStroke, InkSurfaceRecord } from '../domain/ink-surface';
 import type { InkSurfaceSessionSnapshot } from '../application/ink-surface-session';
 import {
   committedStrokeRenderDelta,
   InkCanvasController,
   nextActivePaintSegment,
 } from './ink-canvas-controller';
-import type { InkToolPreference } from '../storage/local-ink-tool-preference';
+import {
+  type InkToolPreference,
+  LocalInkToolPreferenceStore,
+} from '../storage/local-ink-tool-preference';
 
 describe('Ink canvas controller', () => {
   beforeEach(() => {
@@ -24,6 +27,10 @@ describe('Ink canvas controller', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: undefined,
+    });
   });
 
   it('paints only the new tail of a long active stroke after the first frame', () => {
@@ -237,6 +244,34 @@ describe('Ink canvas controller', () => {
     controller.dispose();
   });
 
+  it('restores Preview to 100% without forgetting the previous Edit zoom', async () => {
+    const root = document.createElement('div');
+    const layoutRoot = document.createElement('div');
+    root.append(layoutRoot);
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      layoutRoot,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-out]')?.click();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-out]')?.click();
+    expect(layoutRoot.style.getPropertyValue('--inkstone-ink-scale')).toBe('0.8');
+
+    await controller.exit('preview');
+
+    expect(root.classList.contains('is-ink-preview')).toBe(true);
+    expect(root.classList.contains('is-ink-fit')).toBe(false);
+    expect(layoutRoot.style.getPropertyValue('--inkstone-ink-scale')).toBe('1');
+
+    controller.enter();
+    expect(root.classList.contains('is-ink-fit')).toBe(false);
+    expect(layoutRoot.style.getPropertyValue('--inkstone-ink-scale')).toBe('0.8');
+    controller.dispose();
+  });
+
   it('leaves Select and move when the user chooses a drawing tool', () => {
     const root = document.createElement('div');
     document.body.append(root);
@@ -290,7 +325,7 @@ describe('Ink canvas controller', () => {
     controller.dispose();
   });
 
-  it('applies a visible width sample to the next stroke', () => {
+  it('applies the brush width selected from the dropdown to the next stroke', () => {
     const root = document.createElement('div');
     document.body.append(root);
     const session = new FakeSession(surface());
@@ -301,12 +336,117 @@ describe('Ink canvas controller', () => {
 
     controller.enter();
     root.querySelector<HTMLButtonElement>('button[aria-label="Show or hide Ink options"]')?.click();
-    root.querySelector<HTMLElement>('[data-inkstone-ink-width-sample="8"]')?.click();
+    const width = root.querySelector<HTMLSelectElement>('[data-inkstone-ink-width-select]');
+    expect(width?.value).toBe('4');
+    if (width === null) throw new Error('Missing Ink width dropdown.');
+    width.value = '8';
+    width.dispatchEvent(new Event('change', { bubbles: true }));
     root.dispatchEvent(pointer('pointerdown', 100, 100));
     root.dispatchEvent(pointer('pointerup', 100, 100));
 
     expect(session.strokes.at(-1)?.width).toBe(8);
     controller.dispose();
+  });
+
+  it('remembers color and width independently for every drawing tool', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('button[aria-label="Show or hide Ink options"]')?.click();
+    const chooseStyle = (tool: 'pen' | 'highlighter' | 'eraser', value: string, pixels: number) => {
+      root.querySelector<HTMLButtonElement>(`[data-inkstone-ink-tool="${tool}"]`)?.click();
+      const color = root.querySelector<HTMLInputElement>('[data-inkstone-ink-color]');
+      const width = root.querySelector<HTMLSelectElement>('[data-inkstone-ink-width-select]');
+      if (color === null || width === null) throw new Error('Missing Ink style controls.');
+      color.value = value;
+      color.dispatchEvent(new Event('input', { bubbles: true }));
+      width.value = String(pixels);
+      width.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    const expectStyle = (tool: 'pen' | 'highlighter' | 'eraser', value: string, pixels: number) => {
+      root.querySelector<HTMLButtonElement>(`[data-inkstone-ink-tool="${tool}"]`)?.click();
+      expect(root.querySelector<HTMLInputElement>('[data-inkstone-ink-color]')?.value).toBe(value);
+      expect(root.querySelector<HTMLSelectElement>('[data-inkstone-ink-width-select]')?.value).toBe(
+        String(pixels),
+      );
+    };
+
+    chooseStyle('pen', '#112233', 8);
+    chooseStyle('highlighter', '#445566', 16);
+    chooseStyle('eraser', '#778899', 2);
+
+    expectStyle('pen', '#112233', 8);
+    expectStyle('highlighter', '#445566', 16);
+    expectStyle('eraser', '#778899', 2);
+    controller.dispose();
+  });
+
+  it('restores every tool style after the Ink controller is recreated', () => {
+    const changes: InkToolPreference[] = [];
+    const firstRoot = document.createElement('div');
+    document.body.append(firstRoot);
+    const first = new InkCanvasController({
+      document,
+      onPreferenceChanged: (preference) => changes.push(preference),
+      root: firstRoot,
+      session: new FakeSession(surface()),
+    });
+    first.enter();
+    firstRoot
+      .querySelector<HTMLButtonElement>('button[aria-label="Show or hide Ink options"]')
+      ?.click();
+
+    const chooseStyle = (
+      root: HTMLElement,
+      tool: 'pen' | 'highlighter' | 'eraser',
+      color: string,
+      width: number,
+    ) => {
+      root.querySelector<HTMLButtonElement>(`[data-inkstone-ink-tool="${tool}"]`)?.click();
+      const colorInput = root.querySelector<HTMLInputElement>('[data-inkstone-ink-color]');
+      const widthInput = root.querySelector<HTMLSelectElement>('[data-inkstone-ink-width-select]');
+      if (colorInput === null || widthInput === null)
+        throw new Error('Missing Ink style controls.');
+      colorInput.value = color;
+      colorInput.dispatchEvent(new Event('input', { bubbles: true }));
+      widthInput.value = String(width);
+      widthInput.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    chooseStyle(firstRoot, 'pen', '#112233', 8);
+    chooseStyle(firstRoot, 'highlighter', '#445566', 16);
+    chooseStyle(firstRoot, 'eraser', '#778899', 2);
+    const saved = changes.at(-1);
+    if (saved === undefined) throw new Error('Missing persisted Ink preference.');
+    first.dispose();
+
+    const secondRoot = document.createElement('div');
+    document.body.append(secondRoot);
+    const second = new InkCanvasController({
+      document,
+      preference: saved,
+      root: secondRoot,
+      session: new FakeSession(surface()),
+    });
+    second.enter();
+    const expectStyle = (tool: 'pen' | 'highlighter' | 'eraser', color: string, width: number) => {
+      secondRoot.querySelector<HTMLButtonElement>(`[data-inkstone-ink-tool="${tool}"]`)?.click();
+      expect(secondRoot.querySelector<HTMLInputElement>('[data-inkstone-ink-color]')?.value).toBe(
+        color,
+      );
+      expect(
+        secondRoot.querySelector<HTMLSelectElement>('[data-inkstone-ink-width-select]')?.value,
+      ).toBe(String(width));
+    };
+
+    expectStyle('pen', '#112233', 8);
+    expectStyle('highlighter', '#445566', 16);
+    expectStyle('eraser', '#778899', 2);
+    second.dispose();
   });
 
   it('replaces the complete Canvas transform when actual rendered scale changes', () => {
@@ -357,6 +497,66 @@ describe('Ink canvas controller', () => {
 
     expect(committedTransformSpy).toHaveBeenCalledWith(0.9, 0, 0, 0.9, 183.2, 0);
     expect(activeTransformSpy).toHaveBeenCalledWith(0.9, 0, 0, 0.9, 183.2, 0);
+    controller.dispose();
+  });
+
+  it('keeps Ink aligned when iPad WebKit reports an unzoomed layout rect after CSS zoom', () => {
+    const contexts = new WeakMap<HTMLCanvasElement, CanvasRenderingContext2D>();
+    const transformSpies = new WeakMap<HTMLCanvasElement, ReturnType<typeof vi.fn>>();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing;
+      const transformSpy = vi.fn();
+      const created = contextFixture(vi.fn(), vi.fn(), transformSpy);
+      contexts.set(this, created);
+      transformSpies.set(this, transformSpy);
+      return created;
+    });
+    const root = document.createElement('div');
+    const layoutRoot = document.createElement('div');
+    root.append(layoutRoot);
+    document.body.append(root);
+    Object.defineProperties(root, {
+      clientHeight: { configurable: true, value: 700 },
+      clientWidth: { configurable: true, value: 1_280 },
+      offsetWidth: { configurable: true, value: 1_280 },
+    });
+    Object.defineProperty(layoutRoot, 'offsetWidth', { configurable: true, value: 704 });
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 1_280, 700));
+    vi.spyOn(layoutRoot, 'getBoundingClientRect').mockImplementation(() => {
+      const scale = Number(layoutRoot.style.getPropertyValue('--inkstone-ink-scale')) || 1;
+      const visualLeft = (1_280 - 704 * scale) / 2;
+      const visualTop = 120;
+      // WebKit bug 77998: CSS zoom is rendered, but the returned rect keeps the unzoomed size and
+      // divides its viewport position by the zoom factor.
+      return rect(visualLeft / scale, visualTop / scale, 704, 1_200);
+    });
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({
+      document,
+      layoutRoot,
+      root,
+      scrollContainer: root,
+      session,
+    });
+    const committed = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]');
+    if (committed === null) throw new Error('Missing committed Canvas.');
+    const transformSpy = transformSpies.get(committed);
+    if (transformSpy === undefined) throw new Error('Missing committed transform spy.');
+
+    controller.enter();
+    for (let step = 0; step < 4; step += 1) {
+      root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-out]')?.click();
+    }
+    const visualDocumentLeft = (1_280 - 704 * 0.6) / 2;
+    root.dispatchEvent(pointer('pointerdown', visualDocumentLeft + 60, 180));
+    root.dispatchEvent(pointer('pointerup', visualDocumentLeft + 60, 180));
+
+    expect(transformSpy).toHaveBeenLastCalledWith(0.6, 0, 0, 0.6, visualDocumentLeft, 120);
+    expect(session.strokes.at(-1)?.points[0]?.x).toBeCloseTo(100);
+    expect(session.strokes.at(-1)?.points[0]?.y).toBeCloseTo(100);
     controller.dispose();
   });
 
@@ -804,6 +1004,48 @@ describe('Ink canvas controller', () => {
     controller.dispose();
   });
 
+  it('classifies closure in CSS space while sending logical loop points at 50% zoom', () => {
+    const root = document.createElement('div');
+    const layoutRoot = document.createElement('div');
+    root.append(layoutRoot);
+    document.body.append(root);
+    Object.defineProperties(root, {
+      clientHeight: { configurable: true, value: 600 },
+      clientWidth: { configurable: true, value: 1_000 },
+    });
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 1_000, 600));
+    vi.spyOn(layoutRoot, 'getBoundingClientRect').mockImplementation(() => {
+      const scale = Number(layoutRoot.style.getPropertyValue('--inkstone-ink-scale')) || 1;
+      return rect((1_000 - 704 * scale) / 2, 0, 704 * scale, 1_200 * scale);
+    });
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({
+      document,
+      layoutRoot,
+      root,
+      scrollContainer: root,
+      session,
+    });
+    controller.enter();
+    for (let step = 0; step < 5; step += 1) {
+      root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-out]')?.click();
+    }
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+    const documentLeft = (1_000 - 704 * 0.5) / 2;
+
+    root.dispatchEvent(pointer('pointerdown', documentLeft + 10, 10));
+    root.dispatchEvent(pointer('pointermove', documentLeft + 110, 10));
+    root.dispatchEvent(pointer('pointermove', documentLeft + 110, 110));
+    root.dispatchEvent(pointer('pointermove', documentLeft + 10, 110));
+    root.dispatchEvent(pointer('pointerup', documentLeft + 10, 10));
+
+    const loop = session.erasePolygonCalls[0];
+    expect(loop).toBeDefined();
+    expect((loop?.[1]?.x ?? 0) - (loop?.[0]?.x ?? 0)).toBeCloseTo(200);
+    expect((loop?.[2]?.y ?? 0) - (loop?.[1]?.y ?? 0)).toBeCloseTo(200);
+    controller.dispose();
+  });
+
   it('captures Ink in visible pane whitespace using document-relative coordinates', () => {
     const root = document.createElement('div');
     const layoutRoot = document.createElement('div');
@@ -1115,6 +1357,8 @@ describe('Ink canvas controller', () => {
 
   it('routes touch input to reading instead of starting a desktop stroke', () => {
     const root = document.createElement('div');
+    const readingContent = document.createElement('p');
+    root.append(readingContent);
     document.body.append(root);
     const session = new FakeSession(surface());
     const controller = new InkCanvasController({ document, root, session });
@@ -1122,13 +1366,198 @@ describe('Ink canvas controller', () => {
     if (active === null) throw new Error('Missing active canvas.');
     vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 960, 1200));
     controller.enter();
+    const markdownPointerHandler = vi.fn();
+    readingContent.addEventListener('pointerdown', markdownPointerHandler);
 
     const touchStart = pointer('pointerdown', 10, 20, 'touch');
-    root.dispatchEvent(touchStart);
-    root.dispatchEvent(pointer('pointerup', 20, 30, 'touch'));
+    readingContent.dispatchEvent(touchStart);
+    readingContent.dispatchEvent(pointer('pointerup', 20, 30, 'touch'));
 
     expect(session.strokes).toEqual([]);
     expect(touchStart.defaultPrevented).toBe(false);
+    expect(markdownPointerHandler).not.toHaveBeenCalled();
+  });
+
+  it('draws Pencil input from the Reading View host while leaving finger input to scrolling', () => {
+    const root = document.createElement('div');
+    const readingContent = document.createElement('p');
+    root.append(readingContent);
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+
+    readingContent.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    readingContent.dispatchEvent(pointer('pointerup', 20, 30, 'pen'));
+    const touchStart = pointer('pointerdown', 10, 20, 'touch');
+    readingContent.dispatchEvent(touchStart);
+
+    expect(session.strokes).toHaveLength(1);
+    expect(touchStart.defaultPrevented).toBe(false);
+    controller.dispose();
+  });
+
+  it('draws Apple Pencil from the WebKit stylus Touch fallback when Pointer Events report touch', () => {
+    const root = document.createElement('div');
+    const readingContent = document.createElement('p');
+    root.append(readingContent);
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+
+    readingContent.dispatchEvent(pointer('pointerdown', 10, 20, 'touch'));
+    const stylusStart = touch('touchstart', 10, 20, 'stylus');
+    readingContent.dispatchEvent(stylusStart);
+    readingContent.dispatchEvent(touch('touchmove', 20, 30, 'stylus'));
+    readingContent.dispatchEvent(touch('touchend', 30, 40, 'stylus'));
+
+    expect(stylusStart.defaultPrevented).toBe(true);
+    expect(session.strokes).toHaveLength(1);
+    controller.dispose();
+  });
+
+  it('keeps direct WebKit finger touches uncancelled for native scrolling', () => {
+    const root = document.createElement('div');
+    const readingContent = document.createElement('p');
+    root.append(readingContent);
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    const markdownTouchHandler = vi.fn();
+    readingContent.addEventListener('touchstart', markdownTouchHandler);
+
+    const fingerStart = touch('touchstart', 10, 20, 'direct');
+    readingContent.dispatchEvent(fingerStart);
+    readingContent.dispatchEvent(touch('touchmove', 10, 40, 'direct'));
+    readingContent.dispatchEvent(touch('touchend', 10, 40, 'direct'));
+
+    expect(fingerStart.defaultPrevented).toBe(false);
+    expect(markdownTouchHandler).not.toHaveBeenCalled();
+    expect(session.strokes).toEqual([]);
+    controller.dispose();
+  });
+
+  it('does not duplicate a Pencil stroke when WebKit emits both Pointer and stylus Touch events', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(touch('touchstart', 10, 20, 'stylus'));
+    root.dispatchEvent(pointer('pointermove', 20, 30, 'pen'));
+    root.dispatchEvent(touch('touchmove', 20, 30, 'stylus'));
+    root.dispatchEvent(pointer('pointerup', 30, 40, 'pen'));
+    root.dispatchEvent(touch('touchend', 30, 40, 'stylus'));
+
+    expect(session.strokes).toHaveLength(1);
+    controller.dispose();
+  });
+
+  it('blocks Reading View double-click activation only during Ink edit without blocking touch scroll', async () => {
+    const root = document.createElement('div');
+    const readingContent = document.createElement('p');
+    root.append(readingContent);
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+    const editActivation = vi.fn();
+    root.addEventListener('dblclick', editActivation);
+    controller.enter();
+
+    const touchStart = pointer('pointerdown', 10, 20, 'touch');
+    readingContent.dispatchEvent(touchStart);
+    const doubleClick = new MouseEvent('dblclick', {
+      bubbles: true,
+      cancelable: true,
+      detail: 2,
+    });
+    readingContent.dispatchEvent(doubleClick);
+
+    expect(touchStart.defaultPrevented).toBe(false);
+    expect(doubleClick.defaultPrevented).toBe(true);
+    expect(editActivation).not.toHaveBeenCalled();
+
+    await controller.exit('preview');
+    const previewDoubleClick = new MouseEvent('dblclick', {
+      bubbles: true,
+      cancelable: true,
+      detail: 2,
+    });
+    readingContent.dispatchEvent(previewDoubleClick);
+    expect(previewDoubleClick.defaultPrevented).toBe(false);
+    expect(editActivation).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
+  it('blocks Reading View text selection only during Ink edit', async () => {
+    const root = document.createElement('div');
+    const readingContent = document.createElement('p');
+    root.append(readingContent);
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+
+    const editSelection = new Event('selectstart', {
+      bubbles: true,
+      cancelable: true,
+    });
+    readingContent.dispatchEvent(editSelection);
+    expect(editSelection.defaultPrevented).toBe(true);
+
+    await controller.exit('preview');
+    const previewSelection = new Event('selectstart', {
+      bubbles: true,
+      cancelable: true,
+    });
+    readingContent.dispatchEvent(previewSelection);
+    expect(previewSelection.defaultPrevented).toBe(false);
+    controller.dispose();
+  });
+
+  it('allows the first Pencil click but blocks the second click that activates Markdown edit', () => {
+    const root = document.createElement('div');
+    const readingContent = document.createElement('p');
+    root.append(readingContent);
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+    const readingActivation = vi.fn();
+    root.addEventListener('click', readingActivation);
+    controller.enter();
+
+    readingContent.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    readingContent.dispatchEvent(pointer('pointerup', 20, 30, 'pen'));
+    const firstClick = new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      detail: 1,
+    });
+    readingContent.dispatchEvent(firstClick);
+    const secondClick = new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      detail: 2,
+    });
+    readingContent.dispatchEvent(secondClick);
+
+    expect(firstClick.defaultPrevented).toBe(false);
+    expect(secondClick.defaultPrevented).toBe(true);
+    expect(readingActivation).toHaveBeenCalledOnce();
+    controller.dispose();
   });
 
   it('switches pen/highlighter styles and exposes non-color active state', () => {
@@ -1175,6 +1604,369 @@ describe('Ink canvas controller', () => {
     expect(session.redoCalls).toBe(1);
   });
 
+  it('routes a qualifying closed eraser path to one region erase', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 110));
+    root.dispatchEvent(pointer('pointermove', 10, 110));
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+
+    expect(session.erasePolygonCalls).toHaveLength(1);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
+  it('tolerates a natural Pencil loop that finishes with a moderate closing gap', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 110, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 110, 110, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 10, 110, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 10, 50, 'pen'));
+
+    expect(session.erasePolygonCalls).toHaveLength(1);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
+  it('recognizes a deliberate Pencil loop with a large pen-lift gap', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 110, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 110, 110, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 10, 110, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 10, 90, 'pen'));
+
+    expect(session.erasePolygonCalls).toHaveLength(1);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
+  it('keeps a self-intersecting Pencil loop eligible for even-odd region erase', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 110, 110, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 10, 110, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 110, 10, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 10, 10, 'pen'));
+
+    expect(session.erasePolygonCalls).toHaveLength(1);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
+  it('closes an Apple Pencil loop when WebKit exposes coalesced samples only for moves', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen', 'moves-only'));
+    root.dispatchEvent(pointer('pointermove', 110, 10, 'pen', 'moves-only'));
+    root.dispatchEvent(pointer('pointermove', 110, 110, 'pen', 'moves-only'));
+    root.dispatchEvent(pointer('pointermove', 10, 110, 'pen', 'moves-only'));
+    root.dispatchEvent(pointer('pointerup', 10, 10, 'pen', 'moves-only'));
+
+    expect(session.erasePolygonCalls).toHaveLength(1);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
+  it('keeps Apple Pencil tap erase when WebKit returns no coalesced down/up samples', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen', 'moves-only'));
+    root.dispatchEvent(pointer('pointerup', 12, 12, 'pen', 'moves-only'));
+
+    expect(session.eraseCalls).toBe(1);
+    expect(session.erasePolygonCalls).toEqual([]);
+    controller.dispose();
+  });
+
+  it('keeps a long open eraser path as one endpoint erase', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 110));
+    root.dispatchEvent(pointer('pointerup', 60, 110));
+
+    expect(session.eraseCalls).toBe(1);
+    expect(session.erasePolygonCalls).toEqual([]);
+    controller.dispose();
+  });
+
+  it('does not auto-close a retraced scribble whose endpoints happen to be nearby', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 30, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 10, 11, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 30, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 10, 11, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 10, 26, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 10, 15, 'pen'));
+
+    expect(session.eraseCalls).toBe(1);
+    expect(session.erasePolygonCalls).toEqual([]);
+    controller.dispose();
+  });
+
+  it('cancels a closed eraser path without leaking it into the next gesture', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 110));
+    root.dispatchEvent(pointer('pointermove', 10, 110));
+    root.dispatchEvent(pointer('pointermove', 10, 10));
+    root.dispatchEvent(pointer('pointercancel', 10, 10));
+    root.dispatchEvent(pointer('pointerdown', 200, 200));
+    root.dispatchEvent(pointer('pointerup', 202, 202));
+
+    expect(session.erasePolygonCalls).toEqual([]);
+    expect(session.eraseCalls).toBe(1);
+    controller.dispose();
+  });
+
+  it('cancels an unfinished eraser loop when the user switches tools', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 110));
+    root.dispatchEvent(pointer('pointermove', 10, 110));
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="pen"]')?.click();
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+
+    expect(session.erasePolygonCalls).toEqual([]);
+    expect(session.eraseCalls).toBe(0);
+    expect(session.strokes.map(({ id }) => id)).toEqual(['saved']);
+    controller.dispose();
+  });
+
+  it('cancels an unfinished eraser loop when Ink edit exits', async () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 110));
+    root.dispatchEvent(pointer('pointermove', 10, 110));
+    await controller.exit();
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+
+    expect(session.erasePolygonCalls).toEqual([]);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
+  it('cancels an unfinished eraser loop when Obsidian replaces the active host', () => {
+    const root = document.createElement('div');
+    const replacement = document.createElement('div');
+    document.body.append(root, replacement);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({
+      document,
+      layoutRoot: root,
+      root,
+      scrollContainer: root,
+      session,
+    });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 110));
+    root.dispatchEvent(pointer('pointermove', 10, 110));
+    controller.reattach(replacement, replacement, replacement);
+    replacement.dispatchEvent(pointer('pointerup', 10, 10));
+
+    expect(session.erasePolygonCalls).toEqual([]);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
+  it('cancels an unfinished eraser loop when the controller unloads', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 110));
+    root.dispatchEvent(pointer('pointermove', 10, 110));
+    controller.dispose();
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+
+    expect(session.erasePolygonCalls).toEqual([]);
+    expect(session.eraseCalls).toBe(0);
+  });
+
+  it('describes both point and closed-loop gestures on the eraser control', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+
+    expect(
+      root
+        .querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')
+        ?.getAttribute('aria-label'),
+    ).toBe('Stroke eraser: tap a stroke or circle strokes');
+    controller.dispose();
+  });
+
+  it('renders a dashed eraser path with a non-color closure marker', () => {
+    const contexts: CanvasRenderingContext2D[] = [];
+    const arc = vi.fn();
+    const setLineDash = vi.fn();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(() => {
+      const context = contextFixture(undefined, undefined, undefined, {
+        arc,
+        setLineDash,
+      });
+      contexts.push(context);
+      return context;
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 110, 10));
+
+    expect(contexts[1]).toBeDefined();
+    expect(setLineDash).toHaveBeenCalledWith(expect.arrayContaining([expect.any(Number)]));
+    expect(arc).toHaveBeenCalled();
+    controller.dispose();
+  });
+
+  it('uses the WebKit stylus Touch fallback for the eraser', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(touch('touchstart', 10, 10, 'stylus'));
+    root.dispatchEvent(touch('touchend', 12, 12, 'stylus'));
+
+    expect(session.eraseCalls).toBe(1);
+    controller.dispose();
+  });
+
+  it('uses the WebKit stylus Touch fallback for closed-loop erase', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(touch('touchstart', 10, 10, 'stylus'));
+    root.dispatchEvent(touch('touchmove', 110, 10, 'stylus'));
+    root.dispatchEvent(touch('touchmove', 110, 110, 'stylus'));
+    root.dispatchEvent(touch('touchmove', 10, 110, 'stylus'));
+    root.dispatchEvent(touch('touchend', 10, 10, 'stylus'));
+
+    expect(session.erasePolygonCalls).toHaveLength(1);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
+  it('commits one closed-loop erase when WebKit emits both Pointer and stylus Touch events', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
+    root.dispatchEvent(touch('touchstart', 10, 10, 'stylus'));
+    root.dispatchEvent(pointer('pointermove', 110, 10, 'pen'));
+    root.dispatchEvent(touch('touchmove', 110, 10, 'stylus'));
+    root.dispatchEvent(pointer('pointermove', 110, 110, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 10, 110, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 10, 10, 'pen'));
+    root.dispatchEvent(touch('touchend', 10, 10, 'stylus'));
+
+    expect(session.erasePolygonCalls).toHaveLength(1);
+    expect(session.eraseCalls).toBe(0);
+    controller.dispose();
+  });
+
   it('selects and previews a mouse drag while keeping touch available for scrolling', () => {
     const root = document.createElement('div');
     document.body.append(root);
@@ -1200,6 +1992,127 @@ describe('Ink canvas controller', () => {
     expect(session.previewCalls[0]?.dx).toBeCloseTo(20);
     expect(session.commitCalls).toBe(1);
     expect(session.strokes).toHaveLength(1);
+  });
+
+  it('reveals a delete action for the current selection and removes it as one command', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 1200));
+    controller.enter();
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-select-move]')?.click();
+    expect(
+      root.querySelector<HTMLButtonElement>('[data-inkstone-ink-delete-selection]')?.hidden,
+    ).toBe(true);
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+
+    const deleteButton = root.querySelector<HTMLButtonElement>(
+      '[data-inkstone-ink-delete-selection]',
+    );
+    expect(deleteButton?.hidden).toBe(false);
+    expect(deleteButton?.getAttribute('aria-label')).toBe('Delete 1 selected Ink stroke');
+
+    deleteButton?.click();
+
+    expect(session.deleteSelectionCalls).toBe(1);
+    expect(session.strokes).toEqual([]);
+    expect(session.selectedStrokeIds()).toEqual([]);
+    expect(deleteButton?.hidden).toBe(true);
+    controller.dispose();
+  });
+
+  it('uses the WebKit stylus Touch fallback for Select and move', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface([stroke('saved')]));
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-select-move]')?.click();
+
+    root.dispatchEvent(touch('touchstart', 10, 10, 'stylus'));
+    root.dispatchEvent(touch('touchmove', 30, 40, 'stylus'));
+    root.dispatchEvent(touch('touchend', 30, 40, 'stylus'));
+
+    expect(session.selectCalls).toEqual([{ additive: false, x: 10, y: 10 }]);
+    expect(session.previewCalls[0]).toMatchObject({ dx: 20, dy: 30 });
+    expect(session.commitCalls).toBe(1);
+    expect(session.strokes).toHaveLength(1);
+    controller.dispose();
+  });
+
+  it('drags the full multiple selection when the pointer starts on an already selected stroke', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const first = stroke('first');
+    const second = {
+      ...stroke('second'),
+      points: [
+        { pressure: 0.5, time: 0, x: 110, y: 110 },
+        { pressure: 0.5, time: 16, x: 120, y: 120 },
+      ],
+    };
+    const session = new FakeSession(surface([first, second]));
+    const controller = new InkCanvasController({ document, root, session });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 1200));
+    controller.enter();
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-select-move]')?.click();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-multiple]')?.click();
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+    root.dispatchEvent(pointer('pointerdown', 110, 110));
+    root.dispatchEvent(pointer('pointerup', 110, 110));
+    expect(session.selectedStrokeIds()).toEqual(['first', 'second']);
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 30, 40));
+    root.dispatchEvent(pointer('pointerup', 30, 40));
+
+    expect(session.selectedStrokeIds()).toEqual(['first', 'second']);
+    expect(session.strokes[0]?.points[0]).toMatchObject({ x: 30, y: 40 });
+    expect(session.strokes[1]?.points[0]).toMatchObject({ x: 130, y: 140 });
+    expect(session.commitCalls).toBe(1);
+  });
+
+  it('toggles an already selected stroke only when the multiple-selection gesture stays a click', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const second = {
+      ...stroke('second'),
+      points: [
+        { pressure: 0.5, time: 0, x: 110, y: 110 },
+        { pressure: 0.5, time: 16, x: 120, y: 120 },
+      ],
+    };
+    const session = new FakeSession(surface([stroke('first'), second]));
+    const controller = new InkCanvasController({ document, root, session });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 1200));
+    controller.enter();
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-select-move]')?.click();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-multiple]')?.click();
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+    root.dispatchEvent(pointer('pointerdown', 110, 110));
+    root.dispatchEvent(pointer('pointerup', 110, 110));
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 12, 12));
+    root.dispatchEvent(pointer('pointerup', 12, 12));
+
+    expect(session.selectedStrokeIds()).toEqual(['second']);
+    expect(session.previewCalls).toEqual([]);
+    expect(session.commitCalls).toBe(0);
   });
 
   it('shows a non-mutating hover affordance in Select/Move', () => {
@@ -1330,7 +2243,86 @@ describe('Ink canvas controller', () => {
     expect(preference.hintShown).toBe(false);
   });
 
-  it('keeps the palette in deterministic keyboard order with names, tooltips, and live status', () => {
+  it('restores every stable toolbar choice from the device-local preference', () => {
+    const root = document.createElement('div');
+    const layoutRoot = document.createElement('div');
+    root.append(layoutRoot);
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      layoutRoot,
+      preference: {
+        color: '#123456',
+        hintShown: true,
+        interaction: 'select',
+        multiple: true,
+        optionsVisible: true,
+        tool: 'highlighter',
+        width: 1,
+        zoomMode: 'manual',
+        zoomScale: 0.7,
+      },
+      root,
+      session: new FakeSession(surface()),
+    });
+
+    controller.enter();
+
+    expect(
+      root.querySelector('[data-inkstone-ink-select-move]')?.getAttribute('aria-pressed'),
+    ).toBe('true');
+    expect(root.querySelector<HTMLElement>('[data-inkstone-ink-multiple]')?.hidden).toBe(false);
+    expect(root.querySelector('[data-inkstone-ink-multiple]')?.getAttribute('aria-pressed')).toBe(
+      'true',
+    );
+    expect(root.querySelector<HTMLInputElement>('[data-inkstone-ink-color]')?.hidden).toBe(false);
+    expect(root.querySelector<HTMLInputElement>('[data-inkstone-ink-color]')?.value).toBe(
+      '#123456',
+    );
+    expect(root.querySelector<HTMLSelectElement>('[data-inkstone-ink-width-select]')?.value).toBe(
+      '1',
+    );
+    expect(
+      root
+        .querySelector('button[aria-label="Show or hide Ink options"]')
+        ?.getAttribute('aria-expanded'),
+    ).toBe('true');
+    expect(root.classList.contains('is-ink-fit')).toBe(false);
+    expect(layoutRoot.style.getPropertyValue('--inkstone-ink-scale')).toBe('0.7');
+    controller.dispose();
+  });
+
+  it('persists option visibility, selection controls, and edit zoom after each user choice', () => {
+    const root = document.createElement('div');
+    const layoutRoot = document.createElement('div');
+    root.append(layoutRoot);
+    document.body.append(root);
+    const changes: InkToolPreference[] = [];
+    const controller = new InkCanvasController({
+      document,
+      layoutRoot,
+      onPreferenceChanged: (preference) => changes.push(preference),
+      preference: { ...LocalInkToolPreferenceStore.DEFAULT, hintShown: true },
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+
+    root.querySelector<HTMLButtonElement>('button[aria-label="Show or hide Ink options"]')?.click();
+    expect(changes.at(-1)).toMatchObject({ optionsVisible: true });
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-out]')?.click();
+    expect(changes.at(-1)).toMatchObject({ zoomMode: 'manual', zoomScale: 0.9 });
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-select-move]')?.click();
+    expect(changes.at(-1)).toMatchObject({ interaction: 'select', optionsVisible: false });
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-multiple]')?.click();
+    expect(changes.at(-1)).toMatchObject({ interaction: 'select', multiple: true });
+    controller.dispose();
+  });
+
+  it('keeps the palette in deterministic keyboard order without stealing focus on iPad', () => {
     const root = document.createElement('div');
     document.body.append(root);
     const controller = new InkCanvasController({
@@ -1341,20 +2333,23 @@ describe('Ink canvas controller', () => {
     controller.enter();
     const controls = root.querySelector<HTMLElement>('.inkstone-ink-controls');
     const buttons = [...(controls?.querySelectorAll<HTMLButtonElement>('button') ?? [])];
+    const keyboardControls = [
+      ...(controls?.querySelectorAll<HTMLButtonElement | HTMLSelectElement>('button, select') ??
+        []),
+    ];
 
     expect(controls?.hasAttribute('data-inkstone-ink-toolbar-app')).toBe(true);
     expect(controls?.getAttribute('role')).toBe('toolbar');
-    expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
+    expect(keyboardControls.map((control) => control.getAttribute('aria-label'))).toEqual([
       'Move Ink toolbar',
       'Exit Ink Mode',
       'Pen',
       'Highlighter',
-      'Stroke eraser',
+      'Stroke eraser: tap a stroke or circle strokes',
       'Select and move Ink',
       'Select multiple Ink strokes',
-      'Set Ink width to 2 px',
-      'Set Ink width to 4 px',
-      'Set Ink width to 8 px',
+      'Delete 0 selected Ink strokes',
+      'Ink width',
       'Zoom Ink workspace out',
       'Fit Ink workspace to pane · 100%',
       'Zoom Ink workspace in',
@@ -1392,8 +2387,23 @@ describe('Ink canvas controller', () => {
     more?.focus();
     expect(root.querySelector<HTMLInputElement>('[aria-label="Ink color"]')?.hidden).toBe(true);
     more?.click();
-    expect(document.activeElement?.getAttribute('aria-label')).toBe('Ink color');
+    expect(document.activeElement).toBe(more);
     expect(root.querySelector<HTMLInputElement>('[aria-label="Ink color"]')?.hidden).toBe(false);
+    const width = root.querySelector<HTMLSelectElement>('[data-inkstone-ink-width-select]');
+    expect(width?.value).toBe('4');
+    expect([...(width?.options ?? [])].map((option) => option.value)).toEqual([
+      '1',
+      '2',
+      '4',
+      '8',
+      '12',
+      '16',
+    ]);
+    expect(
+      root
+        .querySelector<HTMLElement>('.inkstone-ink-controls__width-preview')
+        ?.style.getPropertyValue('height'),
+    ).toBe('4px');
     more?.click();
     expect(root.querySelector<HTMLInputElement>('[aria-label="Ink color"]')?.hidden).toBe(true);
   });
@@ -1401,8 +2411,10 @@ describe('Ink canvas controller', () => {
   it('moves the compact floating palette by its drag handle and keeps it in the viewport', () => {
     const root = document.createElement('div');
     document.body.append(root);
+    const changes: InkToolPreference[] = [];
     const controller = new InkCanvasController({
       document,
+      onPreferenceChanged: (preference) => changes.push(preference),
       root,
       session: new FakeSession(surface()),
     });
@@ -1424,9 +2436,122 @@ describe('Ink canvas controller', () => {
     expect(controls.style.left).toBe('380px');
     expect(controls.style.top).toBe('280px');
     expect(controls.style.right).toBe('auto');
+    expect(changes.at(-1)?.toolbarPosition).toEqual({ left: 380, top: 280 });
 
     handle.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowLeft' }));
     expect(controls.style.left).toBe('752px');
+    expect(changes.at(-1)?.toolbarPosition).toEqual({ left: 752, top: 80 });
+  });
+
+  it('restores and clamps the remembered palette inside the iPad visual viewport', () => {
+    const visualViewport = new EventTarget();
+    Object.defineProperties(visualViewport, {
+      height: { value: 400 },
+      offsetLeft: { value: 100 },
+      offsetTop: { value: 50 },
+      width: { value: 500 },
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      preference: {
+        color: '#123456',
+        hintShown: true,
+        tool: 'pen',
+        toolbarPosition: { left: 20, top: 900 },
+        width: 4,
+      },
+      root,
+      session: new FakeSession(surface()),
+    });
+    const controls = root.querySelector<HTMLElement>('.inkstone-ink-controls');
+    if (controls === null) throw new Error('Missing Ink controls.');
+    vi.spyOn(controls, 'getBoundingClientRect').mockReturnValue(rect(20, 900, 420, 48));
+
+    controller.enter();
+
+    expect(controls.dataset.inkstoneInkDragged).toBe('true');
+    expect(controls.style.left).toBe('112px');
+    expect(controls.style.top).toBe('390px');
+  });
+
+  it('keeps a remembered palette position while its first iPad layout rect is still zero', () => {
+    const visualViewport = new EventTarget();
+    Object.defineProperties(visualViewport, {
+      height: { value: 700 },
+      offsetLeft: { value: 0 },
+      offsetTop: { value: 0 },
+      width: { value: 1_000 },
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      preference: {
+        color: '#123456',
+        hintShown: true,
+        tool: 'pen',
+        toolbarPosition: { left: 240, top: 180 },
+        width: 4,
+      },
+      root,
+      session: new FakeSession(surface()),
+    });
+    const controls = root.querySelector<HTMLElement>('.inkstone-ink-controls');
+    if (controls === null) throw new Error('Missing Ink controls.');
+    vi.spyOn(controls, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 0, 0));
+
+    controller.enter();
+
+    expect(controls.style.left).toBe('240px');
+    expect(controls.style.top).toBe('180px');
+  });
+
+  it('extends the pane Canvas through the owning iPad view content', async () => {
+    const viewportHost = document.createElement('div');
+    const root = document.createElement('div');
+    const layoutRoot = document.createElement('div');
+    root.append(layoutRoot);
+    viewportHost.append(root);
+    document.body.append(viewportHost);
+    Object.defineProperties(root, {
+      clientHeight: { configurable: true, value: 600 },
+      clientWidth: { configurable: true, value: 1_000 },
+    });
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(0, 100, 1_000, 600));
+    vi.spyOn(viewportHost, 'getBoundingClientRect').mockReturnValue(rect(0, 100, 1_000, 900));
+    vi.spyOn(layoutRoot, 'getBoundingClientRect').mockReturnValue(rect(148, 132, 704, 500));
+    const extentChanged = vi.fn();
+    const shortSurface = surface();
+    const controller = new InkCanvasController({
+      document,
+      layoutRoot,
+      onLayoutExtentChanged: extentChanged,
+      root,
+      scrollContainer: root,
+      session: new FakeSession({
+        ...shortSurface,
+        layout: { ...shortSurface.layout, logicalHeight: 500 },
+      }),
+      viewportHost,
+    });
+    const overlay = root.querySelector<HTMLElement>('.inkstone-ink-surface');
+    if (overlay === null) throw new Error('Missing Ink surface.');
+
+    controller.enter();
+    await vi.waitFor(() => expect(extentChanged).toHaveBeenCalled());
+
+    expect(overlay.style.height).toBe('900px');
+    expect(extentChanged).toHaveBeenCalledWith(868);
   });
 
   it('defaults a compact document pane to the bottom so the toolbar does not cover its title', () => {
@@ -1536,7 +2661,9 @@ class FakeSession {
   cancelCalls = 0;
   clearCalls = 0;
   commitCalls = 0;
+  deleteSelectionCalls = 0;
   eraseCalls = 0;
+  erasePolygonCalls: Array<readonly InkPoint[]> = [];
   enterCalls = 0;
   exitCalls = 0;
   failExit = false;
@@ -1545,7 +2672,7 @@ class FakeSession {
   redoCalls = 0;
   previewCalls: Array<{ dx: number; dy: number }> = [];
   private previewBaseStrokes: InkStroke[] | null = null;
-  private selected = false;
+  private readonly selected = new Set<string>();
   savedLocally = false;
   state: InkSurfaceSessionSnapshot['state'] = {
     dirty: false,
@@ -1610,8 +2737,8 @@ class FakeSession {
 
   clearSelection(): boolean {
     this.clearCalls += 1;
-    const changed = this.selected || this.previewBaseStrokes !== null;
-    this.selected = false;
+    const changed = this.selected.size > 0 || this.previewBaseStrokes !== null;
+    this.selected.clear();
     this.previewBaseStrokes = null;
     return changed;
   }
@@ -1622,12 +2749,22 @@ class FakeSession {
     return true;
   }
 
+  deleteSelectedStrokes(): readonly string[] {
+    this.deleteSelectionCalls += 1;
+    const selected = this.selectedStrokeIds();
+    this.strokes = this.strokes.filter((candidate) => !this.selected.has(candidate.id));
+    this.selected.clear();
+    if (selected.length > 0) {
+      this.state = { dirty: true, kind: 'ink-mode', saveError: null };
+    }
+    return selected;
+  }
+
   previewSelectionMove(dx: number, dy: number): { readonly dx: number; readonly dy: number } {
     this.previewCalls.push({ dx, dy });
     this.previewBaseStrokes ??= this.strokes;
-    const selectedId = this.previewBaseStrokes[0]?.id;
     this.strokes = this.previewBaseStrokes.map((candidate) =>
-      candidate.id === selectedId
+      this.selected.has(candidate.id)
         ? {
             ...candidate,
             points: candidate.points.map((point) => ({
@@ -1647,17 +2784,36 @@ class FakeSession {
     additive = false,
   ): readonly string[] {
     this.selectCalls.push({ additive, x: point.x, y: point.y });
-    this.selected = this.strokes.length > 0;
-    return this.selected ? [this.strokes[0]?.id ?? ''] : [];
+    const strokeId = this.hitStrokeId(point);
+    if (!additive) this.selected.clear();
+    if (strokeId === null) {
+      this.selected.clear();
+    } else if (additive && this.selected.has(strokeId)) {
+      this.selected.delete(strokeId);
+    } else {
+      this.selected.add(strokeId);
+    }
+    return this.selectedStrokeIds();
   }
 
   selectedStrokeIds(): readonly string[] {
-    return !this.selected || this.strokes.length === 0 ? [] : [this.strokes[0]?.id ?? ''];
+    return [...this.selected];
   }
 
   strokeIdAt(point: { readonly x: number; readonly y: number }): string | null {
     this.hoverCalls.push({ x: point.x, y: point.y });
-    return this.strokes[0]?.id ?? null;
+    return this.hitStrokeId(point);
+  }
+
+  private hitStrokeId(point: { readonly x: number; readonly y: number }): string | null {
+    return (
+      this.strokes.find((candidate) =>
+        candidate.points.some(
+          (candidatePoint) =>
+            Math.hypot(candidatePoint.x - point.x, candidatePoint.y - point.y) <= 8,
+        ),
+      )?.id ?? null
+    );
   }
 
   exit(): Promise<void> {
@@ -1693,6 +2849,11 @@ class FakeSession {
   eraseStrokeAt(): string | null {
     this.eraseCalls += 1;
     return this.strokes[0]?.id ?? null;
+  }
+
+  eraseStrokesInPolygon(polygon: readonly InkPoint[]): readonly string[] {
+    this.erasePolygonCalls.push(polygon);
+    return [];
   }
 
   redo(): boolean {
@@ -1743,7 +2904,13 @@ function stroke(id: string): InkStroke {
   };
 }
 
-function pointer(type: string, x: number, y: number, pointerType = 'mouse'): Event {
+function pointer(
+  type: string,
+  x: number,
+  y: number,
+  pointerType = 'mouse',
+  coalescedEvents: 'all' | 'moves-only' = 'all',
+): Event {
   const event = new MouseEvent(type, {
     bubbles: true,
     button: 0,
@@ -1752,12 +2919,38 @@ function pointer(type: string, x: number, y: number, pointerType = 'mouse'): Eve
     clientY: y,
   });
   Object.defineProperties(event, {
-    getCoalescedEvents: { value: () => [event] },
+    getCoalescedEvents: {
+      value: () => (coalescedEvents === 'moves-only' && type !== 'pointermove' ? [] : [event]),
+    },
     pointerId: { value: 1 },
     pointerType: { value: pointerType },
     pressure: { value: pointerType === 'pen' ? 0.7 : 0 },
     tiltX: { value: 0 },
     tiltY: { value: 0 },
+  });
+  return event;
+}
+
+function touch(
+  type: string,
+  x: number,
+  y: number,
+  touchType: 'direct' | 'stylus',
+  identifier = 7,
+): Event {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  const sample = {
+    altitudeAngle: touchType === 'stylus' ? Math.PI / 4 : 0,
+    azimuthAngle: 0,
+    clientX: x,
+    clientY: y,
+    force: touchType === 'stylus' ? 0.7 : 0,
+    identifier,
+    touchType,
+  };
+  Object.defineProperties(event, {
+    changedTouches: { value: [sample] },
+    touches: { value: type === 'touchend' || type === 'touchcancel' ? [] : [sample] },
   });
   return event;
 }
@@ -1780,8 +2973,13 @@ function contextFixture(
   strokeSpy = vi.fn(),
   clearRectSpy = vi.fn(),
   setTransformSpy = vi.fn(),
+  previewSpies: {
+    arc?: ReturnType<typeof vi.fn>;
+    setLineDash?: ReturnType<typeof vi.fn>;
+  } = {},
 ): CanvasRenderingContext2D {
   return {
+    arc: previewSpies.arc ?? vi.fn(),
     beginPath: vi.fn(),
     clearRect: clearRectSpy,
     lineCap: 'round',
@@ -1791,6 +2989,7 @@ function contextFixture(
     restore: vi.fn(),
     save: vi.fn(),
     scale: vi.fn(),
+    setLineDash: previewSpies.setLineDash ?? vi.fn(),
     setTransform: setTransformSpy,
     stroke: strokeSpy,
     strokeStyle: '#000',

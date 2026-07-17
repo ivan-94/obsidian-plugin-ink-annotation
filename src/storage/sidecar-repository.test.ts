@@ -288,6 +288,46 @@ describe('sidecar repository contract', () => {
     await expect(repository.readAnnotation('旧目录/中文笔记.md', created.id)).resolves.toBeNull();
   });
 
+  it('rekeys an observed rename by old path even when the source fingerprint changed', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    const created = await createFixture(repository, 'Draft.md');
+
+    const reconciled = await repository.reconcileObservedRename({
+      newPath: 'Renamed.md',
+      now: '2026-07-14T11:30:00.000Z',
+      oldPath: 'Draft.md',
+    });
+
+    expect(reconciled).toMatchObject({
+      filePath: 'Renamed.md',
+      noteId: created.noteId,
+      sourceFingerprint: created.target.sourceRevision,
+    });
+    await expect(repository.readAnnotation('Renamed.md', created.id)).resolves.toEqual({
+      ...created,
+      filePath: 'Renamed.md',
+      revision: 2,
+      updatedAt: '2026-07-14T11:30:00.000Z',
+    });
+    await expect(repository.readAnnotation('Draft.md', created.id)).resolves.toBeNull();
+  });
+
+  it('reports an observed rename when a canonical text path rewrite fails', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    await createFixture(repository, 'Draft.md');
+    store.corruptAndFailNextAnnotationWrite();
+
+    await expect(
+      repository.reconcileObservedRename({
+        newPath: 'Renamed.md',
+        now: '2026-07-14T11:30:00.000Z',
+        oldPath: 'Draft.md',
+      }),
+    ).rejects.toThrow('Injected partial write');
+  });
+
   it('rebuilds a disposable summary entirely from canonical record files', async () => {
     const store = new MemoryTextFileStore();
     const repository = new SidecarRepository(store);
@@ -384,6 +424,41 @@ describe('sidecar repository contract', () => {
     expect(restored).toMatchObject({ noteId: created.noteId });
   });
 
+  it('preserves the original missing-source timestamp across repeated delete events', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    await createFixture(repository, 'Recoverable.md');
+    await repository.markNoteSourceMissing('Recoverable.md', '2026-07-14T14:00:00.000Z');
+
+    await expect(
+      repository.markNoteSourceMissing('Recoverable.md', '2026-07-15T14:00:00.000Z'),
+    ).resolves.toMatchObject({ sourceMissingAt: '2026-07-14T14:00:00.000Z' });
+  });
+
+  it('does not attach missing sidecars to unrelated content recreated at the same path', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    const created = await createFixture(repository, 'Reused.md');
+    await repository.markNoteSourceMissing('Reused.md', '2026-07-14T14:00:00.000Z');
+
+    await expect(
+      repository.reconcileNote({
+        filePath: 'Reused.md',
+        now: '2026-07-14T14:05:00.000Z',
+        sourceFingerprint: 'unrelated-source',
+      }),
+    ).rejects.toThrow(/different content/u);
+
+    expect((await repository.listNotes()).notes).toMatchObject([
+      {
+        filePath: 'Reused.md',
+        noteId: created.noteId,
+        sourceMissingAt: '2026-07-14T14:00:00.000Z',
+      },
+    ]);
+    await expect(repository.readAnnotation('Reused.md', created.id)).resolves.toEqual(created);
+  });
+
   it('discovers every canonical note meta in stable path order', async () => {
     const store = new MemoryTextFileStore();
     const repository = new SidecarRepository(store);
@@ -406,6 +481,62 @@ describe('sidecar repository contract', () => {
     expect(discovered.notes.map((note) => note.filePath)).toEqual(['Zeta.md', '研究/Alpha.md']);
   });
 
+  it('resolves a canonical annotation sidecar event to its validated source file', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    const created = await createFixture(repository, 'External.md');
+    const sidecarPath = store.pathBySuffix(`/annotations/${created.id}.json`);
+    if (sidecarPath === null) throw new Error('Missing canonical annotation fixture path.');
+
+    await expect(repository.resolveFilePathForAnnotationSidecar(sidecarPath)).resolves.toBe(
+      'External.md',
+    );
+  });
+
+  it('resolves direct iCloud conflict siblings but rejects paths outside annotation candidates', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    const created = await createFixture(repository, 'External.md');
+    const sidecarPath = store.pathBySuffix(`/annotations/${created.id}.json`);
+    if (sidecarPath === null) throw new Error('Missing canonical annotation fixture path.');
+    const noteRoot = sidecarPath.slice(0, sidecarPath.lastIndexOf('/annotations/'));
+
+    await expect(
+      repository.resolveFilePathForAnnotationSidecar(
+        `${noteRoot}/annotations/${created.id} (conflicted copy).json`,
+      ),
+    ).resolves.toBe('External.md');
+    await expect(
+      Promise.all([
+        repository.resolveFilePathForAnnotationSidecar(`${noteRoot}/summary.json`),
+        repository.resolveFilePathForAnnotationSidecar(
+          `${noteRoot}/annotations/nested/${created.id}.json`,
+        ),
+      ]),
+    ).resolves.toEqual([null, null]);
+  });
+
+  it('fails closed when annotation sidecar metadata is damaged or has mismatched identity', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new SidecarRepository(store);
+    const created = await createFixture(repository, 'External.md');
+    const sidecarPath = store.pathBySuffix(`/annotations/${created.id}.json`);
+    if (sidecarPath === null) throw new Error('Missing canonical annotation fixture path.');
+    const metaPath = `${sidecarPath.slice(0, sidecarPath.lastIndexOf('/annotations/'))}/meta.json`;
+    const originalMeta = await store.read(metaPath);
+    if (originalMeta === null) throw new Error('Missing note metadata fixture.');
+
+    await store.write(metaPath, '{');
+    await expect(repository.resolveFilePathForAnnotationSidecar(sidecarPath)).resolves.toBeNull();
+
+    const parsedMeta = JSON.parse(originalMeta) as Record<string, unknown>;
+    await store.write(metaPath, JSON.stringify({ ...parsedMeta, pathHash: '0'.repeat(64) }));
+    await expect(repository.resolveFilePathForAnnotationSidecar(sidecarPath)).resolves.toBeNull();
+
+    await store.write(metaPath, JSON.stringify({ ...parsedMeta, filePath: 'Different.md' }));
+    await expect(repository.resolveFilePathForAnnotationSidecar(sidecarPath)).resolves.toBeNull();
+  });
+
   it('emits canonical record changes only after successful writes', async () => {
     const store = new MemoryTextFileStore();
     const changes: string[] = [];
@@ -420,6 +551,26 @@ describe('sidecar repository contract', () => {
     });
 
     expect(changes).toEqual([`${created.id}:1`, `${created.id}:2`]);
+  });
+
+  it('keeps a successful canonical write successful when a projection event throws', async () => {
+    const store = new MemoryTextFileStore();
+    const issues: unknown[] = [];
+    const repository = new SidecarRepository(store, {
+      onEventIssue: (error) => issues.push(error),
+      onRecordChanged: () => {
+        throw new Error('projection unavailable');
+      },
+    });
+    const created = await createFixture(repository, 'Event Isolation.md');
+    const updated = { ...created, revision: 2, updatedAt: '2026-07-14T16:01:00.000Z' };
+
+    await expect(repository.updateAnnotation(updated)).resolves.toBeUndefined();
+    await expect(repository.readAnnotation(updated.filePath, updated.id)).resolves.toEqual(updated);
+    expect(issues).toEqual([
+      expect.objectContaining({ message: 'projection unavailable' }),
+      expect.objectContaining({ message: 'projection unavailable' }),
+    ]);
   });
 });
 
@@ -526,6 +677,10 @@ class MemoryTextFileStore implements TextFileStore {
 
   readBySuffix(pathSuffix: string): string | null {
     return [...this.files.entries()].find(([path]) => path.endsWith(pathSuffix))?.[1] ?? null;
+  }
+
+  pathBySuffix(pathSuffix: string): string | null {
+    return [...this.files.keys()].find((path) => path.endsWith(pathSuffix)) ?? null;
   }
 
   corruptAndFailNextAnnotationWrite(): void {

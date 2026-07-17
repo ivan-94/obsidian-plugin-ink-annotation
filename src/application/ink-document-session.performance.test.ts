@@ -61,6 +61,32 @@ describe('Ink document interaction performance', () => {
     expect(session.selectedStrokeIds()).toEqual(['stroke-15-123']);
     expect(durationMs).toBeLessThan(250);
   });
+
+  it('classifies and batch-erases 10,000 strokes with a 128-point loop within the desktop budget', () => {
+    const strokes = Array.from({ length: 10_000 }, (_value, index): InkStroke => ({
+      color: '#111111',
+      id: `stroke-${index}`,
+      points: [point(index % 1_000, Math.floor(index / 1_000) * 20)],
+      tool: 'pen',
+      width: 2,
+    }));
+    const polygon = Array.from({ length: 128 }, (_value, index) => {
+      const angle = (index / 128) * Math.PI * 2;
+      return point(500 + Math.cos(angle) * 220, 90 + Math.sin(angle) * 220);
+    });
+    const session = new InkDocumentSession({
+      surfaces: [{ ...surface(), strokes }],
+      writer: { updateSurface: () => Promise.resolve() },
+    });
+    const startedAt = performance.now();
+
+    const erased = session.eraseStrokesInPolygon(polygon);
+    const durationMs = performance.now() - startedAt;
+
+    expect(erased.length).toBeGreaterThan(0);
+    expect(erased.length).toBeLessThan(strokes.length);
+    expect(durationMs).toBeLessThan(250);
+  });
 });
 
 function surface(): InkSurfaceRecord {

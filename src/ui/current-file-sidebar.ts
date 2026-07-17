@@ -42,8 +42,8 @@ export class CurrentFileSidebar {
     selection: readonly CurrentBulkSelectionEntry[],
     invoker: HTMLElement,
   ) => Promise<void>;
-  private readonly onDeleteAnnotation: (annotationId: string) => void;
-  private readonly onDeleteInk: (surfaceId: string) => void;
+  private readonly onDeleteAnnotation: (annotationId: string, expectedRevision: number) => void;
+  private readonly onDeleteInk: (surfaceId: string, expectedRevision: number) => void;
   private readonly onEditInk: (surfaceId: string) => void;
   private readonly onEntireVault: () => void | Promise<void>;
   private readonly onExportCurrentFile: (invoker: HTMLElement) => void;
@@ -56,7 +56,7 @@ export class CurrentFileSidebar {
   private readonly onRetry: () => void;
   private readonly onReviewConflicts: (invoker: HTMLElement) => void;
   private readonly onRestoreAnnotation: (annotationId: string, expectedRevision: number) => void;
-  private readonly onRestoreInk: (surfaceId: string) => void;
+  private readonly onRestoreInk: (surfaceId: string, expectedRevision: number) => void;
   private readonly onSelect: (annotationId: string) => void;
   private readonly onSelectInk: (summary: InkSurfaceSummary) => void;
   private readonly showScope: boolean;
@@ -83,10 +83,10 @@ export class CurrentFileSidebar {
       selection: readonly CurrentBulkSelectionEntry[],
       invoker: HTMLElement,
     ) => Promise<void>;
-    readonly onDeleteAnnotation?: (annotationId: string) => void;
+    readonly onDeleteAnnotation?: (annotationId: string, expectedRevision: number) => void;
     readonly onInspect?: (annotationId: string, invoker: HTMLElement) => void;
     readonly onRepairAnnotation?: (annotationId: string, invoker: HTMLElement) => void;
-    readonly onDeleteInk?: (surfaceId: string) => void;
+    readonly onDeleteInk?: (surfaceId: string, expectedRevision: number) => void;
     readonly onEditInk?: (surfaceId: string) => void;
     readonly onExportInkPng?: (surfaceId: string) => void;
     readonly onExportInkReport?: () => void;
@@ -95,7 +95,7 @@ export class CurrentFileSidebar {
     readonly onExportCurrentFile?: (invoker: HTMLElement) => void;
     readonly onRetry?: () => void;
     readonly onReviewConflicts?: (invoker: HTMLElement) => void;
-    readonly onRestoreInk?: (surfaceId: string) => void;
+    readonly onRestoreInk?: (surfaceId: string, expectedRevision: number) => void;
     readonly onRestoreAnnotation?: (annotationId: string, expectedRevision: number) => void;
     readonly onSelect: (annotationId: string) => void;
     readonly onSelectInk?: (summary: InkSurfaceSummary) => void;

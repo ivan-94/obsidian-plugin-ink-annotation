@@ -11,6 +11,11 @@ Inkstone Annotations plugin.
 - [Ink three-state view and toolbar/layout correction](2026-07-15-ink-three-state-view-and-toolbar-correction.md)
 - [Ink 704 zoomable workspace and pane-wide drawing](2026-07-16-ink-704-zoomable-workspace.md)
 - [Ink Stage Frame and native navigation](2026-07-16-ink-stage-frame-and-native-navigation.md)
+- [Ink context-sensitive next-action button](2026-07-16-ink-next-action-button.md)
+- [Ink closed-loop stroke eraser](2026-07-16-ink-closed-loop-stroke-eraser.md)
+- [Sidecar lifecycle, Trash, and garbage collection](2026-07-16-sidecar-lifecycle-trash-and-garbage-collection.md)
+- [Editing mode dormancy and Reading View remount correction](2026-07-17-editing-mode-dormancy.md)
+- [Ink iCloud-resilient persistence](2026-07-17-ink-icloud-resilient-persistence.md)
 - [Preact UI architecture refactor specification](2026_07_15_refactor_to_preact.md)
 
 Historical plan updates that have already been reconciled into the master plan are retained here for
@@ -52,6 +57,11 @@ are no longer valid sources of truth.
 - `docs/specs/2026-07-15-ink-three-state-view-and-toolbar-correction.md`
 - `docs/specs/2026-07-16-ink-704-zoomable-workspace.md`
 - `docs/specs/2026-07-16-ink-stage-frame-and-native-navigation.md`
+- `docs/specs/2026-07-16-ink-next-action-button.md`
+- `docs/specs/2026-07-16-ink-closed-loop-stroke-eraser.md`
+- `docs/specs/2026-07-16-sidecar-lifecycle-trash-and-garbage-collection.md`
+- `docs/specs/2026-07-17-editing-mode-dormancy.md`
+- `docs/specs/2026-07-17-ink-icloud-resilient-persistence.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`
 - `docs/specs/2026-07-15-preact-execution-plan-update.md`
 - `docs/specs/assets/obsidian-annotation-plugin-ui-v2/`

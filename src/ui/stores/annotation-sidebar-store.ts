@@ -11,6 +11,13 @@ import type { CurrentBulkDialog } from '../sidebar/current-bulk-selection-types'
 
 export type SidebarScope = 'current-file' | 'entire-vault';
 
+export interface RecentDeletionReceipt {
+  readonly count: number;
+  readonly error: string | null;
+  readonly expiresAt: number;
+  readonly pending: boolean;
+}
+
 export interface CurrentFileSidebarStore {
   readonly activeAnnotationId: Signal<string | null>;
   readonly bulkDialog: Signal<CurrentBulkDialog>;
@@ -20,7 +27,11 @@ export interface CurrentFileSidebarStore {
   readonly filePath: Signal<string | null>;
   readonly inkSummaries: Signal<readonly InkSurfaceSummary[]>;
   readonly model: Signal<CurrentFileAnnotationList>;
-  readonly pendingInkDelete: Signal<{ readonly id: string; readonly title: string } | null>;
+  readonly pendingInkDelete: Signal<{
+    readonly expectedRevision: number;
+    readonly id: string;
+    readonly title: string;
+  } | null>;
   readonly restoreDeadline: Signal<number | null>;
   readonly scrollOffset: Signal<number>;
   readonly searchQuery: Signal<string>;
@@ -96,6 +107,8 @@ export function createVaultSidebarStore(): VaultSidebarStore {
 
 export class AnnotationSidebarStore {
   readonly current = createCurrentFileSidebarStore();
+
+  readonly recentDeletion = signal<RecentDeletionReceipt | null>(null);
 
   readonly scope = signal<SidebarScope>('current-file');
 

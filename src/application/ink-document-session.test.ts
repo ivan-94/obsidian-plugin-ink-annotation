@@ -322,6 +322,119 @@ describe('continuous Ink document session', () => {
     expect(session.snapshot().surface.strokes).toHaveLength(1);
   });
 
+  it('erases every enclosed logical stroke as one undoable command', () => {
+    const session = createSession([
+      {
+        ...surface('a', 600),
+        strokes: [
+          { ...stroke('inside-a', 20, 40), points: [point(20, 20), point(40, 40)] },
+          { ...stroke('inside-b', 60, 80), points: [point(60, 60), point(80, 80)] },
+          { ...stroke('crossing', 50, 50), points: [point(50, 50), point(150, 50)] },
+          { ...stroke('outside', 140, 160), points: [point(140, 140), point(160, 160)] },
+        ],
+      },
+    ]).session;
+    const loop = [point(0, 0), point(100, 0), point(100, 100), point(0, 100)];
+
+    expect(session.eraseStrokesInPolygon(loop)).toEqual(['inside-a', 'inside-b']);
+    expect(session.snapshot().surface.strokes.map(({ id }) => id)).toEqual(['crossing', 'outside']);
+
+    expect(session.undo()).toBe(true);
+    expect(session.snapshot().surface.strokes.map(({ id }) => id)).toEqual([
+      'inside-a',
+      'inside-b',
+      'crossing',
+      'outside',
+    ]);
+    expect(session.redo()).toBe(true);
+    expect(session.snapshot().surface.strokes.map(({ id }) => id)).toEqual(['crossing', 'outside']);
+  });
+
+  it('keeps history and persistence unchanged when a closed loop matches nothing', () => {
+    const { session, writer } = createSession([
+      {
+        ...surface('a', 600),
+        strokes: [{ ...stroke('saved', 20, 40), points: [point(20, 20), point(40, 40)] }],
+      },
+    ]);
+    const emptyLoop = [point(200, 200), point(300, 200), point(300, 300), point(200, 300)];
+
+    expect(session.eraseStrokesInPolygon(emptyLoop)).toEqual([]);
+    expect(session.canUndo()).toBe(false);
+    expect(session.canRedo()).toBe(false);
+    expect(writer.records).toEqual([]);
+    expect(session.snapshot().surface.strokes.map(({ id }) => id)).toEqual(['saved']);
+  });
+
+  it('preserves an available redo command when a closed loop matches nothing', () => {
+    const session = createSession([
+      {
+        ...surface('a', 600),
+        strokes: [{ ...stroke('saved', 20, 40), points: [point(20, 20), point(40, 40)] }],
+      },
+    ]).session;
+    session.eraseStrokeAt(point(20, 20), 8);
+    session.undo();
+    const emptyLoop = [point(200, 200), point(300, 200), point(300, 300), point(200, 300)];
+
+    expect(session.canRedo()).toBe(true);
+    expect(session.eraseStrokesInPolygon(emptyLoop)).toEqual([]);
+    expect(session.canRedo()).toBe(true);
+  });
+
+  it('atomically removes every linked fragment enclosed across chunks', async () => {
+    const linkedA: InkStroke = {
+      ...fragment('fragment-a', 'user-stroke', 550, 600),
+      points: [point(100, 550), point(150, 600)],
+    };
+    const linkedB: InkStroke = {
+      ...fragment('fragment-b', 'user-stroke', 0, 50),
+      points: [point(150, 0), point(200, 50)],
+    };
+    const { session, writer } = createSession([
+      { ...surface('a', 600), strokes: [linkedA] },
+      { ...surface('b', 400), strokes: [linkedB] },
+    ]);
+    const loop = [point(50, 500), point(250, 500), point(250, 700), point(50, 700)];
+
+    expect(session.eraseStrokesInPolygon(loop)).toEqual(['user-stroke']);
+    expect(session.snapshot().surface.strokes).toEqual([]);
+    await session.background();
+
+    expect(writer.atomicBatches).toHaveLength(1);
+    expect(writer.atomicBatches[0]?.map(({ strokes }) => strokes)).toEqual([[], []]);
+  });
+
+  it('retains a complete live circle erase when its atomic write fails and retries it', async () => {
+    const linkedA: InkStroke = {
+      ...fragment('fragment-a', 'user-stroke', 550, 600),
+      points: [point(100, 550), point(150, 600)],
+    };
+    const linkedB: InkStroke = {
+      ...fragment('fragment-b', 'user-stroke', 0, 50),
+      points: [point(150, 0), point(200, 50)],
+    };
+    const writer = new FailOnceAtomicWriter();
+    const session = new InkDocumentSession({
+      surfaces: [
+        { ...surface('a', 600), strokes: [linkedA] },
+        { ...surface('b', 400), strokes: [linkedB] },
+      ],
+      writer,
+    });
+    const loop = [point(50, 500), point(250, 500), point(250, 700), point(50, 700)];
+
+    expect(session.eraseStrokesInPolygon(loop)).toEqual(['user-stroke']);
+    await expect(session.background()).rejects.toThrow('batch unavailable');
+    expect(session.snapshot().surface.strokes).toEqual([]);
+    expect(session.recoverySnapshot()).toMatchObject({ requiresRecovery: true });
+
+    await session.retry();
+    expect(session.snapshot().surface.strokes).toEqual([]);
+    expect(writer.attempts).toBe(2);
+    expect(writer.records.map(({ strokes }) => strokes)).toEqual([[], []]);
+  });
+
   it('selects one linked logical stroke without persisting selection chrome', () => {
     const session = createSession([surface('a', 600), surface('b', 400)]).session;
     session.addStroke(stroke('user-stroke', 550, 650));
@@ -368,6 +481,26 @@ describe('continuous Ink document session', () => {
     expect(session.selectedStrokeIds()).toEqual([]);
     expect(session.clearSelection()).toBe(false);
     expect(writer.records).toEqual([]);
+  });
+
+  it('deletes the selected logical strokes as one undoable command and clears selection', () => {
+    const session = createSession([surface('a', 600), surface('b', 400)]).session;
+    session.addStroke(stroke('first', 100, 120));
+    session.addStroke(stroke('crossing', 550, 650));
+    session.addStroke(stroke('retained', 800, 820));
+    session.selectStrokeAt(point(100, 100), 8);
+    session.selectStrokeAt(point(151, 601), 8, true);
+
+    expect(session.deleteSelectedStrokes()).toEqual(['first', 'crossing']);
+    expect(session.selectedStrokeIds()).toEqual([]);
+    expect(session.snapshot().surface.strokes.map(({ id }) => id)).toEqual(['retained']);
+
+    expect(session.undo()).toBe(true);
+    expect(session.snapshot().surface.strokes.map(({ id }) => id)).toEqual([
+      'first',
+      'crossing',
+      'retained',
+    ]);
   });
 
   it('previews one shared selection translation in memory and cancel restores the snapshot', () => {

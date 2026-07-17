@@ -16,11 +16,14 @@ export type InkPersistenceState =
   | { readonly error: unknown; readonly kind: 'error'; readonly message: string };
 
 export interface InkSurfaceWriter {
-  updateSurface(record: InkSurfaceRecord, expectedBase?: InkSurfaceRecord): Promise<void>;
+  updateSurface(
+    record: InkSurfaceRecord,
+    expectedBase?: InkSurfaceRecord,
+  ): Promise<InkSurfaceRecord | void>;
   updateSurfacesAtomically?(
     records: readonly InkSurfaceRecord[],
     expectedBases?: readonly InkSurfaceRecord[],
-  ): Promise<void>;
+  ): Promise<readonly InkSurfaceRecord[] | void>;
 }
 
 export interface InkSurfaceSessionSnapshot {
@@ -218,17 +221,16 @@ export class InkSurfaceSession {
         // where the Vault write landed before an error.
         if (!this.dirty) this.surface = candidate;
         this.emit();
-        await this.repository.updateSurface(candidate, this.confirmedBase);
-        this.confirmedBase = candidate;
+        const committed =
+          (await this.repository.updateSurface(candidate, this.confirmedBase)) ?? candidate;
+        this.confirmedBase = committed;
         this.pendingAttempt = null;
         this.pendingAttemptStarted = false;
         // Drawing may have continued while bytes were in flight. Advance the persisted
         // revision while retaining the newer live stroke array for the next loop.
-        this.surface = {
-          ...this.surface,
-          revision: candidate.revision,
-          updatedAt: candidate.updatedAt,
-        };
+        this.surface = this.dirty
+          ? carryWorkingChangesForward(candidate, this.surface, committed)
+          : committed;
         // A synchronous recovery checkpoint must advance its base revision as soon as the
         // canonical write does, including when a newer stroke arrived while bytes were in flight.
         this.emit();
@@ -238,14 +240,15 @@ export class InkSurfaceSession {
       this.setPersistence({ kind: 'saved-locally' });
     } catch (error) {
       this.dirty = true;
+      const message = persistenceFailureMessage(error);
       this.state = reduceInkModeState(this.state, {
-        message: error instanceof Error ? error.message : String(error),
+        message,
         type: 'save-failed',
       });
       this.setPersistence({
         error,
         kind: 'error',
-        message: "Couldn't save Ink locally. Retry.",
+        message,
       });
       throw error;
     }
@@ -301,4 +304,52 @@ function sameWorkingContent(working: InkSurfaceRecord, candidate: InkSurfaceReco
       updatedAt: candidate.updatedAt,
     }) === encodeInkSurfaceRecord(candidate)
   );
+}
+
+function persistenceFailureMessage(error: unknown): string {
+  return error instanceof Error && error.name === 'InkSurfaceStaleBaseError'
+    ? 'Another Ink version arrived. Your local strokes are safe.'
+    : "Couldn't save Ink locally. Retry.";
+}
+
+function carryWorkingChangesForward(
+  attempted: InkSurfaceRecord,
+  working: InkSurfaceRecord,
+  committed: InkSurfaceRecord,
+): InkSurfaceRecord {
+  const attemptedIds = new Set(attempted.strokes.map(({ id }) => id));
+  const workingById = new Map(working.strokes.map((stroke) => [stroke.id, stroke]));
+  const carried: InkStroke[] = [];
+  const carriedIds = new Set<string>();
+  for (const committedStroke of committed.strokes) {
+    if (attemptedIds.has(committedStroke.id)) {
+      const workingStroke = workingById.get(committedStroke.id);
+      if (workingStroke !== undefined) {
+        carried.push(workingStroke);
+        carriedIds.add(workingStroke.id);
+      }
+      continue;
+    }
+    const collision = workingById.get(committedStroke.id);
+    if (collision !== undefined && JSON.stringify(collision) !== JSON.stringify(committedStroke)) {
+      throw new Error(
+        `Ink stroke ${committedStroke.id} changed while a merged canonical save was in flight; local Ink is retained.`,
+      );
+    }
+    carried.push(committedStroke);
+    carriedIds.add(committedStroke.id);
+  }
+  for (const workingStroke of working.strokes) {
+    if (!carriedIds.has(workingStroke.id)) carried.push(workingStroke);
+  }
+  return {
+    ...working,
+    layout: {
+      ...working.layout,
+      logicalHeight: Math.max(working.layout.logicalHeight, committed.layout.logicalHeight),
+    },
+    revision: committed.revision,
+    strokes: carried,
+    updatedAt: committed.updatedAt,
+  };
 }

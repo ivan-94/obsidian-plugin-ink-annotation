@@ -15,6 +15,10 @@ Markdown.
   `docs/specs/2026-07-16-ink-704-zoomable-workspace.md`
 - Current Ink Stage Frame and native navigation correction:
   `docs/specs/2026-07-16-ink-stage-frame-and-native-navigation.md`
+- Current Ink context-sensitive next-action button:
+  `docs/specs/2026-07-16-ink-next-action-button.md`
+- Current Ink closed-loop stroke eraser: `docs/specs/2026-07-16-ink-closed-loop-stroke-eraser.md`
+- Current editing-mode dormancy correction: `docs/specs/2026-07-17-editing-mode-dormancy.md`
 - UI architecture refactor specification: `docs/specs/2026_07_15_refactor_to_preact.md`
 - Slice evidence: `docs/delivery/slices/`
 

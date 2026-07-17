@@ -20,6 +20,7 @@ export interface InkToolbarState {
   readonly optionsVisible: boolean;
   readonly position: InkToolbarPosition | null;
   readonly saveError: string | null;
+  readonly selectedCount: number;
   readonly statusText: string;
   readonly tool: InkStroke['tool'];
   readonly width: number;
@@ -39,16 +40,20 @@ export function createInkToolbarStore(preference: InkToolPreference): InkToolbar
       canUndo: false,
       color: preference.color,
       dragging: false,
-      interaction: 'draw',
-      multiple: false,
-      optionsVisible: false,
-      position: null,
+      interaction: preference.interaction ?? 'draw',
+      multiple: preference.multiple ?? false,
+      optionsVisible: preference.optionsVisible ?? false,
+      position:
+        preference.toolbarPosition === undefined
+          ? null
+          : { ...preference.toolbarPosition, dragged: true },
       saveError: null,
+      selectedCount: 0,
       statusText: 'Ink Mode',
       tool: preference.tool,
       width: preference.width,
-      zoomMode: 'fit',
-      zoomScale: 1,
+      zoomMode: preference.zoomMode ?? 'fit',
+      zoomScale: preference.zoomScale ?? 1,
     }),
   };
 }
