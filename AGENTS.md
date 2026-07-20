@@ -23,6 +23,8 @@ Markdown.
 - Current Ink native-feel performance and brush-fidelity specification:
   `docs/specs/2026-07-17-ink-native-feel-performance-and-brush-fidelity.md`
 - Current Ink native-feel execution plan: `docs/specs/2026-07-17-ink-native-feel-execution-plan.md`
+- Current Ink responsive commands, save, and Preview specification:
+  `docs/specs/2026-07-20-ink-responsive-commands-save-and-preview.md`
 - UI architecture refactor specification: `docs/specs/2026_07_15_refactor_to_preact.md`
 - Slice evidence: `docs/delivery/slices/`
 
