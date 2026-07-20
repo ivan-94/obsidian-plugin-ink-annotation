@@ -215,7 +215,7 @@ describe('InkRenderRuntime', () => {
     runtime.dispose();
   });
 
-  it('projects the retained bitmap during scrolling and rebuilds only when the frame settles', () => {
+  it('projects during scrolling and rebuilds the settled viewport without shifting committed pixels', () => {
     const frames: FrameRequestCallback[] = [];
     const host = document.createElement('div');
     document.body.append(host);
@@ -258,13 +258,13 @@ describe('InkRenderRuntime', () => {
     drain(frames);
 
     expect(query).toHaveBeenCalledOnce();
-    expect(committedContext.drawImage).toHaveBeenCalledOnce();
-    expect(query.mock.calls[0]?.[0]).toMatchObject({ height: 80, y: 200 });
+    expect(committedContext.drawImage).not.toHaveBeenCalled();
+    expect(query.mock.calls[0]?.[0]).toMatchObject({ height: 200, y: 80 });
     expect(
       committedContext.clearRect.mock.calls
         .slice(clearsBeforeScroll)
         .some(([x, y, width, height]) => x === 0 && y === 0 && width === 200 && height === 200),
-    ).toBe(false);
+    ).toBe(true);
     expect(committed.style.transform).toBe('');
     runtime.dispose();
   });

@@ -21,9 +21,8 @@ interface InkRasterTileEntry<Value> {
 }
 
 /** Bounded non-DOM LRU for disposable committed raster tiles. */
-export class InkRasterTileCache<Value> {
+export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant {
   private bytes = 0;
-  private clock = 0;
   private readonly entries = new Map<string, InkRasterTileEntry<Value>>();
   private evictionCount = 0;
   private hitCount = 0;
@@ -32,8 +31,14 @@ export class InkRasterTileCache<Value> {
   constructor(
     private maxBytes: number,
     private readonly disposeValue: (value: Value) => void,
+    private readonly coordinator: InkGeometryCacheCoordinator = GLOBAL_INK_GEOMETRY_CACHE_COORDINATOR,
   ) {
     assertBudget(maxBytes);
+    this.coordinator.register(this);
+  }
+
+  get disposableBytes(): number {
+    return this.bytes;
   }
 
   get(key: string): Value | null {
@@ -42,7 +47,7 @@ export class InkRasterTileCache<Value> {
       this.missCount += 1;
       return null;
     }
-    entry.lastAccess = ++this.clock;
+    entry.lastAccess = this.coordinator.nextUse();
     this.hitCount += 1;
     return entry.value;
   }
@@ -57,9 +62,15 @@ export class InkRasterTileCache<Value> {
       this.disposeValue(value);
       return false;
     }
-    this.entries.set(key, { bounds, byteSize, lastAccess: ++this.clock, value });
+    this.entries.set(key, {
+      bounds,
+      byteSize,
+      lastAccess: this.coordinator.nextUse(),
+      value,
+    });
     this.bytes += byteSize;
     this.evictToBudget();
+    this.coordinator.enforce();
     return this.entries.has(key);
   }
 
@@ -80,6 +91,11 @@ export class InkRasterTileCache<Value> {
     for (const key of [...this.entries.keys()]) this.delete(key, false);
   }
 
+  dispose(): void {
+    this.clear();
+    this.coordinator.unregister(this);
+  }
+
   stats(): InkRasterTileCacheStats {
     return Object.freeze({
       bytes: this.bytes,
@@ -88,6 +104,24 @@ export class InkRasterTileCache<Value> {
       hitCount: this.hitCount,
       missCount: this.missCount,
     });
+  }
+
+  evictionCandidate(): InkDisposableMemoryEvictionCandidate | null {
+    let selectedKey: string | null = null;
+    let selected: InkRasterTileEntry<Value> | null = null;
+    for (const [key, entry] of this.entries) {
+      if (selected === null || entry.lastAccess < selected.lastAccess) {
+        selectedKey = key;
+        selected = entry;
+      }
+    }
+    return selected === null || selectedKey === null
+      ? null
+      : {
+          evict: () => this.delete(selectedKey, true),
+          lastUsed: selected.lastAccess,
+          visible: false,
+        };
   }
 
   private evictToBudget(): void {
@@ -142,3 +176,9 @@ function intersects(left: InkRasterTileBounds, right: InkRasterTileBounds): bool
     left.y + left.height >= right.y
   );
 }
+import {
+  GLOBAL_INK_GEOMETRY_CACHE_COORDINATOR,
+  type InkDisposableMemoryEvictionCandidate,
+  type InkDisposableMemoryParticipant,
+  type InkGeometryCacheCoordinator,
+} from './ink-geometry-cache';

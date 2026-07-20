@@ -7,14 +7,20 @@ import {
   localConditionSampleCounts,
   localDrawingConditionFailure,
   localDrawingSampleCounts,
+  localDoneSampleCounts,
   localCacheLifecycleSampleCounts,
   localPerformanceSoakProgressText,
+  localPreviewSampleCounts,
+  localReplayDispatchMoveTarget,
+  localResponsiveCommandSampleCounts,
   localViewportSampleCounts,
   prepareLocalPerformanceMeasurement,
   resetLocalPerformanceDrafts,
   restoreLocalPerformanceCheckpoint,
   runLocalPerformanceConditionWithForegroundRecovery,
   waitForLocalPerformanceFrame,
+  waitForLocalPerformanceSpansToSettle,
+  waitForLocalCommandPresentationFrames,
   runLocalPerformanceHostHeartbeat,
   runLocalInitialFrameStringingCanary,
   runLocalReplayColdLaneYield,
@@ -39,10 +45,10 @@ describe('local Obsidian performance Gate request', () => {
       diagnostics: {},
       durationMs: 1,
       fixture: 'history-10k-30-surfaces',
-      id: 'history-10k-30-surfaces-pen-mixed-drawing',
+      id: 'history-10k-30-surfaces-pen-preview-lifecycle',
       renderRuntime: {},
       tool: 'pen',
-      trace: 'mixed-drawing',
+      trace: 'preview-lifecycle',
     };
     const checkpoint = {
       buildDigest: request.buildDigest,
@@ -118,11 +124,14 @@ describe('local Obsidian performance Gate request', () => {
       },
     });
 
-    expect(reset).toHaveLength(29);
-    expect(new Set(reset).size).toBe(29);
+    expect(reset).toHaveLength(35);
+    expect(new Set(reset).size).toBe(35);
     expect(reset).toContain('S27R6 history-10k-30-surfaces pen writing.md');
     expect(reset).toContain('S27R6 history-10k-30-surfaces pen mixed-drawing.md');
     expect(reset).toContain('S27R6 empty mixed soak.md');
+    expect(reset).toContain('S27R6 history-10k-30-surfaces pen responsive-commands.md');
+    expect(reset).toContain('S27R6 empty pen done-save.md');
+    expect(reset).toContain('S27R6 history-10k-30-surfaces pen preview-lifecycle.md');
   });
 
   it('fails the current condition immediately when replay misses the mounted Canvas', () => {
@@ -155,6 +164,20 @@ describe('local Obsidian performance Gate request', () => {
         ],
       }),
     ).toEqual({ commits: 100, idle: 120, moves: 1_000, passed: true });
+  });
+
+  it('dispatches bounded headroom without lowering the accepted move sample minimum', () => {
+    expect(localReplayDispatchMoveTarget(1_000)).toBe(1_020);
+    expect(localReplayDispatchMoveTarget(200)).toBe(220);
+  });
+
+  it('waits for command application and its following presentation opportunity', async () => {
+    let frameCount = 0;
+    await waitForLocalCommandPresentationFrames(() => {
+      frameCount += 1;
+      return Promise.resolve();
+    });
+    expect(frameCount).toBe(2);
   });
 
   it('uses the fixed replay size of each non-drawing condition', () => {
@@ -210,6 +233,53 @@ describe('local Obsidian performance Gate request', () => {
       }).passed,
     ).toBe(true);
     expect(localConditionSampleCounts('mixed-drawing', base).passed).toBe(false);
+  });
+
+  it('requires complete command, Done, and Preview stage coverage', () => {
+    const idle = Array.from({ length: 120 }, () => 16.7);
+    const commandKinds = [
+      'delete-selection',
+      'erase',
+      'move',
+      'restyle',
+      'selection',
+      ...Array.from({ length: 50 }, () => ['undo', 'redo']).flat(),
+    ];
+    const commandSpans = commandKinds.flatMap((commandKind) => [
+      { accepted: true, commandKind, name: 'ink-command-apply' },
+      { accepted: true, commandKind, name: 'ink-command-to-submit' },
+    ]);
+    expect(
+      localResponsiveCommandSampleCounts({
+        frameIntervalsMs: { idle },
+        recentSpans: commandSpans,
+      }),
+    ).toMatchObject({ passed: true, undoRedo: 100 });
+    expect(
+      localDoneSampleCounts({
+        frameIntervalsMs: { idle },
+        recentSpans: [
+          { accepted: true, name: 'ink-done-first-feedback' },
+          { accepted: true, name: 'ink-done-total' },
+        ],
+      }),
+    ).toMatchObject({ passed: true });
+    expect(
+      localPreviewSampleCounts({
+        frameIntervalsMs: { idle },
+        recentSpans: [
+          { accepted: false, name: 'ink-preview-cache-lookup' },
+          { accepted: true, name: 'ink-preview-cache-publish' },
+          { name: 'ink-preview-first-ink' },
+          { name: 'ink-preview-viewport-complete' },
+          { name: 'ink-preview-editable-hydration' },
+          { name: 'ink-preview-to-edit' },
+          { accepted: true, name: 'ink-preview-cache-lookup' },
+          { name: 'ink-preview-first-ink' },
+          { name: 'ink-preview-viewport-complete' },
+        ],
+      }),
+    ).toMatchObject({ passed: true });
   });
 
   it('rejects background or hidden host samples before they contaminate performance budgets', () => {
@@ -352,6 +422,31 @@ describe('local Obsidian performance Gate request', () => {
     expect(localPerformanceSoakProgressText(65_400, 237, 300_000)).toBe(
       'Local Gate soak 01:05 / 05:00 · 237 strokes · Pen/Highlighter switch every 10',
     );
+  });
+
+  it('waits for asynchronous Done spans to settle before taking the condition snapshot', async () => {
+    const hangingCounts = [3, 1, 0];
+    let yields = 0;
+
+    await waitForLocalPerformanceSpansToSettle({
+      snapshot: () => ({ hangingSpanCount: hangingCounts.shift() ?? 0 }),
+      waitForSettlement: () => {
+        yields += 1;
+        return Promise.resolve();
+      },
+    });
+
+    expect(yields).toBe(2);
+  });
+
+  it('fails a Done condition whose asynchronous spans never settle', async () => {
+    await expect(
+      waitForLocalPerformanceSpansToSettle({
+        maximumAttempts: 2,
+        snapshot: () => ({ hangingSpanCount: 1 }),
+        waitForSettlement: () => Promise.resolve(),
+      }),
+    ).rejects.toThrow(/did not settle/u);
   });
 
   it('records host heartbeat gaps during the real-host condition', () => {

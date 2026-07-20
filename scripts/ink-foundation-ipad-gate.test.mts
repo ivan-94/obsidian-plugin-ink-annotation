@@ -1783,6 +1783,11 @@ async function createCliRunFixture(projectRoot: string) {
       'utf8',
     ),
     writeFile(
+      join(projectRoot, 'docs', 'specs', '2026-07-20-ink-responsive-commands-save-and-preview.md'),
+      'responsive command and Preview spec\n',
+      'utf8',
+    ),
+    writeFile(
       join(evidenceRoot, 'hat-guide.md'),
       '<!-- HAT:BEGIN checklist -->\nfrozen card\n<!-- HAT:END checklist -->\n',
       'utf8',

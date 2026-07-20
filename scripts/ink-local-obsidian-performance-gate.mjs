@@ -80,7 +80,21 @@ export function analyzeLocalObsidianCapture(capture) {
   const commits = acceptedSpans(allSpans, 'ink-stroke-commit').filter(
     (span) => span.documentCommandProduced === true,
   );
-  const canonicalPersistenceSubmits = acceptedSpans(allSpans, 'ink-canonical-persistence-submit');
+  const commandSpans = conditionSpans(conditions, 'responsive-commands');
+  const doneSpans = conditionSpans(conditions, 'done-save');
+  const previewSpans = conditionSpans(conditions, 'preview-lifecycle');
+  const drawingSpans = conditions
+    .filter(({ trace }) => DRAWING_TRACES.includes(trace))
+    .flatMap(({ diagnostics }) => diagnostics.recentSpans);
+  const canonicalPersistenceSubmits = acceptedSpans(
+    drawingSpans,
+    'ink-canonical-persistence-submit',
+  );
+  const commandApply = acceptedSpans(commandSpans, 'ink-command-apply');
+  const commandSubmit = acceptedSpans(commandSpans, 'ink-command-to-submit');
+  const doneFirstFeedback = acceptedSpans(doneSpans, 'ink-done-first-feedback');
+  const previewFirstInk = acceptedSpans(previewSpans, 'ink-preview-first-ink');
+  const previewViewportComplete = acceptedSpans(previewSpans, 'ink-preview-viewport-complete');
   const viewports = acceptedSpans(allSpans, 'ink-viewport-redraw');
   const activeContactViewportRedrawCount = viewports.filter(
     (span) => span.contactSequence !== undefined,
@@ -119,6 +133,17 @@ export function analyzeLocalObsidianCapture(capture) {
       (span.name === 'ink-input-handler' || span.name === 'ink-input-to-submit') &&
       span.sampleCountBucket === '0',
   ).length;
+  const schedulerUnitOverruns = auditedDiagnostics.flatMap(
+    (diagnostics) => diagnostics.schedulerUnitOverruns ?? [],
+  );
+  const schedulerUnitCount = auditedDiagnostics.reduce(
+    (total, diagnostics) => total + (diagnostics.schedulerUnitCount ?? 0),
+    0,
+  );
+  const schedulerOverrunDistribution = distribution(schedulerUnitOverruns);
+  const schedulerOverrunRatio =
+    schedulerUnitOverruns.length / Math.max(1, schedulerUnitCount || schedulerUnitOverruns.length);
+  const schedulerUnitP99Ms = thresholdedSchedulerP99(schedulerUnitCount, schedulerUnitOverruns);
   const minimumInitialFrameStringingCanaries = Math.min(
     ...conditions
       .filter((condition) => DRAWING_TRACES.includes(condition.trace))
@@ -144,7 +169,7 @@ export function analyzeLocalObsidianCapture(capture) {
     ),
     budget('coverage', hasRequiredCoverage(conditions), {
       actual: conditions.length,
-      limit: 10,
+      limit: 16,
     }),
     budget('sample-minimums', hasSampleMinimums(conditions), {
       actual: minimumSamples(conditions),
@@ -166,6 +191,22 @@ export function analyzeLocalObsidianCapture(capture) {
       actual: acceptedZeroSampleMoveCount,
       limit: 0,
     }),
+    budget(
+      'scheduler-unit-distribution',
+      schedulerOverrunRatio <= 0.01 &&
+        schedulerUnitP99Ms <= 2 &&
+        schedulerOverrunDistribution.maximumMs < 4,
+      {
+        actual: {
+          overrunRatio: round(schedulerOverrunRatio),
+          overruns: schedulerOverrunDistribution,
+          p99Ms: round(schedulerUnitP99Ms),
+          totalUnitCount: schedulerUnitCount,
+          units: schedulerUnitOverruns,
+        },
+        limit: { maximumMsExclusive: 4, overrunRatio: 0.01, overrunThresholdMs: 1, p99Ms: 2 },
+      },
+    ),
     budget('initial-frame-stringing-canary', minimumInitialFrameStringingCanaries >= 100, {
       actual: { minimumPerCondition: minimumInitialFrameStringingCanaries },
       limit: { minimumPerCondition: 100 },
@@ -193,6 +234,66 @@ export function analyzeLocalObsidianCapture(capture) {
     budget('stroke-commit-p99-ms', distribution(commits).p99Ms <= 4, {
       actual: distribution(commits),
       limit: 4,
+    }),
+    budget('command-kind-coverage', hasCommandKindCoverage(commandApply), {
+      actual: [...new Set(commandApply.map(({ commandKind }) => commandKind))].sort(),
+      limit: ['delete-selection', 'erase', 'move', 'redo', 'restyle', 'selection', 'undo'],
+    }),
+    budget('command-apply-p95-p99-ms', commandApplyBudgetsPass(commandApply), {
+      actual: distribution(commandApply),
+      limit: { p95Ms: 4, p99Ms: 8 },
+    }),
+    budget(
+      'command-submit-p95-p99-ms',
+      commandSubmitBudgetsPass(commandSubmit, refreshIntervalMs),
+      {
+        actual: distribution(commandSubmit),
+        limit: { p95Ms: round(refreshIntervalMs + 8), p99Ms: round(refreshIntervalMs * 2) },
+      },
+    ),
+    budget('command-undo-redo-sample-minimum', undoRedoSampleCount(commandApply) >= 300, {
+      actual: undoRedoSampleCount(commandApply),
+      limit: 300,
+    }),
+    budget('ordinary-command-full-rebuild-count', commandRebuildCount(conditions) === 0, {
+      actual: commandRebuildCount(conditions),
+      limit: 0,
+    }),
+    budget('command-empty-vs-10k-growth', commandGrowthPasses(conditions), {
+      actual: commandGrowth(conditions),
+      limit: 'p95 delta <= max(1 ms, 10%)',
+    }),
+    budget(
+      'done-first-feedback-p99-ms',
+      distribution(doneFirstFeedback).p99Ms <= refreshIntervalMs + 2,
+      {
+        actual: distribution(doneFirstFeedback),
+        limit: round(refreshIntervalMs + 2),
+      },
+    ),
+    budget('done-total-normal-and-10k-ms', doneBudgetsPass(conditions), {
+      actual: doneConditionDurations(conditions),
+      limit: { emptyMs: 1_000, history10kMs: 3_000 },
+    }),
+    budget('preview-stage-coverage', previewStageCoveragePasses(previewSpans), {
+      actual: previewStageCounts(previewSpans),
+      limit: { cacheLookup: 2, editableHydration: 1, firstInk: 2, toEdit: 1, viewportComplete: 2 },
+    }),
+    budget('preview-cache-miss-hit-coverage', previewCacheMissHitCoverage(previewSpans), {
+      actual: previewCacheLookupOutcomes(previewSpans),
+      limit: { hit: 1, miss: 1 },
+    }),
+    budget('preview-cold-first-ink-p99-ms', (previewFirstInk[0]?.durationMs ?? Infinity) <= 500, {
+      actual: previewFirstInk[0]?.durationMs ?? null,
+      limit: 500,
+    }),
+    budget('preview-warm-first-ink-p99-ms', (previewFirstInk[1]?.durationMs ?? Infinity) <= 200, {
+      actual: previewFirstInk[1]?.durationMs ?? null,
+      limit: 200,
+    }),
+    budget('preview-viewport-complete-sample-minimum', previewViewportComplete.length >= 2, {
+      actual: previewViewportComplete.length,
+      limit: 2,
     }),
     budget(
       'foreground-canonical-persistence-submit-count',
@@ -340,7 +441,13 @@ function analyzePartialCapture(capture) {
   const commits = acceptedSpans(spans, 'ink-stroke-commit').filter(
     (span) => span.documentCommandProduced === true,
   );
-  const canonicalPersistenceSubmits = acceptedSpans(spans, 'ink-canonical-persistence-submit');
+  const drawingSpans = capture.conditions
+    .filter(({ trace }) => DRAWING_TRACES.includes(trace))
+    .flatMap(({ diagnostics: value }) => value.recentSpans);
+  const canonicalPersistenceSubmits = acceptedSpans(
+    drawingSpans,
+    'ink-canonical-persistence-submit',
+  );
   const forbiddenHotPathWork = forbiddenHotPathViolations(diagnostics);
   const armedAuditGuards = collectArmedAuditGuards(diagnostics);
   const memory = memorySummary(diagnostics);
@@ -353,7 +460,7 @@ function analyzePartialCapture(capture) {
       actual: `${capture.host.kind}/${String(capture.host.productionCanvas)}`,
       limit: 'obsidian-desktop/true',
     }),
-    budget('coverage', false, { actual: capture.conditions.length, limit: 10 }),
+    budget('coverage', false, { actual: capture.conditions.length, limit: 16 }),
     budget('sample-minimums', hasSampleMinimums(capture.conditions), {
       actual: minimumSamples(capture.conditions),
       limit: { idle: 120, move: 1_000, strokeCommit: 100, viewport: 5 },
@@ -432,6 +539,7 @@ export async function computeLocalObsidianProtocolDigest(projectRoot) {
     'scripts/ink-local-obsidian-performance-gate.mjs',
     'docs/specs/2026-07-17-ink-native-feel-execution-plan.md',
     'docs/specs/2026-07-17-ink-native-feel-performance-and-brush-fidelity.md',
+    'docs/specs/2026-07-20-ink-responsive-commands-save-and-preview.md',
   ];
   const hash = createHash('sha256');
   for (const path of paths) {
@@ -785,7 +893,9 @@ export function renderLocalObsidianSourceManifest(input) {
 ## Sources
 
 - User decision on 2026-07-18: stop iPad Run 2/3; require a real installed Obsidian performance Gate before any physical marker; automate Pen/Highlighter, empty/1k/10k-30, writing/long-line/rapid-lift/viewport/cache and a five-minute soak; compress physical acceptance to at most four sessions.
+- User decision on 2026-07-20: keep drawing memory-first until Done; make toolbar commands and Done feedback responsive; use a read-only exact Preview projection with disposable IndexedDB tiles; run the long Gate only after code and unit work are complete.
 - \`AGENTS.md\`, \`CONTEXT.md\`, and both 2026-07-17 native-feel specifications.
+- \`docs/specs/2026-07-20-ink-responsive-commands-save-and-preview.md\`.
 - Preserved failed iPad Run 1 under \`docs/delivery/slices/S27R5-ink-foundation-ipad-regate/attempts/20260718-pre-history-independent-hotpath-fix/\`.
 - \`scripts/ink-local-obsidian-performance-gate.mjs\` and \`src/adapters/obsidian/ink-local-performance-gate.ts\`.
 
@@ -809,6 +919,8 @@ export function renderLocalObsidianSourceManifest(input) {
 ## Key decisions
 
 - Real Obsidian and the production Canvas are mandatory; jsdom/Node evidence cannot satisfy this Gate.
+- Digest-compatible COMPLETE conditions resume from the checkpoint; the failed/incomplete condition reruns without repeating the passing prefix.
+- Command, Done, cold/warm Preview, Preview-to-Edit, and plugin-wide disposable-memory budgets are independent from Pencil budgets.
 - Any local failure blocks iPad marker generation. S27R6 PASS still does not claim Pencil delivery, iPad thermal, tip-to-display, or subjective product quality.
 - No telemetry, external service, personal Vault, authored note content, coordinates, pressure, tilt, or geometry are exported.
 
@@ -890,7 +1002,14 @@ function assertCondition(condition) {
     typeof condition.id !== 'string' ||
     !FIXTURES.includes(condition.fixture) ||
     !TOOLS.includes(condition.tool) ||
-    ![...ACCEPTED_DRAWING_TRACES, 'viewport', 'cache-lifecycle'].includes(condition.trace) ||
+    ![
+      ...ACCEPTED_DRAWING_TRACES,
+      'viewport',
+      'cache-lifecycle',
+      'responsive-commands',
+      'done-save',
+      'preview-lifecycle',
+    ].includes(condition.trace) ||
     !isRecord(condition.diagnostics) ||
     !isRecord(condition.renderRuntime)
   ) {
@@ -992,12 +1111,162 @@ function hasRequiredCoverage(conditions) {
     if (!keys.has(`history-10k-30-surfaces/${tool}/viewport`)) return false;
     if (!keys.has(`history-10k-30-surfaces/${tool}/cache-lifecycle`)) return false;
   }
+  for (const fixture of FIXTURES) {
+    if (!keys.has(`${fixture}/pen/responsive-commands`)) return false;
+  }
+  if (!keys.has('empty/pen/done-save')) return false;
+  if (!keys.has('history-10k-30-surfaces/pen/done-save')) return false;
+  if (!keys.has('history-10k-30-surfaces/pen/preview-lifecycle')) return false;
   return true;
+}
+
+function conditionSpans(conditions, trace) {
+  return conditions
+    .filter((condition) => condition.trace === trace)
+    .flatMap((condition) => condition.diagnostics.recentSpans);
+}
+
+function hasCommandKindCoverage(spans) {
+  const kinds = new Set(spans.map(({ commandKind }) => commandKind));
+  return ['delete-selection', 'erase', 'move', 'redo', 'restyle', 'selection', 'undo'].every(
+    (kind) => kinds.has(kind),
+  );
+}
+
+function undoRedoSampleCount(spans) {
+  return spans.filter(({ commandKind }) => commandKind === 'undo' || commandKind === 'redo').length;
+}
+
+function commandApplyBudgetsPass(spans) {
+  const value = distribution(spans);
+  return value.sampleCount > 0 && value.p95Ms <= 4 && value.p99Ms <= 8;
+}
+
+function commandSubmitBudgetsPass(spans, refreshIntervalMs) {
+  const value = distribution(spans);
+  return (
+    value.sampleCount > 0 &&
+    value.p95Ms <= refreshIntervalMs + 8 &&
+    value.p99Ms <= refreshIntervalMs * 2
+  );
+}
+
+function commandRebuildCount(conditions) {
+  return conditions
+    .filter(({ trace }) => trace === 'responsive-commands')
+    .reduce(
+      (total, { renderRuntime }) =>
+        total +
+        Math.max(
+          0,
+          renderRuntime.after.visibleRecoveryRebuildCount -
+            renderRuntime.before.visibleRecoveryRebuildCount,
+        ),
+      0,
+    );
+}
+
+function commandGrowth(conditions) {
+  const summarize = (fixture) => {
+    const condition = conditions.find(
+      (candidate) => candidate.fixture === fixture && candidate.trace === 'responsive-commands',
+    );
+    if (condition === undefined) return null;
+    return {
+      applyP95Ms: distribution(
+        acceptedSpans(condition.diagnostics.recentSpans, 'ink-command-apply'),
+      ).p95Ms,
+      submitP95Ms: distribution(
+        acceptedSpans(condition.diagnostics.recentSpans, 'ink-command-to-submit'),
+      ).p95Ms,
+    };
+  };
+  return { empty: summarize('empty'), history10k: summarize('history-10k-30-surfaces') };
+}
+
+function commandGrowthPasses(conditions) {
+  const { empty, history10k } = commandGrowth(conditions);
+  return (
+    empty !== null &&
+    history10k !== null &&
+    history10k.applyP95Ms - empty.applyP95Ms <= Math.max(1, empty.applyP95Ms * 0.1) &&
+    history10k.submitP95Ms - empty.submitP95Ms <= Math.max(1, empty.submitP95Ms * 0.1)
+  );
+}
+
+function responsiveCommandSampleCounts(spans) {
+  const apply = acceptedSpans(spans, 'ink-command-apply');
+  const submit = acceptedSpans(spans, 'ink-command-to-submit');
+  return {
+    passed:
+      hasCommandKindCoverage(apply) &&
+      undoRedoSampleCount(apply) >= 100 &&
+      submit.length === apply.length,
+  };
+}
+
+function doneSampleCounts(spans) {
+  return {
+    passed:
+      acceptedSpans(spans, 'ink-done-first-feedback').length === 1 &&
+      acceptedSpans(spans, 'ink-done-total').length === 1,
+  };
+}
+
+function doneConditionDurations(conditions) {
+  const result = {};
+  for (const condition of conditions.filter(({ trace }) => trace === 'done-save')) {
+    result[condition.fixture] = distribution(
+      acceptedSpans(condition.diagnostics.recentSpans, 'ink-done-total'),
+    ).p99Ms;
+  }
+  return result;
+}
+
+function doneBudgetsPass(conditions) {
+  const durations = doneConditionDurations(conditions);
+  return durations.empty <= 1_000 && durations['history-10k-30-surfaces'] <= 3_000;
+}
+
+function previewStageCounts(spans) {
+  const count = (name, includeMiss = false) =>
+    spans.filter((span) => span.name === name && (includeMiss || span.accepted !== false)).length;
+  return {
+    cacheLookup: count('ink-preview-cache-lookup', true),
+    editableHydration: count('ink-preview-editable-hydration'),
+    firstInk: count('ink-preview-first-ink'),
+    toEdit: count('ink-preview-to-edit'),
+    viewportComplete: count('ink-preview-viewport-complete'),
+  };
+}
+
+function previewStageCoveragePasses(spans) {
+  const counts = previewStageCounts(spans);
+  return (
+    counts.cacheLookup >= 2 &&
+    counts.editableHydration >= 1 &&
+    counts.firstInk >= 2 &&
+    counts.toEdit >= 1 &&
+    counts.viewportComplete >= 2
+  );
+}
+
+function previewCacheLookupOutcomes(spans) {
+  const lookups = spans.filter(({ name }) => name === 'ink-preview-cache-lookup');
+  return {
+    hit: lookups.filter(({ accepted }) => accepted !== false).length,
+    miss: lookups.filter(({ accepted }) => accepted === false).length,
+  };
+}
+
+function previewCacheMissHitCoverage(spans) {
+  const outcomes = previewCacheLookupOutcomes(spans);
+  return outcomes.hit >= 1 && outcomes.miss >= 1;
 }
 
 function hasSampleMinimums(conditions) {
   return (
-    conditions.length === 10 &&
+    conditions.length === 16 &&
     conditions.every((condition) => {
       const spans = condition.diagnostics.recentSpans;
       const moves = acceptedSpans(spans, 'ink-input-handler', 'move').length;
@@ -1009,6 +1278,11 @@ function hasSampleMinimums(conditions) {
       if (idle < 120) return false;
       if (DRAWING_TRACES.includes(condition.trace)) return moves >= 1_000 && commits >= 100;
       if (condition.trace === 'viewport') return viewport >= 5;
+      if (condition.trace === 'responsive-commands') {
+        return responsiveCommandSampleCounts(spans).passed;
+      }
+      if (condition.trace === 'done-save') return doneSampleCounts(spans).passed;
+      if (condition.trace === 'preview-lifecycle') return previewStageCoveragePasses(spans);
       return moves >= 200 && commits >= 20;
     })
   );
@@ -1260,6 +1534,17 @@ function distribution(spans) {
     p99Ms: round(percentile(values, 0.99)),
     sampleCount: values.length,
   };
+}
+
+function thresholdedSchedulerP99(totalUnitCount, overruns) {
+  if (totalUnitCount <= 0) return overruns.length === 0 ? 0 : distribution(overruns).p99Ms;
+  const overrunValues = overruns
+    .map(({ durationMs }) => durationMs)
+    .sort((left, right) => left - right);
+  const withinTargetCount = Math.max(0, totalUnitCount - overrunValues.length);
+  const rank = Math.ceil(totalUnitCount * 0.99);
+  if (rank <= withinTargetCount) return 1;
+  return overrunValues[rank - withinTargetCount - 1] ?? overrunValues.at(-1) ?? 0;
 }
 
 function budget(name, passed, details) {

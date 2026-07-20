@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { CompiledInkStroke } from '../domain/ink-stroke-geometry';
 import { InkGeometryCache, InkGeometryCacheCoordinator } from './ink-geometry-cache';
+import { InkRasterTileCache } from './ink-raster-tile-cache';
 
 describe('Ink geometry cache budgets', () => {
   it('evicts outside-viewport least-recently-used geometry before visible geometry', () => {
@@ -40,6 +41,18 @@ describe('Ink geometry cache budgets', () => {
 
     expect(coordinator.byteSize).toBeLessThanOrEqual(360);
     expect(first.stats().bytes + second.stats().bytes).toBe(0);
+  });
+
+  it('enforces one plugin-wide budget across geometry and raster participants', () => {
+    const coordinator = new InkGeometryCacheCoordinator(360);
+    const geometryCache = new InkGeometryCache({ coordinator, maximumBytes: 1_000 });
+    const rasterCache = new InkRasterTileCache<string>(1_000, () => undefined, coordinator);
+    geometryCache.put('geometry', geometry('geometry', 200), false);
+    rasterCache.put('raster', 'raster', { height: 10, width: 10, x: 0, y: 0 }, 200);
+
+    expect(coordinator.byteSize).toBe(geometryCache.stats().bytes + rasterCache.stats().bytes);
+    expect(coordinator.byteSize).toBeLessThanOrEqual(360);
+    expect(geometryCache.stats().entryCount + rasterCache.stats().entryCount).toBe(1);
   });
 
   it('reserves index bytes inside the local disposable budget and invalidates exact IDs', () => {

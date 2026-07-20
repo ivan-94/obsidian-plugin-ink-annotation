@@ -527,6 +527,7 @@ describe('Ink canvas viewport rendering', () => {
     vi.spyOn(scrollContainer, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 744, 200));
     vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(20, 0, 704, 1_200));
     const controller = new InkCanvasController({
+      afterNextPaint: () => Promise.resolve(),
       document,
       layoutRoot: root,
       root: scrollContainer,

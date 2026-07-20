@@ -3,6 +3,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   decodeInkSurfaceRecord,
   encodeInkSurfaceRecord,
+  inkSurfaceContentDigest,
   inkPointsToPhysicalTrace,
   inkSurfaceVisibleBounds,
   physicalTraceToInkPoints,
@@ -41,6 +42,21 @@ describe('Ink surface canonical schema', () => {
     expect(encoded).toContain('"pointEncoding": "delta-v1"');
     expect(encoded).not.toContain('"points":');
     expect(decodeInkSurfaceRecord(encoded)).toEqual(normalizedLegacy(surface));
+  });
+
+  it('retains the exact canonical byte fingerprint across encode and decode boundaries', () => {
+    const surface = fixture();
+
+    expect(inkSurfaceContentDigest(surface)).toBeNull();
+    const encoded = encodeInkSurfaceRecord(surface);
+    const encodedDigest = inkSurfaceContentDigest(surface);
+    const decoded = decodeInkSurfaceRecord(encoded);
+
+    expect(encodedDigest).toMatch(/^ink-bytes-v1:/u);
+    expect(inkSurfaceContentDigest(decoded)).toBe(encodedDigest);
+    expect(
+      inkSurfaceContentDigest(decodeInkSurfaceRecord(encoded.replace(/\n$/u, '\n\n'))),
+    ).not.toBe(encodedDigest);
   });
 
   it('round-trips section bindings and linked cross-surface stroke identity', () => {

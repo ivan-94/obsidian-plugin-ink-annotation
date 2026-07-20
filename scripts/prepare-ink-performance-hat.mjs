@@ -135,6 +135,26 @@ function localPerformanceGateConditions() {
       });
     }
   }
+  for (const fixture of CONDITIONS) {
+    conditions.push({
+      ...fixture,
+      filePath: localGateFilePath(fixture.name, 'pen', 'responsive-commands'),
+      name: `local-${fixture.name}-pen-responsive-commands`,
+    });
+  }
+  for (const fixture of [CONDITIONS[0], worst]) {
+    if (fixture === undefined) continue;
+    conditions.push({
+      ...fixture,
+      filePath: localGateFilePath(fixture.name, 'pen', 'done-save'),
+      name: `local-${fixture.name}-pen-done-save`,
+    });
+  }
+  conditions.push({
+    ...worst,
+    filePath: localGateFilePath(worst.name, 'pen', 'preview-lifecycle'),
+    name: `local-${worst.name}-pen-preview-lifecycle`,
+  });
   const empty = CONDITIONS[0];
   if (empty === undefined) throw new Error('Missing empty local Gate fixture.');
   conditions.push({

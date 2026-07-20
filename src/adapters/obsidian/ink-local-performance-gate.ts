@@ -14,6 +14,7 @@ const PARTIAL_RAW_PATH = 'S27 Local Performance Partial Raw.json';
 const CHECKPOINT_PATH = 'S27 Local Performance Checkpoint.json';
 const STATUS_PATH = 'S27 Local Performance Status.json';
 const CONDITION_MAX_DURATION_MS = 90_000;
+const REPLAY_DISPATCH_HEADROOM_MOVES = 20;
 const REPLAY_POST_FRAME_PHASE_MS = 2;
 const REPLAY_COLD_LANE_IDLE_MS = 600;
 const WARMUP_STROKE_COUNT = 3;
@@ -27,6 +28,7 @@ const TOOLS = Object.freeze(['pen', 'highlighter'] as const);
 const DRAWING_TRACES = Object.freeze(['writing', 'long-line', 'rapid-lift'] as const);
 const DRAWING_CONDITION_TRACE = 'mixed-drawing' as const;
 const CONDITION_IDS = Object.freeze([
+  'history-10k-30-surfaces-pen-preview-lifecycle',
   'history-10k-30-surfaces-pen-mixed-drawing',
   'history-10k-30-surfaces-highlighter-mixed-drawing',
   'history-1k-pen-mixed-drawing',
@@ -37,7 +39,14 @@ const CONDITION_IDS = Object.freeze([
   'history-10k-30-surfaces-pen-cache-lifecycle',
   'history-10k-30-surfaces-highlighter-viewport',
   'history-10k-30-surfaces-highlighter-cache-lifecycle',
+  'history-10k-30-surfaces-pen-responsive-commands',
+  'history-1k-pen-responsive-commands',
+  'empty-pen-responsive-commands',
+  'empty-pen-done-save',
+  'history-10k-30-surfaces-pen-done-save',
 ] as const);
+
+type ResponsiveConditionTrace = 'done-save' | 'preview-lifecycle' | 'responsive-commands';
 
 type DrawingReplayTrace = (typeof DRAWING_TRACES)[number] | typeof DRAWING_CONDITION_TRACE;
 
@@ -70,7 +79,8 @@ interface LocalPerformanceCondition {
     readonly strokeCount: number;
   };
   readonly tool: (typeof TOOLS)[number];
-  readonly trace: typeof DRAWING_CONDITION_TRACE | 'cache-lifecycle' | 'viewport';
+  readonly trace:
+    typeof DRAWING_CONDITION_TRACE | 'cache-lifecycle' | 'viewport' | ResponsiveConditionTrace;
 }
 
 /** Runtime decoder shared by on-load execution and unit tests. */
@@ -123,9 +133,14 @@ export function restoreLocalPerformanceCheckpoint(
       condition.captureStatus !== 'COMPLETE' ||
       !FIXTURES.some(({ name }) => name === condition.fixture) ||
       !TOOLS.some((tool) => tool === condition.tool) ||
-      ![DRAWING_CONDITION_TRACE, 'viewport', 'cache-lifecycle'].includes(
-        condition.trace as typeof DRAWING_CONDITION_TRACE,
-      ) ||
+      ![
+        DRAWING_CONDITION_TRACE,
+        'viewport',
+        'cache-lifecycle',
+        'responsive-commands',
+        'done-save',
+        'preview-lifecycle',
+      ].includes(condition.trace as typeof DRAWING_CONDITION_TRACE) ||
       typeof condition.durationMs !== 'number' ||
       !Number.isFinite(condition.durationMs) ||
       !isRecord(condition.diagnostics) ||
@@ -159,6 +174,7 @@ export class ObsidianLocalPerformanceGate {
     const request = decodeLocalPerformanceGateRequest(
       JSON.parse(await this.adapter.read(REQUEST_PATH)) as unknown,
     );
+    await this.input.inkMode.setPreviewByDefault(false);
     await this.input.inkMode.exit();
     await resetLocalPerformanceDrafts(this.input.draftStore);
     await this.writeStatus(request, 'RUNNING', null);
@@ -171,6 +187,23 @@ export class ObsidianLocalPerformanceGate {
     const completedConditionIds = new Set(conditions.map(({ id }) => id));
     let activeConditionId = 'initialization';
     try {
+      // Run the high-risk cache/Preview path first so an exact-cache regression fails in seconds,
+      // before the broad drawing matrix and five-minute soak consume host time.
+      activeConditionId = `${FIXTURES[0].name}-pen-preview-lifecycle`;
+      if (!completedConditionIds.has(activeConditionId)) {
+        const condition = await this.runConditionWithForegroundRecovery(
+          request,
+          activeConditionId,
+          () => this.runPreviewLifecycleCondition(FIXTURES[0]),
+        );
+        conditions.push(condition);
+        await this.writePartialCapture(request, conditions, null);
+        if (condition.captureStatus !== 'COMPLETE') {
+          throw new Error(`${condition.id} did not complete the Preview lifecycle.`);
+        }
+        completedConditionIds.add(condition.id);
+        await this.writeCheckpoint(request, conditions);
+      }
       for (const fixture of FIXTURES) {
         for (const tool of TOOLS) {
           activeConditionId = `${fixture.name}-${tool}-${DRAWING_CONDITION_TRACE}`;
@@ -220,6 +253,38 @@ export class ObsidianLocalPerformanceGate {
           completedConditionIds.add(condition.id);
           await this.writeCheckpoint(request, conditions);
         }
+      }
+      for (const fixture of FIXTURES) {
+        activeConditionId = `${fixture.name}-pen-responsive-commands`;
+        if (completedConditionIds.has(activeConditionId)) continue;
+        const condition = await this.runConditionWithForegroundRecovery(
+          request,
+          activeConditionId,
+          () => this.runResponsiveCommandCondition(fixture),
+        );
+        conditions.push(condition);
+        await this.writePartialCapture(request, conditions, null);
+        if (condition.captureStatus !== 'COMPLETE') {
+          throw new Error(`${condition.id} did not complete every command sample.`);
+        }
+        completedConditionIds.add(condition.id);
+        await this.writeCheckpoint(request, conditions);
+      }
+      for (const fixture of [FIXTURES[2], FIXTURES[0]] as const) {
+        activeConditionId = `${fixture.name}-pen-done-save`;
+        if (completedConditionIds.has(activeConditionId)) continue;
+        const condition = await this.runConditionWithForegroundRecovery(
+          request,
+          activeConditionId,
+          () => this.runDoneCondition(fixture),
+        );
+        conditions.push(condition);
+        await this.writePartialCapture(request, conditions, null);
+        if (condition.captureStatus !== 'COMPLETE') {
+          throw new Error(`${condition.id} did not complete the Done transaction.`);
+        }
+        completedConditionIds.add(condition.id);
+        await this.writeCheckpoint(request, conditions);
       }
       activeConditionId = 'five-minute-growing-history-soak';
       const soak = await this.runConditionWithForegroundRecovery(request, activeConditionId, () =>
@@ -507,6 +572,170 @@ export class ObsidianLocalPerformanceGate {
     };
   }
 
+  private async runResponsiveCommandCondition(
+    fixture: (typeof FIXTURES)[number],
+  ): Promise<LocalPerformanceCondition> {
+    const target = await this.openFixture(
+      localGateFilePath(fixture.name, 'pen', 'responsive-commands'),
+      'pen',
+    );
+    await replayForDuration(target, 'pen', 'writing', 0, WARMUP_STROKE_COUNT, 30);
+    await this.input.inkMode.background();
+    await waitForLocalPersistence(target.toolbar);
+    this.input.diagnostics.reset();
+    await this.calibrateIdleFrames();
+    const before = this.requireActiveRenderRuntimeStats();
+    const startedAt = performance.now();
+    const run = async (
+      kind: Parameters<ObsidianInkModeManager['runLocalPerformanceCommand']>[0],
+    ): Promise<void> => {
+      if (!this.input.inkMode.runLocalPerformanceCommand(kind)) {
+        throw new Error(`Local Gate command ${kind} was not accepted.`);
+      }
+      await waitForLocalCommandPresentationFrames(nextFrame);
+    };
+    await run('restyle');
+    for (let sample = 0; sample < 50; sample += 1) {
+      await run('undo');
+      await run('redo');
+    }
+    await run('selection');
+    await run('move');
+    await run('delete-selection');
+    await run('undo');
+    await run('erase');
+    await run('undo');
+    const diagnostics = this.input.diagnostics.snapshot();
+    return {
+      captureStatus: localResponsiveCommandSampleCounts(diagnostics).passed
+        ? 'COMPLETE'
+        : 'TIMEOUT',
+      diagnostics,
+      durationMs: performance.now() - startedAt,
+      fixture: fixture.name,
+      id: `${fixture.name}-pen-responsive-commands`,
+      renderRuntime: { after: this.requireActiveRenderRuntimeStats(), before },
+      tool: 'pen',
+      trace: 'responsive-commands',
+    };
+  }
+
+  private async runDoneCondition(
+    fixture: (typeof FIXTURES)[number],
+  ): Promise<LocalPerformanceCondition> {
+    await this.input.inkMode.setPreviewByDefault(false);
+    const target = await this.openFixture(
+      localGateFilePath(fixture.name, 'pen', 'done-save'),
+      'pen',
+    );
+    await replayForDuration(target, 'pen', 'writing', 0, 1, 10);
+    await nextFrame();
+    this.input.diagnostics.reset();
+    await this.calibrateIdleFrames();
+    const before = this.requireActiveRenderRuntimeStats();
+    const startedAt = performance.now();
+    await this.input.inkMode.exit();
+    await nextFrame();
+    await waitForLocalPerformanceSpansToSettle({
+      snapshot: () => this.input.diagnostics.snapshot(),
+    });
+    const diagnostics = this.input.diagnostics.snapshot();
+    return {
+      captureStatus: localDoneSampleCounts(diagnostics).passed ? 'COMPLETE' : 'TIMEOUT',
+      diagnostics,
+      durationMs: performance.now() - startedAt,
+      fixture: fixture.name,
+      id: `${fixture.name}-pen-done-save`,
+      renderRuntime: { after: before, before },
+      tool: 'pen',
+      trace: 'done-save',
+    };
+  }
+
+  private async runPreviewLifecycleCondition(
+    fixture: (typeof FIXTURES)[number],
+  ): Promise<LocalPerformanceCondition> {
+    const filePath = localGateFilePath(fixture.name, 'pen', 'preview-lifecycle');
+    await this.input.inkMode.exit();
+    await this.input.inkMode.setPreviewByDefault(false);
+    await this.input.inkMode.resetLocalPerformancePreviewCache(filePath);
+    const file = this.input.app.vault.getAbstractFileByPath(filePath);
+    if (!(file instanceof TFile)) throw new Error(`Local Gate fixture is missing: ${filePath}`);
+    const leaf = this.input.app.workspace.getLeaf(false);
+    await leaf.setViewState({ type: 'markdown', state: { file: file.path, mode: 'preview' } });
+    this.input.app.workspace.setActiveLeaf(leaf, { focus: true });
+    if (!(leaf.view instanceof MarkdownView))
+      throw new Error('Local Gate Preview view is missing.');
+    this.input.inkMode.registerView(leaf.view);
+    await this.input.inkMode.synchronizeRegisteredView(leaf.view);
+    this.input.diagnostics.reset();
+    await this.calibrateIdleFrames();
+    const startedAt = performance.now();
+    await this.input.inkMode.setPreviewByDefault(true);
+    await waitForElement(
+      leaf.view.contentEl,
+      '[data-inkstone-ink-preview-canvas]',
+      (candidate) => candidate.isConnected,
+    );
+    await waitUntil(
+      () => localPreviewSampleCounts(this.input.diagnostics.snapshot()).firstInk >= 1,
+      10_000,
+      () => 'Local Gate cold Preview did not present its first Ink pixels.',
+    );
+    await waitUntil(
+      () => localPreviewSampleCounts(this.input.diagnostics.snapshot()).viewportComplete >= 1,
+      10_000,
+      () => 'Local Gate cold Preview did not complete its visible viewport.',
+    );
+    await waitUntil(
+      () => localPreviewSampleCounts(this.input.diagnostics.snapshot()).cachePublish >= 1,
+      15_000,
+      () => 'Local Gate cold Preview did not publish its exact visible cache tiles.',
+    );
+    await this.input.inkMode.remountLocalPerformancePreview(leaf.view);
+    await waitUntil(
+      () => localPreviewSampleCounts(this.input.diagnostics.snapshot()).firstInk >= 2,
+      10_000,
+      () => 'Local Gate warm Preview did not present its first Ink pixels.',
+    );
+    await waitUntil(
+      () => {
+        const samples = localPreviewSampleCounts(this.input.diagnostics.snapshot());
+        return samples.hit >= 1 && samples.viewportComplete >= 2;
+      },
+      10_000,
+      () => 'Local Gate warm Preview did not present a complete exact cache hit.',
+    );
+    await this.input.inkMode.toggle(leaf.view);
+    await waitUntil(
+      () => {
+        const samples = localPreviewSampleCounts(this.input.diagnostics.snapshot());
+        return (
+          this.input.inkMode.activeRenderRuntimeStats !== null &&
+          samples.editableHydration >= 1 &&
+          samples.toEdit >= 1
+        );
+      },
+      10_000,
+      () => 'Local Gate Preview-to-Edit hydration did not complete.',
+    );
+    const before = this.requireActiveRenderRuntimeStats();
+    const diagnostics = this.input.diagnostics.snapshot();
+    const durationMs = performance.now() - startedAt;
+    await this.input.inkMode.exit();
+    await this.input.inkMode.setPreviewByDefault(false);
+    return {
+      captureStatus: localPreviewSampleCounts(diagnostics).passed ? 'COMPLETE' : 'TIMEOUT',
+      diagnostics,
+      durationMs,
+      fixture: fixture.name,
+      id: `${fixture.name}-pen-preview-lifecycle`,
+      renderRuntime: { after: before, before },
+      tool: 'pen',
+      trace: 'preview-lifecycle',
+    };
+  }
+
   private async runSoak(
     fixture: (typeof FIXTURES)[number],
     durationMs: number,
@@ -764,6 +993,12 @@ export async function resetLocalPerformanceDrafts(
     filePaths.push(localGateFilePath(worst.name, tool, 'viewport'));
     filePaths.push(localGateFilePath(worst.name, tool, 'cache-lifecycle'));
   }
+  for (const fixture of FIXTURES) {
+    filePaths.push(localGateFilePath(fixture.name, 'pen', 'responsive-commands'));
+  }
+  filePaths.push(localGateFilePath(FIXTURES[2].name, 'pen', 'done-save'));
+  filePaths.push(localGateFilePath(FIXTURES[0].name, 'pen', 'done-save'));
+  filePaths.push(localGateFilePath(FIXTURES[0].name, 'pen', 'preview-lifecycle'));
   filePaths.push(localGateFilePath(FIXTURES[2].name, 'mixed', 'soak'));
   await Promise.all(
     filePaths.map((filePath) => draftStore.discardThrough(filePath, Number.MAX_SAFE_INTEGER)),
@@ -793,10 +1028,11 @@ async function replayForDuration(
   const startedAt = performance.now();
   let moveCount = 0;
   let strokeCount = 0;
+  const dispatchMoveTarget = localReplayDispatchMoveTarget(minimumMoves);
   while (
     performance.now() - startedAt < durationMs ||
     strokeCount < minimumStrokes ||
-    moveCount < minimumMoves
+    moveCount < dispatchMoveTarget
   ) {
     if (performance.now() - startedAt >= maximumDurationMs) break;
     const replayTrace =
@@ -816,6 +1052,16 @@ async function replayForDuration(
       strokeCount < minimumStrokes ||
       moveCount < minimumMoves,
   };
+}
+
+/**
+ * Synthetic Pointer Events can occasionally lose capture between frames even though the first
+ * coalesced batch was accepted and safely committed. Dispatch headroom keeps the Gate's fixed
+ * minimum based on accepted production spans instead of accidentally treating dispatch count as
+ * acceptance. Analyzer budgets and accepted-sample minimums remain unchanged.
+ */
+export function localReplayDispatchMoveTarget(minimumMoves: number): number {
+  return minimumMoves + REPLAY_DISPATCH_HEADROOM_MOVES;
 }
 
 async function replayStroke(
@@ -909,6 +1155,14 @@ export async function runLocalReplayFrameStep(input: {
 }): Promise<void> {
   input.dispatch();
   await input.waitForFrame();
+}
+
+/** Allows both command application and a following overlay/document presentation opportunity. */
+export async function waitForLocalCommandPresentationFrames(
+  waitForFrame: () => Promise<unknown>,
+): Promise<void> {
+  await waitForFrame();
+  await waitForFrame();
 }
 
 /** Reproduces the iPad failure window: down and the first coalesced curve await one shared frame. */
@@ -1328,11 +1582,97 @@ type LocalConditionSampleInput = {
   readonly frameIntervalsMs: { readonly idle: readonly number[] };
   readonly recentSpans: readonly {
     readonly accepted?: boolean;
+    readonly commandKind?: string;
     readonly documentCommandProduced?: boolean;
     readonly inputPhase?: string;
     readonly name: string;
   }[];
 };
+
+export function localResponsiveCommandSampleCounts(input: LocalConditionSampleInput): {
+  readonly apply: number;
+  readonly idle: number;
+  readonly kinds: readonly string[];
+  readonly passed: boolean;
+  readonly submit: number;
+  readonly undoRedo: number;
+} {
+  const accepted = input.recentSpans.filter((span) => span.accepted !== false);
+  const apply = accepted.filter((span) => span.name === 'ink-command-apply');
+  const submit = accepted.filter((span) => span.name === 'ink-command-to-submit');
+  const kinds = [...new Set(apply.map(({ commandKind }) => commandKind).filter(isString))].sort();
+  const required = ['delete-selection', 'erase', 'move', 'redo', 'restyle', 'selection', 'undo'];
+  const undoRedo = apply.filter(
+    ({ commandKind }) => commandKind === 'undo' || commandKind === 'redo',
+  ).length;
+  const idle = input.frameIntervalsMs.idle.length;
+  return {
+    apply: apply.length,
+    idle,
+    kinds,
+    passed:
+      idle >= 120 &&
+      required.every((kind) => kinds.includes(kind)) &&
+      undoRedo >= 100 &&
+      submit.length === apply.length,
+    submit: submit.length,
+    undoRedo,
+  };
+}
+
+export function localDoneSampleCounts(input: LocalConditionSampleInput): {
+  readonly firstFeedback: number;
+  readonly idle: number;
+  readonly passed: boolean;
+  readonly total: number;
+} {
+  const accepted = input.recentSpans.filter((span) => span.accepted !== false);
+  const firstFeedback = accepted.filter(({ name }) => name === 'ink-done-first-feedback').length;
+  const total = accepted.filter(({ name }) => name === 'ink-done-total').length;
+  const idle = input.frameIntervalsMs.idle.length;
+  return { firstFeedback, idle, passed: idle >= 120 && firstFeedback === 1 && total === 1, total };
+}
+
+export function localPreviewSampleCounts(input: LocalConditionSampleInput): {
+  readonly cacheLookup: number;
+  readonly cachePublish: number;
+  readonly editableHydration: number;
+  readonly firstInk: number;
+  readonly hit: number;
+  readonly miss: number;
+  readonly passed: boolean;
+  readonly toEdit: number;
+  readonly viewportComplete: number;
+} {
+  const accepted = input.recentSpans.filter((span) => span.accepted !== false);
+  const count = (name: string): number => accepted.filter((span) => span.name === name).length;
+  const result = {
+    cacheLookup: input.recentSpans.filter(({ name }) => name === 'ink-preview-cache-lookup').length,
+    cachePublish: count('ink-preview-cache-publish'),
+    editableHydration: count('ink-preview-editable-hydration'),
+    firstInk: count('ink-preview-first-ink'),
+    toEdit: count('ink-preview-to-edit'),
+    viewportComplete: count('ink-preview-viewport-complete'),
+    hit: input.recentSpans.filter(
+      ({ accepted, name }) => name === 'ink-preview-cache-lookup' && accepted !== false,
+    ).length,
+    miss: input.recentSpans.filter(
+      ({ accepted, name }) => name === 'ink-preview-cache-lookup' && accepted === false,
+    ).length,
+  };
+  return {
+    ...result,
+    passed:
+      result.cacheLookup >= 2 &&
+      result.cachePublish >= 1 &&
+      result.editableHydration >= 1 &&
+      result.firstInk >= 2 &&
+      result.hit >= 1 &&
+      result.miss >= 1 &&
+      result.toEdit >= 1 &&
+      result.viewportComplete >= 2,
+  };
+}
 
 export function localConditionSampleCounts(
   trace: typeof DRAWING_CONDITION_TRACE | 'viewport' | 'cache-lifecycle',
@@ -1427,6 +1767,22 @@ async function waitUntil(
   }
 }
 
+export async function waitForLocalPerformanceSpansToSettle(input: {
+  readonly maximumAttempts?: number;
+  readonly snapshot: () => { readonly hangingSpanCount: number };
+  readonly waitForSettlement?: () => Promise<void>;
+}): Promise<void> {
+  const maximumAttempts = input.maximumAttempts ?? 100;
+  const waitForSettlement =
+    input.waitForSettlement ??
+    (() => new Promise<void>((resolve) => globalThis.setTimeout(resolve, 50)));
+  for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    if (input.snapshot().hangingSpanCount === 0) return;
+    await waitForSettlement();
+  }
+  throw new Error('Local Gate Done spans did not settle before the condition snapshot.');
+}
+
 function requiredDigest(value: unknown, name: string): string {
   if (typeof value !== 'string' || !DIGEST_PATTERN.test(value)) {
     throw new Error(`Local performance Gate request has invalid ${name} digest.`);
@@ -1439,6 +1795,10 @@ function requiredString(value: unknown, name: string): string {
     throw new Error(`Local performance Gate request has invalid ${name}.`);
   }
   return value;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

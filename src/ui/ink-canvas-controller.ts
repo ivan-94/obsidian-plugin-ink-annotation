@@ -11,6 +11,7 @@ import {
   NOOP_INK_PERFORMANCE_RECORDER,
   type InkInputAdapter,
   type InkInputPhase,
+  type InkCommandKind,
   type InkPerformanceContact,
   type InkPerformanceRecorder,
   type InkPerformanceSpan,
@@ -51,6 +52,7 @@ import {
   type InkRenderRuntimeStats,
   type InkWorkerPresentationRuntimeOptions,
 } from './ink-render-runtime';
+import type { InkGeometryCacheCoordinator } from './ink-geometry-cache';
 import {
   InkUnpublishedPhysicalInkCandidate,
   type InkPhysicalCandidateDocumentPort,
@@ -87,6 +89,7 @@ interface InkSessionLike {
   eraseStrokesInPolygon(polygon: readonly InkPoint[]): readonly string[];
   enter(): void;
   exit(): Promise<void>;
+  firstRenderableStrokeRef?(): InkRenderableStrokeRef | undefined;
   noteUserInteraction?(): void;
   redo(): boolean;
   previewSelectionMove?(dx: number, dy: number): { readonly dx: number; readonly dy: number };
@@ -117,6 +120,16 @@ interface InkSelectionDragState {
   readonly start: InkPoint;
   readonly startClient: CssPoint;
   readonly toggleOnClick: boolean;
+}
+
+interface InkPendingCommandResponse {
+  applyFinished: boolean;
+  readonly applySpan: InkPerformanceSpan | null;
+  commandId: string | null;
+  readonly kind: InkCommandKind;
+  presentation: 'document' | 'overlay' | null;
+  presented: boolean;
+  readonly submitSpan: InkPerformanceSpan | null;
 }
 
 interface InkClientInputSample {
@@ -168,6 +181,7 @@ const DISABLED_STYLUS_PERFORMANCE_CONTACT: InkPerformanceContact = Object.freeze
 /** A single fixed logical surface. Rendering stays pointer-transparent in every view mode. */
 export class InkCanvasController {
   private active = false;
+  private readonly afterNextPaint: () => Promise<void>;
   private activeContactDiagnosticsEnabled = false;
   private activePointerId: number | null = null;
   private activeStylusTouchId: number | null = null;
@@ -175,6 +189,9 @@ export class InkCanvasController {
   private cachedCaptureBatchContext: InkCaptureBatchContext | null = null;
   private readonly capturePipeline = new InkCapturePipeline();
   private readonly controls: HTMLElement;
+  private commitFeedbackPromise: Promise<void> | null = null;
+  private doneFirstFeedbackSpan: InkPerformanceSpan | null = null;
+  private doneTotalSpan: InkPerformanceSpan | null = null;
   private currentRead: InkDocumentReadView;
   private lastSynchronizedChange: InkDocumentChange | null = null;
   private controlsDragState: InkControlsDragState | null = null;
@@ -185,11 +202,13 @@ export class InkCanvasController {
   private deferredStageFrame: InkStageFrame | null = null;
   private readonly dragHandle: HTMLButtonElement;
   private readonly extentProbeTimeouts = new Set<number>();
+  private enteredPresentation: Promise<void> | null = null;
   private eraserPreviewColor = '#dc2626';
   private hintShown: boolean;
   private hoveredStrokeId: string | null = null;
   private inputTarget: HTMLElement;
   private layoutRoot: HTMLElement;
+  private localPerformanceCommandSequence = 0;
   private readonly onExitRequested: () => Promise<void>;
   private readonly onExportUnsavedRequested: () => Promise<void>;
   private readonly onLayoutExtentChanged: (minimumHeight: number) => void;
@@ -200,6 +219,7 @@ export class InkCanvasController {
   private readonly presentationLedger: InkPresentationGenerationLedger;
   private readonly physicalCandidate: InkUnpublishedPhysicalInkCandidate | null;
   private pendingExitTarget: 'raw' | 'preview' = 'raw';
+  private readonly pendingCommandResponses: InkPendingCommandResponse[] = [];
   private readingContextRestoreFrame: number | null = null;
   private previousPosition: string;
   private reportedLayoutExtent = 0;
@@ -237,6 +257,15 @@ export class InkCanvasController {
     return this.renderRuntime.stats();
   }
 
+  presentationLayer(): HTMLElement {
+    return this.overlay;
+  }
+
+  whenFirstEnteredPresentation(): Promise<void> {
+    this.enteredPresentation ??= this.active ? this.afterNextPaint() : Promise.resolve();
+    return this.enteredPresentation;
+  }
+
   private get viewportLeft(): number {
     return this.stageFrame.logicalViewport.left;
   }
@@ -262,10 +291,12 @@ export class InkCanvasController {
   }
 
   constructor(input: {
+    readonly afterNextPaint?: () => Promise<void>;
     readonly controlsHost?: HTMLElement;
     readonly document: Document;
     readonly inkPerformance?: InkPerformanceRecorder;
     readonly layoutRoot?: HTMLElement;
+    readonly memoryCoordinator?: InkGeometryCacheCoordinator;
     readonly now?: () => number;
     readonly onExitRequested?: () => Promise<void>;
     readonly onExportUnsavedRequested?: () => Promise<void>;
@@ -284,6 +315,7 @@ export class InkCanvasController {
     nextInkControllerInstance += 1;
     const controllerInstance = String(nextInkControllerInstance);
     this.document = input.document;
+    this.afterNextPaint = input.afterNextPaint ?? (() => waitForNextPaint(input.document));
     this.root = input.root;
     this.layoutRoot = input.layoutRoot ?? input.root;
     this.scrollContainer = input.scrollContainer ?? null;
@@ -345,10 +377,15 @@ export class InkCanvasController {
       document: input.document,
       host: this.overlay,
       inkPerformance: this.inkPerformance,
+      ...(input.memoryCoordinator === undefined
+        ? {}
+        : { memoryCoordinator: input.memoryCoordinator }),
       onActiveFrame: this.onRenderActiveFrame,
       onActiveFrameUnpresented: (generation) =>
         this.presentationLedger.cancel('unpresented', generation),
       onDiagnostic: this.onRenderDiagnostic,
+      onDocumentChangesPresented: this.onDocumentChangesPresented,
+      onOverlayPresented: this.onOverlayPresented,
       query: (viewport) => this.session.query(viewport),
       read: () => this.session.read(),
       ...(input.workerPresentation === undefined
@@ -398,6 +435,7 @@ export class InkCanvasController {
     }
     this.session.enter();
     this.active = true;
+    this.enteredPresentation = null;
     this.toolbarHost.dataset.inkstoneControllerActive = 'true';
     this.viewMode = 'edit';
     this.overlay.hidden = false;
@@ -408,7 +446,7 @@ export class InkCanvasController {
       this.positionOverlay();
     });
     this.document.addEventListener('keydown', this.onDocumentKeyDown);
-    this.updateToolbar({ active: true });
+    this.updateToolbar({ active: true, committing: false });
     this.positionControlsDefault();
     this.sync(this.session.read());
     this.enterPhysicalCandidate();
@@ -436,6 +474,16 @@ export class InkCanvasController {
     this.sync(this.session.read());
   }
 
+  /** Reclaims shared host classes after an older Preview presenter releases the same root. */
+  reassertHostPresentation(): void {
+    if (this.disposed || this.viewMode === 'raw') return;
+    this.root.classList.add('inkstone-ink-host');
+    this.root.classList.toggle('is-ink-mode', this.viewMode === 'edit');
+    this.root.classList.toggle('is-ink-preview', this.viewMode === 'preview');
+    this.activateWorkspace();
+    this.positionOverlay();
+  }
+
   hidePreview(): void {
     if (this.active) return;
     this.viewMode = 'raw';
@@ -445,22 +493,31 @@ export class InkCanvasController {
   }
 
   async exit(target: 'raw' | 'preview' = 'raw'): Promise<void> {
+    const resumeAfterFailure = this.active || this.toolbarStore.state.value.active;
+    await this.ensureCommitFeedbackPainted();
     this.finishStroke(false);
-    const resumeAfterFailure = this.active;
-    this.active = false;
-    this.updateToolbar({ statusText: 'Ink Mode · Saving…' });
     this.pendingExitTarget = target;
     try {
       await this.physicalCandidate?.discardUnused();
       await this.session.exit();
       this.sync(this.session.read());
       this.deactivate(target);
+      this.finishDoneTransaction(true);
+      this.commitFeedbackPromise = null;
       this.pendingExitTarget = 'raw';
     } catch (error) {
       this.sync(this.session.read());
+      this.finishDoneTransaction(false);
+      this.commitFeedbackPromise = null;
       if (resumeAfterFailure) this.enter();
       throw error;
     }
+  }
+
+  /** Starts Done feedback outside the serialized host lifecycle so input is fenced immediately. */
+  prepareDoneFeedback(): Promise<void> {
+    this.noteToolbarInteraction();
+    return this.ensureCommitFeedbackPainted();
   }
 
   background(): Promise<void> {
@@ -479,6 +536,77 @@ export class InkCanvasController {
       await this.session.retry();
     } finally {
       this.sync(this.session.read());
+    }
+  }
+
+  /** Real-host Gate seam: exercises the production command transaction without synthetic DOM gestures. */
+  runLocalPerformanceCommand(kind: InkCommandKind): boolean {
+    if (!this.active) return false;
+    const ref =
+      this.session.firstRenderableStrokeRef?.() ??
+      this.session.read().strokes.find(({ stroke }) => stroke.tool !== 'eraser');
+    const selectFirst = (): boolean => {
+      if (ref === undefined) return false;
+      const point = ref.stroke.points[0];
+      if (point === undefined) return false;
+      const before = this.session.selectedStrokeIds?.() ?? [];
+      return (
+        this.performSessionCommand(
+          'selection',
+          () => this.session.selectStrokeAt?.(point, Math.max(8, ref.stroke.width)) ?? [],
+          (next) => next.length !== before.length || next.some((id, index) => id !== before[index]),
+        ).length > 0
+      );
+    };
+    this.localPerformanceCommandSequence += 1;
+    const id = `local-gate:${kind}:${this.localPerformanceCommandSequence}`;
+    switch (kind) {
+      case 'undo':
+        return this.performSessionCommand(kind, () => this.session.undo());
+      case 'redo':
+        return this.performSessionCommand(kind, () => this.session.redo());
+      case 'selection':
+        if (this.toolbarStore.state.value.interaction !== 'select') this.onToolbarSelectMove();
+        return selectFirst();
+      case 'move': {
+        if ((this.session.selectedStrokeIds?.().length ?? 0) === 0 && !selectFirst()) return false;
+        this.session.previewSelectionMove?.(1, 1);
+        return this.performSessionCommand(
+          kind,
+          () => this.session.commitSelectionMove?.() ?? false,
+        );
+      }
+      case 'delete-selection': {
+        if ((this.session.selectedStrokeIds?.().length ?? 0) === 0 && !selectFirst()) return false;
+        return this.performSessionCommand(
+          kind,
+          () => (this.session.deleteSelectedStrokes?.().length ?? 0) > 0,
+        );
+      }
+      case 'erase':
+        return (
+          ref !== undefined &&
+          this.performSessionCommand(
+            kind,
+            () => this.session.apply({ id, ids: [ref.id], kind: 'erase' }),
+            ({ kind: outcome }) => outcome === 'committed',
+          ).kind === 'committed'
+        );
+      case 'restyle':
+        return (
+          ref !== undefined &&
+          this.performSessionCommand(
+            kind,
+            () =>
+              this.session.apply({
+                id,
+                ids: [ref.id],
+                kind: 'restyle',
+                style: { color: ref.stroke.color === '#0f766e' ? '#7c3aed' : '#0f766e' },
+              }),
+            ({ kind: outcome }) => outcome === 'committed',
+          ).kind === 'committed'
+        );
     }
   }
 
@@ -565,7 +693,10 @@ export class InkCanvasController {
     this.updateViewport(false);
     if (change === null) {
       if (this.selectionCommittedStrokes === null) this.renderRuntime.installDocument(read);
-    } else this.renderRuntime.applyDocumentChange(change);
+    } else {
+      this.bindPendingCommandResponse(change);
+      this.renderRuntime.applyDocumentChange(change);
+    }
     this.updateRenderOverlay();
     this.syncToolbarFromRead(read);
   }
@@ -580,11 +711,13 @@ export class InkCanvasController {
       selectedCount: this.session.selectedStrokeIds?.().length ?? 0,
       statusText: error
         ? `Ink Mode · ${read.persistence.message}`
-        : read.persistence.kind === 'saving'
-          ? 'Ink Mode · Saving locally…'
-          : read.persistence.kind === 'saved-locally'
-            ? 'Ink Mode · Saved locally'
-            : 'Ink Mode',
+        : this.toolbarStore.state.value.committing
+          ? 'Ink Mode · Saving…'
+          : read.persistence.kind === 'saving'
+            ? 'Ink Mode · Saving locally…'
+            : read.persistence.kind === 'saved-locally'
+              ? 'Ink Mode · Saved locally'
+              : 'Ink Mode',
     });
   }
 
@@ -597,6 +730,14 @@ export class InkCanvasController {
     void this.physicalCandidate?.discardUnused().catch(() => undefined);
     this.session.setInteractionActive?.(false);
     this.presentationLedger.cancel('unpresented');
+    for (const response of this.pendingCommandResponses.splice(0)) {
+      response.applySpan?.cancel();
+      response.submitSpan?.cancel();
+    }
+    this.doneFirstFeedbackSpan?.cancel();
+    this.doneFirstFeedbackSpan = null;
+    this.doneTotalSpan?.cancel();
+    this.doneTotalSpan = null;
     this.renderRuntime.dispose();
     if (this.activePerformanceContact !== null) {
       this.inkPerformance.closeContact(this.activePerformanceContact);
@@ -1399,7 +1540,13 @@ export class InkCanvasController {
       additive && hitStrokeId !== null && currentSelection.includes(hitStrokeId);
     const selected = toggleOnClick
       ? currentSelection
-      : (this.session.selectStrokeAt?.(start, tolerance, additive) ?? []);
+      : this.performSessionCommand(
+          'selection',
+          () => this.session.selectStrokeAt?.(start, tolerance, additive) ?? [],
+          (next) =>
+            next.length !== currentSelection.length ||
+            next.some((id, index) => id !== currentSelection[index]),
+        );
     this.selectionDragState =
       selected.length === 0
         ? null
@@ -1416,7 +1563,7 @@ export class InkCanvasController {
     if (capturePointer && this.selectionDragState !== null) {
       this.inputTarget.setPointerCapture?.(pointerId);
     }
-    this.sync(this.session.read());
+    this.syncUnpublishedSessionMutation();
     return this.selectionDragState !== null;
   }
 
@@ -1434,7 +1581,7 @@ export class InkCanvasController {
     }
     this.flushSelectionPreview();
     if (commit && drag?.dragged === true) {
-      this.session.commitSelectionMove?.();
+      this.performSessionCommand('move', () => this.session.commitSelectionMove?.() ?? false);
     } else if (commit && drag?.toggleOnClick === true) {
       this.session.selectStrokeAt?.(drag.start, Math.max(8, this.width), true);
     } else if (!commit) {
@@ -1443,7 +1590,7 @@ export class InkCanvasController {
     this.selectionCommittedStrokes = null;
     this.renderRuntime.setCommittedExclusions([]);
     this.inputTarget.style.cursor = this.hoveredStrokeId === null ? '' : 'grab';
-    this.sync(this.session.read());
+    this.syncUnpublishedSessionMutation();
   }
 
   private updateSelectionDrag(event: InkClientInputSample): void {
@@ -1480,7 +1627,7 @@ export class InkCanvasController {
     if (delta === null) return;
     this.isolateSelectionPreviewFromCommittedLayer();
     this.session.previewSelectionMove?.(delta.dx, delta.dy);
-    this.sync(this.session.read());
+    this.syncUnpublishedSessionMutation();
   }
 
   private isolateSelectionPreviewFromCommittedLayer(): void {
@@ -1573,21 +1720,25 @@ export class InkCanvasController {
       }
       if ((completedStroke?.tool ?? this.tool) === 'eraser') {
         if (closedLoopErase) {
-          documentCommandProduced = this.session.eraseStrokesInPolygon(points).length > 0;
+          documentCommandProduced = this.performSessionCommand(
+            'erase',
+            () => this.session.eraseStrokesInPolygon(points).length > 0,
+          );
           this.renderRuntime.cancelActive();
-          this.sync(this.session.read());
           return;
         }
         const target = points.at(-1);
         if (target !== undefined) {
-          documentCommandProduced =
-            this.session.eraseStrokeAt(
-              target,
-              Math.max(8, completedStroke?.width ?? this.width),
-            ) !== null;
+          documentCommandProduced = this.performSessionCommand(
+            'erase',
+            () =>
+              this.session.eraseStrokeAt(
+                target,
+                Math.max(8, completedStroke?.width ?? this.width),
+              ) !== null,
+          );
         }
         this.renderRuntime.cancelActive();
-        this.sync(this.session.read());
         return;
       }
       if (completed === null) return;
@@ -2079,12 +2230,52 @@ export class InkCanvasController {
   };
 
   private readonly onToolbarDone = (): void => {
-    void this.onExitRequested().catch(() => undefined);
+    void this.prepareDoneFeedback()
+      .then(() => this.onExitRequested())
+      .then(() => this.finishDoneTransaction(true))
+      .catch(() => {
+        this.finishDoneTransaction(false);
+        this.restoreAfterCommitFailure();
+      });
   };
+
+  private ensureCommitFeedbackPainted(): Promise<void> {
+    if (this.commitFeedbackPromise !== null) return this.commitFeedbackPromise;
+    this.doneFirstFeedbackSpan = this.inkPerformance.beginSpan('ink-done-first-feedback', {
+      workPhase: 'save',
+    });
+    this.doneTotalSpan = this.inkPerformance.beginSpan('ink-done-total', { workPhase: 'save' });
+    this.active = false;
+    this.session.setInteractionActive?.(false);
+    this.updateToolbar({
+      canRedo: false,
+      canUndo: false,
+      committing: true,
+      statusText: 'Ink Mode · Saving…',
+    });
+    this.commitFeedbackPromise = this.afterNextPaint().then(() => {
+      this.doneFirstFeedbackSpan?.finish({ accepted: true });
+      this.doneFirstFeedbackSpan = null;
+    });
+    return this.commitFeedbackPromise;
+  }
+
+  private finishDoneTransaction(accepted: boolean): void {
+    this.doneFirstFeedbackSpan?.cancel();
+    this.doneFirstFeedbackSpan = null;
+    this.doneTotalSpan?.finish({ accepted });
+    this.doneTotalSpan = null;
+  }
+
+  private restoreAfterCommitFailure(): void {
+    if (this.disposed || this.active) return;
+    this.commitFeedbackPromise = null;
+    this.enter();
+  }
 
   private readonly onToolbarRedo = (): void => {
     this.noteToolbarInteraction();
-    if (this.session.redo()) this.sync(this.session.read());
+    this.performSessionCommand('redo', () => this.session.redo());
   };
 
   private readonly onToolbarExportUnsaved = (): void => {
@@ -2094,8 +2285,10 @@ export class InkCanvasController {
 
   private readonly onToolbarDeleteSelection = (): void => {
     this.noteToolbarInteraction();
-    const deletedStrokeIds = this.session.deleteSelectedStrokes?.() ?? [];
-    if (deletedStrokeIds.length > 0) this.sync(this.session.read());
+    this.performSessionCommand(
+      'delete-selection',
+      () => (this.session.deleteSelectedStrokes?.().length ?? 0) > 0,
+    );
   };
 
   private readonly onToolbarRetry = (): void => {
@@ -2157,7 +2350,7 @@ export class InkCanvasController {
 
   private readonly onToolbarUndo = (): void => {
     this.noteToolbarInteraction();
-    if (this.session.undo()) this.sync(this.session.read());
+    this.performSessionCommand('undo', () => this.session.undo());
   };
 
   private readonly onToolbarWidth = (width: number): void => {
@@ -2196,6 +2389,93 @@ export class InkCanvasController {
 
   private noteToolbarInteraction(): void {
     if (this.active) this.session.noteUserInteraction?.();
+  }
+
+  private syncUnpublishedSessionMutation(): void {
+    const read = this.session.read();
+    if (read !== this.currentRead) this.sync(read);
+  }
+
+  private performSessionCommand<T>(
+    kind: InkCommandKind,
+    apply: () => T,
+    isAccepted: (result: T) => boolean = (result) => result === true,
+  ): T {
+    const response: InkPendingCommandResponse = {
+      applyFinished: false,
+      applySpan: this.beginCommandPerformanceSpan('ink-command-apply', kind),
+      commandId: null,
+      kind,
+      presentation: null,
+      presented: false,
+      submitSpan: this.beginCommandPerformanceSpan('ink-command-to-submit', kind),
+    };
+    this.pendingCommandResponses.push(response);
+    let accepted = false;
+    let result!: T;
+    try {
+      result = apply();
+      accepted = isAccepted(result);
+      this.syncUnpublishedSessionMutation();
+      return result;
+    } finally {
+      response.applySpan?.finish({ accepted });
+      response.applyFinished = true;
+      if (!accepted) {
+        response.submitSpan?.finish({ accepted: false, presentationOutcome: 'unpresented' });
+        this.removePendingCommandResponse(response);
+      } else if (response.presented) {
+        this.finishPresentedCommandResponse(response);
+      }
+    }
+  }
+
+  private beginCommandPerformanceSpan(
+    name: 'ink-command-apply' | 'ink-command-to-submit',
+    kind: InkCommandKind,
+  ): InkPerformanceSpan | null {
+    return this.inkPerformance.isEnabled()
+      ? this.inkPerformance.beginSpan(name, { commandKind: kind, workPhase: 'command' })
+      : null;
+  }
+
+  private bindPendingCommandResponse(change: InkDocumentChange): void {
+    const response = this.pendingCommandResponses.find(
+      ({ commandId: pending }) => pending === null,
+    );
+    if (response === undefined) return;
+    response.commandId = change.commandId;
+    response.presentation = hasInkDocumentDamage(change) ? 'document' : 'overlay';
+  }
+
+  private readonly onDocumentChangesPresented = (changes: readonly InkDocumentChange[]): void => {
+    for (const change of changes) {
+      const response = this.pendingCommandResponses.find(
+        ({ commandId, presentation }) =>
+          presentation === 'document' && commandId === change.commandId,
+      );
+      if (response === undefined) continue;
+      response.presented = true;
+      if (response.applyFinished) this.finishPresentedCommandResponse(response);
+    }
+  };
+
+  private readonly onOverlayPresented = (): void => {
+    for (const response of [...this.pendingCommandResponses]) {
+      if (response.presentation !== 'overlay') continue;
+      response.presented = true;
+      if (response.applyFinished) this.finishPresentedCommandResponse(response);
+    }
+  };
+
+  private finishPresentedCommandResponse(response: InkPendingCommandResponse): void {
+    response.submitSpan?.finish({ presentationOutcome: 'submitted' });
+    this.removePendingCommandResponse(response);
+  }
+
+  private removePendingCommandResponse(response: InkPendingCommandResponse): void {
+    const index = this.pendingCommandResponses.indexOf(response);
+    if (index >= 0) this.pendingCommandResponses.splice(index, 1);
   }
 
   private refreshWorkspacePresentation(): void {
@@ -2392,7 +2672,7 @@ export class InkCanvasController {
     this.renderRuntime.cancelActive();
     this.renderRuntime.setOverlay({ hovered: [], selected: [] });
     this.inputTarget.style.cursor = '';
-    this.updateToolbar({ active: false });
+    this.updateToolbar({ active: false, committing: false });
     this.root.classList.remove('is-ink-mode', 'is-ink-preview');
     if (target === 'preview') {
       this.root.classList.add('is-ink-preview');
@@ -2456,6 +2736,16 @@ export class InkCanvasController {
   }
 }
 
+function waitForNextPaint(document: Document): Promise<void> {
+  const view = document.defaultView;
+  if (view === null) return Promise.resolve();
+  return new Promise((resolve) => {
+    view.requestAnimationFrame(() => {
+      view.setTimeout(resolve, 0);
+    });
+  });
+}
+
 function cssPixels(value: string): number {
   const parsed = Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -2464,6 +2754,15 @@ function cssPixels(value: string): number {
 function approximatelyEqual(left: number, right: number): boolean {
   if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
   return Math.abs(left - right) <= Math.max(0.005, Math.abs(right) * 0.01);
+}
+
+function hasInkDocumentDamage(change: InkDocumentChange): boolean {
+  return (
+    change.addedIds.length > 0 ||
+    change.updatedIds.length > 0 ||
+    change.removedIds.length > 0 ||
+    change.bounds.length > 0
+  );
 }
 
 function isMeasurableRect(rect: DOMRect): boolean {

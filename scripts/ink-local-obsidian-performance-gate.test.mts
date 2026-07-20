@@ -163,6 +163,47 @@ describe('S27R6 Local Obsidian Performance Gate', () => {
     expect(result.strokeWindows[0]).toMatchObject({ endStroke: 10, startStroke: 1 });
   });
 
+  it('fails closed on command, Done, or Preview response regression', () => {
+    const commandCapture = validCapture();
+    const command = commandCapture.conditions.find(({ trace }) => trace === 'responsive-commands');
+    const commandApply = command?.diagnostics.recentSpans.filter(
+      ({ name }) => name === 'ink-command-apply',
+    );
+    if (commandApply?.[0] === undefined) throw new Error('Missing command span fixture.');
+    for (const span of commandApply) span.durationMs = 20;
+    expect(
+      analyzeLocalObsidianCapture(commandCapture).budgets.find(
+        ({ name }) => name === 'command-apply-p95-p99-ms',
+      ),
+    ).toMatchObject({ status: 'FAIL' });
+
+    const doneCapture = validCapture();
+    const worstDone = doneCapture.conditions.find(
+      ({ fixture, trace }) => fixture === 'history-10k-30-surfaces' && trace === 'done-save',
+    );
+    const done = worstDone?.diagnostics.recentSpans.find(({ name }) => name === 'ink-done-total');
+    if (done === undefined) throw new Error('Missing Done span fixture.');
+    done.durationMs = 3_001;
+    expect(
+      analyzeLocalObsidianCapture(doneCapture).budgets.find(
+        ({ name }) => name === 'done-total-normal-and-10k-ms',
+      ),
+    ).toMatchObject({ status: 'FAIL' });
+
+    const previewCapture = validCapture();
+    const preview = previewCapture.conditions.find(({ trace }) => trace === 'preview-lifecycle');
+    const firstInk = preview?.diagnostics.recentSpans.filter(
+      ({ name }) => name === 'ink-preview-first-ink',
+    );
+    if (firstInk?.[1] === undefined) throw new Error('Missing warm Preview span fixture.');
+    firstInk[1].durationMs = 201;
+    expect(
+      analyzeLocalObsidianCapture(previewCapture).budgets.find(
+        ({ name }) => name === 'preview-warm-first-ink-p99-ms',
+      ),
+    ).toMatchObject({ status: 'FAIL' });
+  });
+
   it('fails closed when any measured condition retains an unfinished performance span', () => {
     const capture = validCapture();
     const first = capture.conditions[0];
@@ -394,6 +435,72 @@ describe('S27R6 Local Obsidian Performance Gate', () => {
     );
   });
 
+  it('allows canonical persistence only inside the separately budgeted Done lane', () => {
+    const capture = validCapture();
+    const done = capture.conditions.find(({ trace }) => trace === 'done-save');
+    if (done === undefined) throw new Error('Missing Done condition fixture.');
+    done.diagnostics.recentSpans.push({
+      accepted: true,
+      durationMs: 2,
+      name: 'ink-canonical-persistence-submit',
+      workPhase: 'cold',
+    } as never);
+
+    expect(
+      analyzeLocalObsidianCapture(capture).budgets.find(
+        (budget) => budget.name === 'foreground-canonical-persistence-submit-count',
+      ),
+    ).toMatchObject({ status: 'PASS' });
+  });
+
+  it('allows isolated one-to-two millisecond scheduler jitter below one percent', () => {
+    const capture = validCapture();
+    const first = capture.conditions[0];
+    if (first === undefined) throw new Error('Missing local Gate condition fixture.');
+    first.diagnostics.schedulerUnitCount = 1_000;
+    first.diagnostics.schedulerUnitOverruns = [
+      { durationMs: 1.25, lane: 'visible' },
+      { durationMs: 1.5, lane: 'visible' },
+    ] as never;
+
+    expect(
+      analyzeLocalObsidianCapture(capture).budgets.find(
+        (budget) => budget.name === 'scheduler-unit-distribution',
+      ),
+    ).toMatchObject({ status: 'PASS' });
+  });
+
+  it('computes scheduler P99 across all units instead of only the overrun samples', () => {
+    const capture = validCapture();
+    const first = capture.conditions[0];
+    if (first === undefined) throw new Error('Missing local Gate condition fixture.');
+    first.diagnostics.schedulerUnitCount = 1_000;
+    first.diagnostics.schedulerUnitOverruns = [{ durationMs: 3.5, lane: 'cold' }] as never;
+
+    expect(
+      analyzeLocalObsidianCapture(capture).budgets.find(
+        (budget) => budget.name === 'scheduler-unit-distribution',
+      ),
+    ).toMatchObject({ actual: { p99Ms: 1 }, status: 'PASS' });
+  });
+
+  it('fails sustained scheduler overruns or any four millisecond unit', () => {
+    const capture = validCapture();
+    const first = capture.conditions[0];
+    if (first === undefined) throw new Error('Missing local Gate condition fixture.');
+    first.diagnostics.schedulerUnitCount = 100;
+    first.diagnostics.schedulerUnitOverruns = [
+      { durationMs: 1.25, lane: 'visible' },
+      { durationMs: 4, lane: 'cold' },
+    ] as never;
+
+    expect(
+      analyzeLocalObsidianCapture(capture).budgets.find(
+        (budget) => budget.name === 'scheduler-unit-distribution',
+      ),
+    ).toMatchObject({ status: 'FAIL' });
+  });
+
   it('rejects a viewport rebuild attributed to an active Pencil contact', () => {
     const capture = validCapture();
     const viewport = capture.conditions.find((condition) => condition.trace === 'viewport');
@@ -455,7 +562,7 @@ describe('S27R6 Local Obsidian Performance Gate', () => {
         (budget) => budget.name === 'pending-work-missed-frame-ratio',
       ),
     ).toMatchObject({
-      actual: { expectedSlots: 10_000, missedSlots: 0, ratio: 0 },
+      actual: { expectedSlots: 16_000, missedSlots: 0, ratio: 0 },
       status: 'PASS',
     });
   });
@@ -579,6 +686,26 @@ function validCapture() {
       ),
     );
   }
+  for (const fixture of ['history-10k-30-surfaces', 'history-1k', 'empty']) {
+    conditions.push(
+      condition(`${fixture}-pen-responsive-commands`, fixture, 'pen', 'responsive-commands'),
+    );
+  }
+  conditions.push(
+    condition('empty-pen-done-save', 'empty', 'pen', 'done-save'),
+    condition(
+      'history-10k-30-surfaces-pen-done-save',
+      'history-10k-30-surfaces',
+      'pen',
+      'done-save',
+    ),
+    condition(
+      'history-10k-30-surfaces-pen-preview-lifecycle',
+      'history-10k-30-surfaces',
+      'pen',
+      'preview-lifecycle',
+    ),
+  );
   return {
     buildDigest: 'a'.repeat(64),
     conditions,
@@ -605,8 +732,16 @@ function validCapture() {
 
 function condition(id: string, fixture: string, tool: string, trace: string) {
   const drawing = trace === 'mixed-drawing';
+  const conditionDiagnostics = diagnostics(
+    drawing ? 100 : 20,
+    drawing ? 1_000 : 200,
+    trace === 'viewport',
+  );
+  if (trace === 'responsive-commands') addResponsiveCommandSpans(conditionDiagnostics);
+  if (trace === 'done-save') addDoneSpans(conditionDiagnostics, fixture);
+  if (trace === 'preview-lifecycle') addPreviewSpans(conditionDiagnostics);
   return {
-    diagnostics: diagnostics(drawing ? 100 : 20, drawing ? 1_000 : 200, trace === 'viewport'),
+    diagnostics: conditionDiagnostics,
     durationMs: 30_000,
     fixture,
     id,
@@ -614,6 +749,82 @@ function condition(id: string, fixture: string, tool: string, trace: string) {
     tool,
     trace,
   };
+}
+
+function addResponsiveCommandSpans(value: ReturnType<typeof diagnostics>) {
+  const commandKinds = [
+    'delete-selection',
+    'erase',
+    'move',
+    'restyle',
+    'selection',
+    ...Array.from({ length: 50 }, () => ['undo', 'redo']).flat(),
+  ];
+  for (const commandKind of commandKinds) {
+    pushDiagnosticSpans(value, [
+      {
+        accepted: true,
+        commandKind,
+        durationMs: 2,
+        name: 'ink-command-apply',
+        workPhase: 'command',
+      },
+      {
+        accepted: true,
+        commandKind,
+        durationMs: 16,
+        name: 'ink-command-to-submit',
+        workPhase: 'command',
+      },
+    ]);
+  }
+}
+
+function addDoneSpans(value: ReturnType<typeof diagnostics>, fixture: string) {
+  pushDiagnosticSpans(value, [
+    { accepted: true, durationMs: 16, name: 'ink-done-first-feedback', workPhase: 'save' },
+    {
+      accepted: true,
+      durationMs: fixture === 'empty' ? 500 : 2_000,
+      name: 'ink-done-total',
+      workPhase: 'save',
+    },
+  ]);
+}
+
+function addPreviewSpans(value: ReturnType<typeof diagnostics>) {
+  pushDiagnosticSpans(value, [
+    { accepted: false, durationMs: 5, name: 'ink-preview-cache-lookup', workPhase: 'preview' },
+    { accepted: true, durationMs: 250, name: 'ink-preview-first-ink', workPhase: 'preview' },
+    {
+      accepted: true,
+      durationMs: 300,
+      name: 'ink-preview-viewport-complete',
+      workPhase: 'preview',
+    },
+    {
+      accepted: true,
+      durationMs: 300,
+      name: 'ink-preview-editable-hydration',
+      workPhase: 'preview',
+    },
+    { accepted: true, durationMs: 16, name: 'ink-preview-to-edit', workPhase: 'preview' },
+    { accepted: true, durationMs: 5, name: 'ink-preview-cache-lookup', workPhase: 'preview' },
+    { accepted: true, durationMs: 100, name: 'ink-preview-first-ink', workPhase: 'preview' },
+    {
+      accepted: true,
+      durationMs: 120,
+      name: 'ink-preview-viewport-complete',
+      workPhase: 'preview',
+    },
+  ]);
+}
+
+function pushDiagnosticSpans(
+  value: ReturnType<typeof diagnostics>,
+  spans: readonly Record<string, unknown>[],
+) {
+  value.recentSpans.push(...(spans as never[]));
 }
 
 function renderRuntimeEvidence(trace: string) {
@@ -734,5 +945,7 @@ function diagnostics(strokeCount: number, moveCount: number, viewport = false) {
     },
     openContactCount: 0,
     recentSpans,
+    schedulerUnitCount: 0,
+    schedulerUnitOverruns: [],
   };
 }

@@ -39,7 +39,11 @@ import {
   type InkPerformanceContact,
   type InkPerformanceRecorder,
 } from '../runtime/ink-performance-diagnostics';
-import { INK_GEOMETRY_CACHE_BYTES_PER_MOUNT, InkGeometryCache } from './ink-geometry-cache';
+import {
+  INK_GEOMETRY_CACHE_BYTES_PER_MOUNT,
+  InkGeometryCache,
+  type InkGeometryCacheCoordinator,
+} from './ink-geometry-cache';
 import { InkRasterTileCache, type InkRasterTileBounds } from './ink-raster-tile-cache';
 import {
   drawInkBrushGeometryToCanvas,
@@ -352,8 +356,6 @@ export class InkRenderRuntime {
   private frame: InkStageFrame | null = null;
   private frameHandle: number | null = null;
   private frameReplacementPending = false;
-  private pendingScrollDamage: { readonly from: InkStageFrame; readonly to: InkStageFrame } | null =
-    null;
   private excludedCommittedIds = new Set<string>();
   private readonly geometry: InkStrokeGeometry;
   private readonly sharedGeometry = new SharedInkStrokeGeometry();
@@ -364,6 +366,8 @@ export class InkRenderRuntime {
   private readonly onDiagnostic: (message: string) => void;
   private readonly onActiveFrame: (submittedThroughGeneration: number | null) => void;
   private readonly onActiveFrameUnpresented: (generation: number) => void;
+  private readonly onDocumentChangesPresented: (changes: readonly InkDocumentChange[]) => void;
+  private readonly onOverlayPresented: () => void;
   private readonly onContextLost = (event: Event): void => {
     event.preventDefault();
     this.clearActivePrediction();
@@ -457,10 +461,13 @@ export class InkRenderRuntime {
     readonly geometry?: InkStrokeGeometry;
     readonly host: HTMLElement;
     readonly inkPerformance?: InkPerformanceRecorder;
+    readonly memoryCoordinator?: InkGeometryCacheCoordinator;
     readonly now?: () => number;
     readonly onDiagnostic?: (message: string) => void;
     readonly onActiveFrame?: (submittedThroughGeneration: number | null) => void;
     readonly onActiveFrameUnpresented?: (generation: number) => void;
+    readonly onDocumentChangesPresented?: (changes: readonly InkDocumentChange[]) => void;
+    readonly onOverlayPresented?: () => void;
     readonly query: (viewport: InkLogicalRect) => readonly InkRenderableStrokeRef[];
     readonly read: () => InkDocumentReadView;
     readonly requestFrame?: (callback: FrameRequestCallback) => number;
@@ -471,7 +478,11 @@ export class InkRenderRuntime {
     this.query = input.query;
     this.read = input.read;
     this.geometry = input.geometry ?? new LegacyRoundInkStrokeGeometry();
-    this.cache = input.cache ?? new InkGeometryCache();
+    this.cache =
+      input.cache ??
+      (input.memoryCoordinator === undefined
+        ? new InkGeometryCache()
+        : new InkGeometryCache({ coordinator: input.memoryCoordinator }));
     this.requestFrame = input.requestFrame ?? ((callback) => requestAnimationFrame(callback));
     this.cancelFrame = input.cancelFrame ?? ((handle) => cancelAnimationFrame(handle));
     this.dpr = input.devicePixelRatio ?? DEFAULT_DPR;
@@ -481,6 +492,8 @@ export class InkRenderRuntime {
     this.onDiagnostic = input.onDiagnostic ?? (() => undefined);
     this.onActiveFrame = input.onActiveFrame ?? (() => undefined);
     this.onActiveFrameUnpresented = input.onActiveFrameUnpresented ?? (() => undefined);
+    this.onDocumentChangesPresented = input.onDocumentChangesPresented ?? (() => undefined);
+    this.onOverlayPresented = input.onOverlayPresented ?? (() => undefined);
     this.requestedPresentationAdapter =
       input.workerPresentation?.enabled === true ? 'worker-offscreen-2d' : 'main-canvas-2d';
     this.committedCanvas = createCanvas(input.document, 'committed');
@@ -489,10 +502,14 @@ export class InkRenderRuntime {
     this.supportsCommittedRasterTiles =
       this.committedContext.canvas === this.committedCanvas &&
       typeof this.committedContext.drawImage === 'function';
-    this.committedRasterTiles = new InkRasterTileCache(0, (tile) => {
-      tile.canvas.width = 0;
-      tile.canvas.height = 0;
-    });
+    this.committedRasterTiles = new InkRasterTileCache(
+      0,
+      (tile) => {
+        tile.canvas.width = 0;
+        tile.canvas.height = 0;
+      },
+      this.cache.memoryCoordinator,
+    );
     const activePair = createMainActiveCanvasPair(input.document);
     this.activePair = activePair;
     this.activePresentationAdapterSnapshot = this.presentationAdapterState('main-canvas-2d');
@@ -883,15 +900,9 @@ export class InkRenderRuntime {
       this.retirePendingWorkerGeneration();
       this.fallbackWorkerPairToMain(this.activePair);
     }
-    if (this.canShiftCommittedBitmap(previousFrame, frame)) {
-      this.pendingScrollDamage = { from: previousFrame, to: frame };
-      this.frameReplacementPending = false;
-    } else {
-      this.pendingScrollDamage = null;
-      this.frameReplacementPending = true;
-      this.pendingVisibleRecoveryReason =
-        previousFrame === null ? 'initial-document-install' : 'backing-replacement';
-    }
+    this.frameReplacementPending = true;
+    this.pendingVisibleRecoveryReason =
+      previousFrame === null ? 'initial-document-install' : 'backing-replacement';
     if (this.active !== null) this.active.pendingFullRedraw = true;
     this.schedule();
   }
@@ -913,7 +924,7 @@ export class InkRenderRuntime {
       this.retirePendingWorkerGeneration();
       this.fallbackWorkerPairToMain(this.activePair);
     }
-    if (this.pendingScrollDamage === null) this.frameReplacementPending = true;
+    this.frameReplacementPending = true;
     if (this.active !== null) this.active.pendingFullRedraw = true;
     this.schedule();
   }
@@ -933,7 +944,7 @@ export class InkRenderRuntime {
   installDocument(read: InkDocumentReadView): void {
     if (this.disposed) return;
     this.cache.setIndexBytes(read.indexBytes);
-    this.committedRasterTiles.clear();
+    this.committedRasterTiles.dispose();
     this.pendingDocumentInstall = true;
     this.pendingVisibleRecoveryReason = 'initial-document-install';
     this.schedule();
@@ -1558,7 +1569,6 @@ export class InkRenderRuntime {
       !activeOwnsFrame &&
       (this.pendingDocumentInstall ||
         this.frameReplacementPending ||
-        this.pendingScrollDamage !== null ||
         this.pendingCommittedDamage.length > 0 ||
         this.pendingChanges.length > 0)
         ? this.inkPerformance.beginSpan('ink-viewport-redraw', { workPhase: 'viewport' })
@@ -1566,6 +1576,8 @@ export class InkRenderRuntime {
     let viewportResultCount = 0;
     let activeDraw: ActiveDrawResult = 'none';
     let frameBackingReady = true;
+    let presentedChanges: readonly InkDocumentChange[] = [];
+    let overlayPresented = false;
     let submittedThroughGeneration: number | null = null;
     let succeeded = false;
     this.committedRasterPreparationIncomplete = false;
@@ -1601,9 +1613,6 @@ export class InkRenderRuntime {
           this.supportsCommittedRasterTiles &&
           (this.pendingChanges.length > 0 || this.pendingCommittedDamage.length > 0)
         ) {
-          if (this.pendingScrollDamage !== null) {
-            viewportResultCount += this.redrawCommittedScrollDamage(this.pendingScrollDamage);
-          }
           for (const change of this.pendingChanges) {
             if (isAddedOnlyDocumentChange(change)) {
               viewportResultCount += this.drawDocumentChange(frame, change);
@@ -1623,9 +1632,6 @@ export class InkRenderRuntime {
             }
           }
         } else {
-          if (this.pendingScrollDamage !== null) {
-            viewportResultCount += this.redrawCommittedScrollDamage(this.pendingScrollDamage);
-          }
           for (const change of this.pendingChanges) {
             viewportResultCount += this.drawDocumentChange(frame, change);
           }
@@ -1636,11 +1642,11 @@ export class InkRenderRuntime {
         if (this.committedRasterPreparationIncomplete) {
           this.schedule();
         } else {
+          presentedChanges = this.pendingChanges;
           this.pendingChanges = [];
           this.pendingCommittedDamage = [];
           this.pendingDocumentInstall = false;
           this.pendingVisibleRecoveryReason = null;
-          this.pendingScrollDamage = null;
         }
       }
       if (activeDraw === 'main-submitted') {
@@ -1648,13 +1654,14 @@ export class InkRenderRuntime {
       }
       this.completePromotion();
       if (frameBackingReady) {
+        const overlayWasPending = this.overlayPending;
         this.drawOverlay(frame);
+        overlayPresented = overlayWasPending && !this.overlayPending;
         this.applyCanvasTransforms(frame);
       }
       if (
         !this.pendingDocumentInstall &&
         !this.frameReplacementPending &&
-        this.pendingScrollDamage === null &&
         this.pendingChanges.length === 0 &&
         this.pendingCommittedDamage.length === 0
       ) {
@@ -1679,6 +1686,10 @@ export class InkRenderRuntime {
       if (!succeeded || activeDraw !== 'worker-submitted') {
         this.onActiveFrame(succeeded ? submittedThroughGeneration : null);
       }
+      if (succeeded && presentedChanges.length > 0) {
+        this.onDocumentChangesPresented(presentedChanges);
+      }
+      if (succeeded && overlayPresented) this.onOverlayPresented();
     }
   }
 
@@ -1686,7 +1697,6 @@ export class InkRenderRuntime {
     return (
       this.pendingDocumentInstall ||
       this.frameReplacementPending ||
-      this.pendingScrollDamage !== null ||
       this.pendingCommittedDamage.length > 0 ||
       this.pendingChanges.length > 0
     );
@@ -1766,21 +1776,6 @@ export class InkRenderRuntime {
       layer.style.transformOrigin = '';
       layer.style.willChange = '';
     }
-  }
-
-  private canShiftCommittedBitmap(
-    previous: InkStageFrame | null,
-    next: InkStageFrame,
-  ): previous is InkStageFrame {
-    if (previous === null || this.configuredDpr !== Math.max(1, this.dpr())) return false;
-    const cssTolerance = 1 / 64;
-    return (
-      Math.abs(previous.actualScale - next.actualScale) <= 1e-6 &&
-      Math.abs(previous.canvasClientRect.left - next.canvasClientRect.left) <= cssTolerance &&
-      Math.abs(previous.canvasClientRect.top - next.canvasClientRect.top) <= cssTolerance &&
-      Math.abs(previous.canvasClientRect.width - next.canvasClientRect.width) <= cssTolerance &&
-      Math.abs(previous.canvasClientRect.height - next.canvasClientRect.height) <= cssTolerance
-    );
   }
 
   private redrawCommittedViewport(
@@ -1963,96 +1958,6 @@ export class InkRenderRuntime {
     });
     const byteSize = canvas.width * canvas.height * 4;
     return this.committedRasterTiles.put(key, tile, bounds, byteSize) ? tile : null;
-  }
-
-  /** Reuses the settled same-scale bitmap and rasterizes only newly exposed scroll strips. */
-  private redrawCommittedScrollDamage(input: {
-    readonly from: InkStageFrame;
-    readonly to: InkStageFrame;
-  }): number {
-    const context = this.committedContext;
-    if (
-      typeof context.drawImage !== 'function' ||
-      typeof context.clip !== 'function' ||
-      typeof context.rect !== 'function'
-    ) {
-      return this.redrawCommittedViewport(input.to, 'settled-projection');
-    }
-    const ratio = Math.max(1, this.dpr());
-    const width = this.committedCanvas.width;
-    const height = this.committedCanvas.height;
-    const dx = Math.round(
-      (input.to.documentClientOrigin.x - input.from.documentClientOrigin.x) * ratio,
-    );
-    const dy = Math.round(
-      (input.to.documentClientOrigin.y - input.from.documentClientOrigin.y) * ratio,
-    );
-    if (dx === 0 && dy === 0) return 0;
-    if (Math.abs(dx) >= width || Math.abs(dy) >= height) {
-      return this.redrawCommittedViewport(input.to, 'settled-projection');
-    }
-
-    context.save();
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.drawImage(this.committedCanvas, 0, 0, width, height, dx, dy, width, height);
-    context.restore();
-
-    const exposed: Array<{ height: number; width: number; x: number; y: number }> = [];
-    if (dx > 0) exposed.push({ height, width: dx, x: 0, y: 0 });
-    else if (dx < 0) exposed.push({ height, width: -dx, x: width + dx, y: 0 });
-    const horizontalX = dx > 0 ? dx : 0;
-    const horizontalWidth = width - Math.abs(dx);
-    if (dy > 0 && horizontalWidth > 0) {
-      exposed.push({ height: dy, width: horizontalWidth, x: horizontalX, y: 0 });
-    } else if (dy < 0 && horizontalWidth > 0) {
-      exposed.push({
-        height: -dy,
-        width: horizontalWidth,
-        x: horizontalX,
-        y: height + dy,
-      });
-    }
-
-    const transform = input.to.canvasBackingTransform(ratio);
-    let resultCount = 0;
-    for (const physical of exposed) {
-      context.save();
-      context.setTransform(1, 0, 0, 1, 0, 0);
-      context.clearRect(physical.x, physical.y, physical.width, physical.height);
-      context.beginPath();
-      context.rect(physical.x, physical.y, physical.width, physical.height);
-      context.clip();
-      context.setTransform(
-        transform.a,
-        transform.b,
-        transform.c,
-        transform.d,
-        transform.e,
-        transform.f,
-      );
-      const start = input.to.canvasCssToLogical({
-        x: physical.x / ratio,
-        y: physical.y / ratio,
-      });
-      const end = input.to.canvasCssToLogical({
-        x: (physical.x + physical.width) / ratio,
-        y: (physical.y + physical.height) / ratio,
-      });
-      const logicalDamage = {
-        height: end.y - start.y,
-        width: end.x - start.x,
-        x: start.x,
-        y: start.y,
-      };
-      const refs = ordered(this.query(logicalDamage)).filter(
-        ({ bounds, id }) =>
-          !this.excludedCommittedIds.has(id) && intersects(bounds, logicalViewport(input.to)),
-      );
-      for (const ref of refs) this.drawCommittedRef(ref, true);
-      resultCount += refs.length;
-      context.restore();
-    }
-    return resultCount;
   }
 
   private drawDocumentChange(frame: InkStageFrame, change: InkDocumentChange): number {

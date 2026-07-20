@@ -969,6 +969,41 @@ describe('Obsidian Ink Mode action', () => {
     manager.dispose();
   });
 
+  it('remounts only the owned local Gate Preview without changing the global preference', async () => {
+    const view = {
+      addAction: () => document.createElement('button'),
+      contentEl: document.createElement('div'),
+    } as unknown as MarkdownView;
+    const dispose = vi.fn();
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      showInkPreviewByDefault: true,
+      textRepository: {} as never,
+    });
+    const showPreview = vi.fn(() => Promise.resolve());
+    const privateManager = manager as unknown as {
+      mounted: Map<MarkdownView, unknown>;
+      showPreview: (view: MarkdownView, manual: boolean) => Promise<void>;
+    };
+    privateManager.mounted.set(view, {
+      complete: false,
+      controller: { dispose },
+      filePath: 'Ink.md',
+      session: null,
+    });
+    privateManager.showPreview = showPreview;
+
+    await manager.remountLocalPerformancePreview(view);
+
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(showPreview).toHaveBeenCalledWith(view, true);
+    manager.dispose();
+  });
+
   it('measures the current Reading View only after fonts become layout-stable', async () => {
     const originalFonts = Object.getOwnPropertyDescriptor(document, 'fonts');
     let resolveFonts!: () => void;
@@ -1245,6 +1280,110 @@ describe('Obsidian Ink Mode action', () => {
     expect(action.hasAttribute('aria-pressed')).toBe(false);
     expect(action.classList.contains('is-preview')).toBe(true);
     manager.dispose();
+  });
+
+  it('reuses the note-open canonical observation when automatic Preview mounts', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const view = markdownView('Ink.md');
+    const canonical = inkSurface('Ink.md');
+    const listSurfaces = vi.fn(() =>
+      Promise.resolve({ conflicts: [], issues: [], records: [canonical] }),
+    );
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { listSurfaces } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      showInkPreviewByDefault: true,
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: canonical.noteId }),
+      } as never,
+    });
+
+    manager.registerView(view);
+
+    await vi.waitFor(() =>
+      expect(view.contentEl.querySelector('.inkstone-ink-surface')).not.toBeNull(),
+    );
+    expect(listSurfaces).toHaveBeenCalledOnce();
+    expect(view.contentEl.querySelector('[data-inkstone-ink-preview-canvas]')).not.toBeNull();
+    expect(view.contentEl.querySelector('[data-inkstone-ink-active]')).toBeNull();
+    expect(view.contentEl.querySelector('[data-inkstone-ink-toolbar-host]')).toBeNull();
+    expect(
+      (
+        manager as unknown as {
+          mounted: Map<MarkdownView, { complete: boolean; session: unknown }>;
+        }
+      ).mounted.get(view),
+    ).toMatchObject({ complete: false, session: null });
+
+    await manager.toggle(view);
+
+    expect(listSurfaces).toHaveBeenCalledOnce();
+    expect(view.contentEl.querySelector('[data-inkstone-ink-preview-canvas]')).not.toBeNull();
+    expect(view.contentEl.querySelector('[data-inkstone-ink-active]')).not.toBeNull();
+    expect((manager as unknown as { activeView: MarkdownView | null }).activeView).toBe(view);
+    await vi.waitFor(() =>
+      expect(view.contentEl.querySelector('[data-inkstone-ink-preview-canvas]')).toBeNull(),
+    );
+
+    await manager.toggle(view);
+
+    expect(listSurfaces).toHaveBeenCalledOnce();
+    expect(
+      (
+        manager as unknown as {
+          mounted: Map<MarkdownView, { complete: boolean; session: unknown }>;
+        }
+      ).mounted.get(view),
+    ).toMatchObject({ complete: false, session: null });
+    expect(view.contentEl.querySelector('[data-inkstone-ink-preview-canvas]')).not.toBeNull();
+    await vi.waitFor(() =>
+      expect(view.contentEl.querySelector('[data-inkstone-ink-active]')).toBeNull(),
+    );
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
+  it('fences Preview bitmap generations created before physical Brush pixels were renderable', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const view = markdownView('Ink.md');
+    const canonical = inkSurface('Ink.md');
+    const load = vi.fn(() => Promise.resolve(null));
+    const manager = new ObsidianInkModeManager({
+      app: {
+        workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () => Promise.resolve({ conflicts: [], issues: [], records: [canonical] }),
+      } as never,
+      preferenceStore: {} as never,
+      previewCache: { load, publish: vi.fn(() => Promise.resolve(false)) } as never,
+      showInkPreviewByDefault: true,
+      textRepository: {} as never,
+    });
+
+    manager.registerView(view);
+
+    await vi.waitFor(() => expect(load).toHaveBeenCalledOnce());
+    expect(load).toHaveBeenCalledWith(
+      expect.objectContaining({ rendererVersion: 'inkstone-preview-brush-v4' }),
+    );
+    manager.dispose();
+    getContext.mockRestore();
   });
 
   it('presents hidden Ink as Show Preview and opens Preview instead of Edit', async () => {
@@ -1796,6 +1935,56 @@ describe('Obsidian Ink Mode action', () => {
     expect(privateManager.activeView).toBeNull();
     expect(dispose).toHaveBeenCalledTimes(1);
     expect(action.hasAttribute('aria-pressed')).toBe(false);
+    manager.dispose();
+  });
+
+  it('begins mounted committing feedback before the lifecycle queue can run Done', async () => {
+    const action = document.createElement('button');
+    const view = {
+      addAction: () => action,
+      contentEl: document.createElement('div'),
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    let acknowledgePaint = (): void => undefined;
+    const prepareDoneFeedback = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          acknowledgePaint = resolve;
+        }),
+    );
+    const exit = vi.fn(() => Promise.resolve());
+    const mounted = {
+      complete: true,
+      controller: { dispose: vi.fn(), exit, prepareDoneFeedback },
+      filePath: 'Ink.md',
+      session: { read: () => ({ strokeCount: 0 }) },
+    };
+    const manager = new ObsidianInkModeManager({
+      app: {
+        workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { reclaimEmptySurfaces: () => Promise.resolve([]) } as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+    manager.registerView(view);
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = view;
+    privateManager.mounted.set(view, mounted);
+
+    const done = manager.toggle(view);
+
+    expect(prepareDoneFeedback).toHaveBeenCalledOnce();
+    expect(exit).not.toHaveBeenCalled();
+    acknowledgePaint();
+    await done;
+    expect(exit).toHaveBeenCalledOnce();
     manager.dispose();
   });
 

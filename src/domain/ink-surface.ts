@@ -297,6 +297,8 @@ export interface InkSurfaceVisibleBounds {
   readonly width: number;
 }
 
+const INK_SURFACE_CONTENT_DIGESTS = new WeakMap<InkSurfaceRecord, string>();
+
 /**
  * Temporary S29 fence for consumers that still only understand legacy centerline geometry.
  * S33 replaces this fence with the shared Brush Geometry registry; until then a physical stroke
@@ -341,7 +343,17 @@ export function inkSurfaceVisibleBounds(record: InkSurfaceRecord): InkSurfaceVis
 
 export function encodeInkSurfaceRecord(record: InkSurfaceRecord): string {
   assertInkSurfaceRecord(record);
-  return `${JSON.stringify(toStoredRecord(record), null, 2)}\n`;
+  const encoded = `${JSON.stringify(toStoredRecord(record), null, 2)}\n`;
+  INK_SURFACE_CONTENT_DIGESTS.set(record, digestCanonicalInkSurfaceBytes(encoded));
+  return encoded;
+}
+
+/**
+ * Exact canonical bytes already observed for this immutable record in the current process.
+ * Preview identity consumes this token instead of serializing a 10k history a second time.
+ */
+export function inkSurfaceContentDigest(record: InkSurfaceRecord): string | null {
+  return INK_SURFACE_CONTENT_DIGESTS.get(record) ?? null;
 }
 
 export function decodeInkSurfaceRecord(value: string): InkNormalizedSurfaceRecord {
@@ -388,7 +400,27 @@ export function safeDecodeInkSurfaceRecord(rawBytes: string): InkSurfaceDecodeRe
   } catch {
     return { kind: 'corrupt', rawBytes, reason: 'invalid-record' };
   }
-  return { kind: 'decoded', record: parsed as InkNormalizedSurfaceRecord };
+  const record = parsed as InkNormalizedSurfaceRecord;
+  INK_SURFACE_CONTENT_DIGESTS.set(record, digestCanonicalInkSurfaceBytes(rawBytes));
+  return { kind: 'decoded', record };
+}
+
+/** Non-cryptographic 128-bit cache fingerprint; canonical conflicts remain byte-compared. */
+function digestCanonicalInkSurfaceBytes(value: string): string {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  let third = 0x85ebca6b;
+  let fourth = 0xc2b2ae35;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ code, 0x27d4eb2d) >>> 0;
+    third = Math.imul(third ^ code, 0x165667b1) >>> 0;
+    fourth = Math.imul(fourth ^ code, 0x85ebca77) >>> 0;
+  }
+  return `ink-bytes-v1:${value.length.toString(16)}:${[first, second, third, fourth]
+    .map((part) => part.toString(16).padStart(8, '0'))
+    .join('')}`;
 }
 
 function toStoredRecord(record: InkSurfaceRecord): Record<string, unknown> {

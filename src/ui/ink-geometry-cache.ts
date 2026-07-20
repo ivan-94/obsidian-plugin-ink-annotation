@@ -10,15 +10,19 @@ interface InkGeometryCacheEntry {
   visible: boolean;
 }
 
-interface EvictionCandidate {
-  readonly cache: InkGeometryCache;
-  readonly key: string;
+export interface InkDisposableMemoryEvictionCandidate {
+  readonly evict: () => void;
   readonly lastUsed: number;
   readonly visible: boolean;
 }
 
+export interface InkDisposableMemoryParticipant {
+  readonly disposableBytes: number;
+  evictionCandidate(): InkDisposableMemoryEvictionCandidate | null;
+}
+
 export class InkGeometryCacheCoordinator {
-  private readonly caches = new Set<InkGeometryCache>();
+  private readonly participants = new Set<InkDisposableMemoryParticipant>();
   private clock = 0;
 
   constructor(readonly maximumBytes = INK_GEOMETRY_CACHE_BYTES_PLUGIN_WIDE) {
@@ -27,7 +31,7 @@ export class InkGeometryCacheCoordinator {
 
   get byteSize(): number {
     let bytes = 0;
-    for (const cache of this.caches) bytes += cache.disposableBytes;
+    for (const participant of this.participants) bytes += participant.disposableBytes;
     return bytes;
   }
 
@@ -36,26 +40,26 @@ export class InkGeometryCacheCoordinator {
     return this.clock;
   }
 
-  register(cache: InkGeometryCache): void {
-    this.caches.add(cache);
+  register(participant: InkDisposableMemoryParticipant): void {
+    this.participants.add(participant);
   }
 
-  unregister(cache: InkGeometryCache): void {
-    this.caches.delete(cache);
+  unregister(participant: InkDisposableMemoryParticipant): void {
+    this.participants.delete(participant);
   }
 
   enforce(): void {
     while (this.byteSize > this.maximumBytes) {
       const candidate = this.oldestCandidate();
       if (candidate === null) return;
-      candidate.cache.evictKey(candidate.key);
+      candidate.evict();
     }
   }
 
-  private oldestCandidate(): EvictionCandidate | null {
-    let selected: EvictionCandidate | null = null;
-    for (const cache of this.caches) {
-      const candidate = cache.evictionCandidate();
+  private oldestCandidate(): InkDisposableMemoryEvictionCandidate | null {
+    let selected: InkDisposableMemoryEvictionCandidate | null = null;
+    for (const participant of this.participants) {
+      const candidate = participant.evictionCandidate();
       if (
         candidate !== null &&
         (selected === null ||
@@ -92,6 +96,10 @@ export class InkGeometryCache {
 
   get geometryBytes(): number {
     return this.bytes;
+  }
+
+  get memoryCoordinator(): InkGeometryCacheCoordinator {
+    return this.coordinator;
   }
 
   get disposableBytes(): number {
@@ -172,7 +180,7 @@ export class InkGeometryCache {
     });
   }
 
-  evictionCandidate(): EvictionCandidate | null {
+  evictionCandidate(): InkDisposableMemoryEvictionCandidate | null {
     let selected: InkGeometryCacheEntry | null = null;
     for (const entry of this.entries.values()) {
       if (
@@ -186,8 +194,9 @@ export class InkGeometryCache {
     return selected === null
       ? null
       : {
-          cache: this,
-          key: selected.key,
+          evict: () => {
+            this.evictKey(selected.key);
+          },
           lastUsed: selected.lastUsed,
           visible: selected.visible,
         };
@@ -205,8 +214,42 @@ export class InkGeometryCache {
     while (this.bytes + this.indexByteSize > this.maximumBytes) {
       const candidate = this.evictionCandidate();
       if (candidate === null) return;
-      this.evictKey(candidate.key);
+      candidate.evict();
     }
+  }
+}
+
+/** Retained non-evictable bytes (for example a mounted spatial index) inside the same budget. */
+export class InkDisposableMemoryReservation implements InkDisposableMemoryParticipant {
+  private bytes = 0;
+
+  constructor(
+    private readonly coordinator: InkGeometryCacheCoordinator = GLOBAL_INK_GEOMETRY_CACHE_COORDINATOR,
+    private readonly maximumBytes = INK_GEOMETRY_CACHE_BYTES_PER_MOUNT,
+  ) {
+    assertBudget(maximumBytes, 'mounted Ink disposable memory');
+    this.coordinator.register(this);
+  }
+
+  get disposableBytes(): number {
+    return this.bytes;
+  }
+
+  setBytes(bytes: number): void {
+    if (!Number.isFinite(bytes) || bytes < 0 || bytes > this.maximumBytes) {
+      throw new Error('Mounted Ink disposable memory must fit its finite non-negative budget.');
+    }
+    this.bytes = bytes;
+    this.coordinator.enforce();
+  }
+
+  evictionCandidate(): null {
+    return null;
+  }
+
+  dispose(): void {
+    this.bytes = 0;
+    this.coordinator.unregister(this);
   }
 }
 

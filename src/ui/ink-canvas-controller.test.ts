@@ -2885,6 +2885,326 @@ describe('Ink canvas controller', () => {
     expect(session.redoCalls).toBe(1);
   });
 
+  it('presents linked document undo and redo without a full recovery rebuild', async () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('history')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    let controller: InkCanvasController | null = null;
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      onChange: (read, change) => controller?.sync(read, change),
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    session.enter();
+    session.apply({ id: 'add-command-stroke', kind: 'add', stroke: v3LegacyStroke('command') });
+    const root = document.createElement('div');
+    document.body.append(root);
+    controller = new InkCanvasController({ document, inkPerformance: diagnostics, root, session });
+    controller.enter();
+    const recoveryRebuildsBeforeCommand = controller.renderRuntimeStats.visibleRecoveryRebuildCount;
+    diagnostics.reset();
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-undo]')?.click();
+    expect(session.read().strokes.map(({ id }) => id)).toEqual(['history']);
+    expect(controller.renderRuntimeStats.visibleRecoveryRebuildCount).toBe(
+      recoveryRebuildsBeforeCommand,
+    );
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ name }) => name.startsWith('ink-command-')),
+    ).toEqual([
+      expect.objectContaining({ commandKind: 'undo', name: 'ink-command-apply' }),
+      expect.objectContaining({
+        commandKind: 'undo',
+        name: 'ink-command-to-submit',
+        presentationOutcome: 'submitted',
+      }),
+    ]);
+
+    const redo = root.querySelector<HTMLButtonElement>('[data-inkstone-ink-redo]');
+    await vi.waitFor(() => expect(redo?.disabled).toBe(false));
+    diagnostics.reset();
+    redo?.click();
+    expect(session.read().strokes.map(({ id }) => id)).toEqual(['history', 'command']);
+    expect(controller.renderRuntimeStats.visibleRecoveryRebuildCount).toBe(
+      recoveryRebuildsBeforeCommand,
+    );
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ name }) => name.startsWith('ink-command-')),
+    ).toEqual([
+      expect.objectContaining({ commandKind: 'redo', name: 'ink-command-apply' }),
+      expect.objectContaining({
+        commandKind: 'redo',
+        name: 'ink-command-to-submit',
+        presentationOutcome: 'submitted',
+      }),
+    ]);
+    controller.dispose();
+  });
+
+  it('cancels an unpresented command response when the controller is disposed', () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('history')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    let controller: InkCanvasController | null = null;
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      onChange: (read, change) => controller?.sync(read, change),
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    session.enter();
+    session.apply({ id: 'add-command-stroke', kind: 'add', stroke: v3LegacyStroke('command') });
+    const root = document.createElement('div');
+    document.body.append(root);
+    controller = new InkCanvasController({ document, inkPerformance: diagnostics, root, session });
+    controller.enter();
+    for (let remaining = 32; frames.length > 0 && remaining > 0; remaining -= 1) {
+      frames.shift()?.(performance.now());
+    }
+    diagnostics.reset();
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-undo]')?.click();
+    expect(diagnostics.snapshot().hangingSpanCount).toBe(1);
+
+    controller.dispose();
+    expect(diagnostics.snapshot().hangingSpanCount).toBe(0);
+  });
+
+  it('presents a linked document erase without a full recovery rebuild', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('erase-target')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    let controller: InkCanvasController | null = null;
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      onChange: (read, change) => controller?.sync(read, change),
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    controller = new InkCanvasController({ document, inkPerformance: diagnostics, root, session });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+    const recoveryRebuildsBeforeCommand = controller.renderRuntimeStats.visibleRecoveryRebuildCount;
+    diagnostics.reset();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointerup', 12, 12));
+
+    expect(session.read().strokes).toHaveLength(0);
+    expect(controller.renderRuntimeStats.visibleRecoveryRebuildCount).toBe(
+      recoveryRebuildsBeforeCommand,
+    );
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ name }) => name.startsWith('ink-command-')),
+    ).toEqual([
+      expect.objectContaining({ commandKind: 'erase', name: 'ink-command-apply' }),
+      expect.objectContaining({
+        commandKind: 'erase',
+        name: 'ink-command-to-submit',
+        presentationOutcome: 'submitted',
+      }),
+    ]);
+    controller.dispose();
+  });
+
+  it('presents linked document selection deletion without a full recovery rebuild', async () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('delete-target')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    let controller: InkCanvasController | null = null;
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      onChange: (read, change) => controller?.sync(read, change),
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    controller = new InkCanvasController({ document, inkPerformance: diagnostics, root, session });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 1200));
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-select-move]')?.click();
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+    const deleteSelection = root.querySelector<HTMLButtonElement>(
+      '[data-inkstone-ink-delete-selection]',
+    );
+    await vi.waitFor(() => expect(deleteSelection?.hidden).toBe(false));
+    const recoveryRebuildsBeforeCommand = controller.renderRuntimeStats.visibleRecoveryRebuildCount;
+    diagnostics.reset();
+
+    deleteSelection?.click();
+
+    expect(session.read().strokes).toHaveLength(0);
+    expect(controller.renderRuntimeStats.visibleRecoveryRebuildCount).toBe(
+      recoveryRebuildsBeforeCommand,
+    );
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ name }) => name.startsWith('ink-command-')),
+    ).toEqual([
+      expect.objectContaining({ commandKind: 'delete-selection', name: 'ink-command-apply' }),
+      expect.objectContaining({
+        commandKind: 'delete-selection',
+        name: 'ink-command-to-submit',
+        presentationOutcome: 'submitted',
+      }),
+    ]);
+    controller.dispose();
+  });
+
+  it('presents linked document selection without a full recovery rebuild', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('select-target')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    let controller: InkCanvasController | null = null;
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      onChange: (read, change) => controller?.sync(read, change),
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    controller = new InkCanvasController({ document, inkPerformance: diagnostics, root, session });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 1200));
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-select-move]')?.click();
+    const recoveryRebuildsBeforeCommand = controller.renderRuntimeStats.visibleRecoveryRebuildCount;
+    diagnostics.reset();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+
+    expect(session.selectedStrokeIds()).toEqual(['select-target']);
+    expect(controller.renderRuntimeStats.visibleRecoveryRebuildCount).toBe(
+      recoveryRebuildsBeforeCommand,
+    );
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ name }) => name.startsWith('ink-command-')),
+    ).toEqual([
+      expect.objectContaining({ commandKind: 'selection', name: 'ink-command-apply' }),
+      expect.objectContaining({
+        commandKind: 'selection',
+        name: 'ink-command-to-submit',
+        presentationOutcome: 'submitted',
+      }),
+    ]);
+    controller.dispose();
+  });
+
+  it('enters Select before the real-host Gate presents a selection command', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('gate-select-target')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    let controller: InkCanvasController | null = null;
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      onChange: (read, change) => controller?.sync(read, change),
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    controller = new InkCanvasController({ document, inkPerformance: diagnostics, root, session });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 1200));
+    controller.enter();
+    diagnostics.reset();
+
+    expect(controller.runLocalPerformanceCommand('selection')).toBe(true);
+
+    expect(session.selectedStrokeIds()).toEqual(['gate-select-target']);
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ name }) => name.startsWith('ink-command-')),
+    ).toEqual([
+      expect.objectContaining({ commandKind: 'selection', name: 'ink-command-apply' }),
+      expect.objectContaining({
+        commandKind: 'selection',
+        name: 'ink-command-to-submit',
+        presentationOutcome: 'submitted',
+      }),
+    ]);
+    controller.dispose();
+  });
+
+  it('presents a linked document selection move as one incremental command', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('move-target')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    let controller: InkCanvasController | null = null;
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      onChange: (read, change) => controller?.sync(read, change),
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    controller = new InkCanvasController({ document, inkPerformance: diagnostics, root, session });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 1200));
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-select-move]')?.click();
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointerup', 10, 10));
+    diagnostics.reset();
+    const recoveryRebuildsBeforeCommand = controller.renderRuntimeStats.visibleRecoveryRebuildCount;
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10));
+    root.dispatchEvent(pointer('pointermove', 30, 40));
+    root.dispatchEvent(pointer('pointerup', 30, 40));
+
+    expect(session.read().strokes[0]?.stroke.points[0]).toMatchObject({ x: 30, y: 40 });
+    expect(controller.renderRuntimeStats.visibleRecoveryRebuildCount).toBe(
+      recoveryRebuildsBeforeCommand,
+    );
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ commandKind }) => commandKind === 'move'),
+    ).toEqual([
+      expect.objectContaining({ name: 'ink-command-apply' }),
+      expect.objectContaining({
+        name: 'ink-command-to-submit',
+        presentationOutcome: 'submitted',
+      }),
+    ]);
+    controller.dispose();
+  });
+
   it('routes a qualifying closed eraser path to one region erase', () => {
     const root = document.createElement('div');
     document.body.append(root);
@@ -3882,12 +4202,22 @@ describe('Ink canvas controller', () => {
     expect(controls.dataset.inkstoneInkDragged).toBeUndefined();
   });
 
-  it('delegates the palette Exit button to the host Ink mode lifecycle', async () => {
+  it('paints disabled Saving feedback before delegating Done to the host lifecycle', async () => {
     const root = document.createElement('div');
     document.body.append(root);
     const requests: string[] = [];
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    let acknowledgePaint = (): void => undefined;
+    const afterNextPaint = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          acknowledgePaint = resolve;
+        }),
+    );
     const controller = new InkCanvasController({
+      afterNextPaint,
       document,
+      inkPerformance: diagnostics,
       onExitRequested: () => {
         requests.push('exit');
         return Promise.resolve();
@@ -3898,7 +4228,26 @@ describe('Ink canvas controller', () => {
     controller.enter();
 
     root.querySelector<HTMLButtonElement>('button[aria-label="Exit Ink Mode"]')?.click();
+
+    const done = root.querySelector<HTMLButtonElement>('button[aria-label="Exit Ink Mode"]');
+    const status = root.querySelector<HTMLElement>('[data-inkstone-ink-status]');
+
+    expect(afterNextPaint).toHaveBeenCalledOnce();
+    expect(status?.hidden).toBe(false);
+    expect(status?.textContent).toContain('Saving');
+    expect(done?.disabled).toBe(true);
+    expect(requests).toEqual([]);
+    expect(diagnostics.snapshot().hangingSpanCount).toBe(2);
+
+    acknowledgePaint();
     await vi.waitFor(() => expect(requests).toEqual(['exit']));
+    await vi.waitFor(() => expect(diagnostics.snapshot().hangingSpanCount).toBe(0));
+    expect(diagnostics.snapshot().recentSpans).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'ink-done-first-feedback', workPhase: 'save' }),
+        expect.objectContaining({ accepted: true, name: 'ink-done-total', workPhase: 'save' }),
+      ]),
+    );
   });
 
   it('keeps Ink Mode active on save failure and exposes Retry', async () => {

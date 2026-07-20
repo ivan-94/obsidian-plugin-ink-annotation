@@ -130,6 +130,8 @@ export interface InkLiveDocumentInstrumentation {
   onColdMaterialization?(measurement: {
     readonly intent: 'explicit-cold' | 'legacy-snapshot';
   }): void;
+  onInteractionActiveChanged?(active: boolean): void;
+  onUserInteraction?(): void;
   onPersistenceWork?(measurement: {
     readonly kind: 'canonical-encode' | 'canonical-storage-write' | 'cold-snapshot';
     readonly phase: 'cold' | 'completion';
@@ -155,7 +157,12 @@ export class InkLiveDocument {
   private readonly logicalRefsById = new Map<string, InkRenderableStrokeRef>();
   private readonly onChange: (read: InkDocumentReadView, change: InkDocumentChange | null) => void;
   private readonly noteKey: string;
-  private appendReadRefs: InkRenderableStrokeRef[] | null = null;
+  private orderedProjectionCache: readonly InkRenderableStrokeRef[] = Object.freeze([]);
+  private orderedProjectionCacheRevision = -1;
+  private orderedProjectionRevision = 0;
+  private readonly orderedStrokeProjection = createLazyInkStrokeProjection(() =>
+    this.materializeOrderedStrokeProjection(),
+  );
   private interactionActive = false;
   private interactionEpoch = 0;
   private readonly interactionIdleWaiters = new Set<() => void>();
@@ -268,6 +275,7 @@ export class InkLiveDocument {
       this.boundsIndex.set(ref.id, ref.bounds, ref);
       this.logicalRefsById.set(ref.id, ref);
     }
+    this.invalidateOrderedStrokeProjection();
     this.readView = Object.freeze({
       documentId: `document:${snapshots.map(({ surface }) => surface.id).join(':')}`,
       generation: 0,
@@ -277,17 +285,20 @@ export class InkLiveDocument {
       persistence: aggregatePersistence(snapshots),
       selection: Object.freeze([]),
       state: aggregateState(snapshots),
-      strokeCount: strokes.length,
-      strokes,
+      strokeCount: this.logicalRefsById.size,
+      strokes: this.orderedStrokeProjection,
     });
-    this.appendReadRefs = [...strokes];
-    this.readView = Object.freeze({ ...this.readView, strokes: this.appendReadRefs });
     this.replayDraftOperations(input.draftOperations ?? []);
     this.scheduleSustainedInactivitySave();
   }
 
   read(): InkDocumentReadView {
     return this.readView;
+  }
+
+  /** O(1) command/Gate seam; ordered history is deliberately not materialized. */
+  firstRenderableStrokeRef(): InkRenderableStrokeRef | undefined {
+    return this.logicalRefsById.values().next().value;
   }
 
   query(viewport: InkLogicalRect): readonly InkRenderableStrokeRef[] {
@@ -333,6 +344,7 @@ export class InkLiveDocument {
   setInteractionActive(active: boolean): void {
     if (active === this.interactionActive) return;
     this.interactionActive = active;
+    this.instrumentation.onInteractionActiveChanged?.(active);
     if (active) {
       this.interactionEpoch += 1;
       this.clearInactivityTimer();
@@ -346,6 +358,7 @@ export class InkLiveDocument {
   /** Resets the product-level sustained-inactivity window without authorizing immediate work. */
   noteUserInteraction(): void {
     this.interactionEpoch += 1;
+    this.instrumentation.onUserInteraction?.();
     this.clearInactivityTimer();
     this.scheduleSustainedInactivitySave();
   }
@@ -418,11 +431,9 @@ export class InkLiveDocument {
     this.nextStrokeOrder += 1;
     this.boundsIndex.set(ref.id, ref.bounds, ref);
     this.logicalRefsById.set(ref.id, ref);
+    this.invalidateOrderedStrokeProjection();
     const persistence = previous.persistence;
     const generation = previous.generation + 1;
-    if (this.appendReadRefs !== previous.strokes) this.appendReadRefs = [...previous.strokes];
-    this.appendReadRefs.push(ref);
-    const strokes = this.appendReadRefs;
     this.readView = Object.freeze({
       documentId: previous.documentId,
       generation,
@@ -432,8 +443,8 @@ export class InkLiveDocument {
       persistence,
       selection: previous.selection,
       state: previous.state,
-      strokeCount: strokes.length,
-      strokes,
+      strokeCount: this.logicalRefsById.size,
+      strokes: this.orderedStrokeProjection,
     });
     return Object.freeze({
       addedIds: Object.freeze([stroke.id]),
@@ -447,6 +458,32 @@ export class InkLiveDocument {
       selectionDelta: null,
       updatedIds: Object.freeze([]),
     });
+  }
+
+  /** Invalidates the cold ordered projection after the O(k) Map/index mutation is complete. */
+  private mutateOrderedStrokeProjection(
+    sourceRefs: readonly InkRenderableStrokeRef[],
+    targetRefs: readonly InkRenderableStrokeRef[],
+  ): readonly InkRenderableStrokeRef[] {
+    void sourceRefs;
+    void targetRefs;
+    this.invalidateOrderedStrokeProjection();
+    return this.orderedStrokeProjection;
+  }
+
+  private invalidateOrderedStrokeProjection(): void {
+    this.orderedProjectionRevision += 1;
+  }
+
+  private materializeOrderedStrokeProjection(): readonly InkRenderableStrokeRef[] {
+    if (this.orderedProjectionCacheRevision === this.orderedProjectionRevision) {
+      return this.orderedProjectionCache;
+    }
+    this.orderedProjectionCache = Object.freeze(
+      [...this.logicalRefsById.values()].sort((left, right) => left.order - right.order),
+    );
+    this.orderedProjectionCacheRevision = this.orderedProjectionRevision;
+    return this.orderedProjectionCache;
   }
 
   snapshot(): InkSurfaceSessionSnapshot {
@@ -476,6 +513,11 @@ export class InkLiveDocument {
   /** Explicit cold canonical materialization for save/export/fixture paths. */
   materializeColdSnapshot(): InkSurfaceSessionSnapshot {
     return this.materializeCompositeSnapshot('explicit-cold');
+  }
+
+  /** Exact bounded canonical projection after Done; shares immutable records and owns no editor. */
+  canonicalProjectionRecords(): readonly InkSurfaceRecord[] {
+    return Object.freeze(this.bounded.map(({ session }) => session.snapshot().surface));
   }
 
   retry(): Promise<void> {
@@ -641,9 +683,10 @@ export class InkLiveDocument {
       throw new Error('Select at least one Ink stroke before moving it.');
     }
     this.selectionPreviewBaseRefs ??= new Map(
-      this.readView.strokes.flatMap((ref) =>
-        this.selectedStrokeIdsSet.has(ref.id) ? [[ref.id, ref] as const] : [],
-      ),
+      [...this.selectedStrokeIdsSet].flatMap((id) => {
+        const ref = this.logicalRefsById.get(id);
+        return ref === undefined ? [] : [[id, ref] as const];
+      }),
     );
     const baseRefs = [...this.selectionPreviewBaseRefs.values()];
     const points = baseRefs.flatMap(({ stroke }) => stroke.points);
@@ -658,6 +701,7 @@ export class InkLiveDocument {
     };
     const previous = this.readView;
     const replacementById = new Map<string, InkRenderableStrokeRef>();
+    const currentRefs: InkRenderableStrokeRef[] = [];
     const boundsChanges: InkDocumentChange['bounds'][number][] = [];
     for (const baseRef of baseRefs) {
       const stroke = translateStroke(baseRef.stroke, this.selectionMovePreview);
@@ -666,15 +710,14 @@ export class InkLiveDocument {
       replacementById.set(ref.id, ref);
       this.boundsIndex.set(ref.id, ref.bounds, ref);
       const current = this.logicalRefsById.get(ref.id) ?? baseRef;
+      currentRefs.push(current);
       this.logicalRefsById.set(ref.id, ref);
       boundsChanges.push(
         Object.freeze({ id: ref.id, newBounds: ref.bounds, oldBounds: current.bounds }),
       );
     }
     const generation = previous.generation + 1;
-    const strokes = Object.freeze(
-      previous.strokes.map((ref) => replacementById.get(ref.id) ?? ref),
-    );
+    const strokes = this.mutateOrderedStrokeProjection(currentRefs, [...replacementById.values()]);
     this.readView = Object.freeze({ ...previous, generation, strokes });
     this.systemChangeSequence += 1;
     this.publishChange(
@@ -696,9 +739,10 @@ export class InkLiveDocument {
     if (this.selectionMovePreview === null || this.selectionPreviewBaseRefs === null) return false;
     const previous = this.readView;
     const baseRefs = [...this.selectionPreviewBaseRefs.values()];
-    const baseById = new Map(baseRefs.map((ref) => [ref.id, ref]));
+    const currentRefs: InkRenderableStrokeRef[] = [];
     const boundsChanges = baseRefs.map((ref) => {
       const current = this.logicalRefsById.get(ref.id) ?? ref;
+      currentRefs.push(current);
       this.boundsIndex.set(ref.id, ref.bounds, ref);
       this.logicalRefsById.set(ref.id, ref);
       return Object.freeze({ id: ref.id, newBounds: ref.bounds, oldBounds: current.bounds });
@@ -706,7 +750,7 @@ export class InkLiveDocument {
     this.selectionMovePreview = null;
     this.selectionPreviewBaseRefs = null;
     const generation = previous.generation + 1;
-    const strokes = Object.freeze(previous.strokes.map((ref) => baseById.get(ref.id) ?? ref));
+    const strokes = this.mutateOrderedStrokeProjection(currentRefs, baseRefs);
     this.readView = Object.freeze({ ...previous, generation, strokes });
     this.systemChangeSequence += 1;
     this.publishChange(
@@ -750,14 +794,15 @@ export class InkLiveDocument {
     this.selectionMovePreview = null;
     this.selectionPreviewBaseRefs = null;
     if (base === null) return;
-    const baseById = new Map(base);
+    const currentRefs: InkRenderableStrokeRef[] = [];
     for (const ref of base.values()) {
+      currentRefs.push(this.logicalRefsById.get(ref.id) ?? ref);
       this.boundsIndex.set(ref.id, ref.bounds, ref);
       this.logicalRefsById.set(ref.id, ref);
     }
     this.readView = Object.freeze({
       ...this.readView,
-      strokes: Object.freeze(this.readView.strokes.map((ref) => baseById.get(ref.id) ?? ref)),
+      strokes: this.mutateOrderedStrokeProjection(currentRefs, [...base.values()]),
     });
   }
 
@@ -785,6 +830,7 @@ export class InkLiveDocument {
     try {
       const change = this.applyHistoryEntry(command.logicalBefore, command.logicalAfter, commandId);
       this.redoStack.push(command);
+      this.publishChange(change);
       return change;
     } catch (error) {
       this.undoStack.push(command);
@@ -798,6 +844,7 @@ export class InkLiveDocument {
     try {
       const change = this.applyHistoryEntry(command.logicalAfter, command.logicalBefore, commandId);
       this.undoStack.push(command);
+      this.publishChange(change);
       return change;
     } catch (error) {
       this.redoStack.push(command);
@@ -813,17 +860,14 @@ export class InkLiveDocument {
     const previous = this.readView;
     const affectedIds = new Set([...targetRefs, ...sourceRefs].map(({ id }) => id));
     const targetById = new Map(targetRefs.map((ref) => [ref.id, ref]));
+    const previousById = new Map(sourceRefs.map((ref) => [ref.id, ref]));
     for (const id of affectedIds) this.boundsIndex.delete(id);
     for (const id of affectedIds) this.logicalRefsById.delete(id);
     for (const ref of targetRefs) {
       this.boundsIndex.set(ref.id, ref.bounds, ref);
       this.logicalRefsById.set(ref.id, ref);
     }
-    const strokes = Object.freeze(
-      [...previous.strokes.filter(({ id }) => !affectedIds.has(id)), ...targetRefs].sort(
-        (left, right) => left.order - right.order,
-      ),
-    );
+    const strokes = this.mutateOrderedStrokeProjection(sourceRefs, targetRefs);
     for (const id of affectedIds) {
       if (!targetById.has(id)) this.selectedStrokeIdsSet.delete(id);
     }
@@ -838,12 +882,9 @@ export class InkLiveDocument {
       persistence,
       selection,
       state: aggregateState(snapshots),
-      strokeCount: strokes.length,
+      strokeCount: this.logicalRefsById.size,
       strokes,
     });
-    const previousById = new Map(
-      previous.strokes.filter(({ id }) => affectedIds.has(id)).map((ref) => [ref.id, ref]),
-    );
     const orderedIds = [...affectedIds].sort(
       (left, right) =>
         (targetById.get(left)?.order ?? previousById.get(left)?.order ?? 0) -
@@ -874,7 +915,6 @@ export class InkLiveDocument {
         : Object.freeze({ next: selection, previous: previous.selection }),
       updatedIds: Object.freeze(updatedIds),
     });
-    this.publishChange(change);
     return change;
   }
 
@@ -928,7 +968,6 @@ export class InkLiveDocument {
     });
     if (removed.length === 0) return { change: null, deletedIds: [] };
     const removedIds = removed.map(({ id }) => id);
-    const removedIdSet = new Set(removedIds);
     this.boundsIndex.deleteMany(removedIds);
     for (const id of removedIds) this.logicalRefsById.delete(id);
     const previous = this.readView;
@@ -939,9 +978,7 @@ export class InkLiveDocument {
     const snapshots = this.bounded.map((bounded) => bounded.session.snapshot());
     const persistence = this.effectivePersistence(snapshots);
     const generation = previous.generation + 1;
-    const strokes = Object.freeze(
-      previous.strokes.filter((candidate) => !removedIdSet.has(candidate.id)),
-    );
+    const strokes = this.mutateOrderedStrokeProjection(removed, []);
     this.readView = Object.freeze({
       documentId: previous.documentId,
       generation,
@@ -951,7 +988,7 @@ export class InkLiveDocument {
       persistence,
       selection,
       state: aggregateState(snapshots),
-      strokeCount: strokes.length,
+      strokeCount: this.logicalRefsById.size,
       strokes,
     });
     const change: InkDocumentChange = Object.freeze({
@@ -1026,9 +1063,7 @@ export class InkLiveDocument {
     const snapshots = this.bounded.map((bounded) => bounded.session.snapshot());
     const persistence = this.effectivePersistence(snapshots);
     const generation = previous.generation + 1;
-    const strokes = Object.freeze(
-      previous.strokes.map((ref) => replacementById.get(ref.id) ?? ref),
-    );
+    const strokes = this.mutateOrderedStrokeProjection(existing, [...replacementById.values()]);
     this.readView = Object.freeze({
       documentId: previous.documentId,
       generation,
@@ -1038,7 +1073,7 @@ export class InkLiveDocument {
       persistence,
       selection: previous.selection,
       state: aggregateState(snapshots),
-      strokeCount: strokes.length,
+      strokeCount: this.logicalRefsById.size,
       strokes,
     });
     const change: InkDocumentChange = Object.freeze({
@@ -1102,9 +1137,7 @@ export class InkLiveDocument {
     }
     const persistence = this.effectivePersistence(snapshots);
     const generation = previous.generation + 1;
-    const strokes = Object.freeze(
-      previous.strokes.map((ref) => replacementById.get(ref.id) ?? ref),
-    );
+    const strokes = this.mutateOrderedStrokeProjection(changed, [...replacementById.values()]);
     this.readView = Object.freeze({
       ...previous,
       generation,
@@ -1265,7 +1298,7 @@ export class InkLiveDocument {
       this.logicalRefsById.set(ref.id, ref);
     }
     this.rebuildProjectedSurfaceIndex(snapshots);
-    this.appendReadRefs = refs;
+    this.invalidateOrderedStrokeProjection();
     this.nextStrokeOrder = refs.length;
     this.selectionMovePreview = null;
     this.selectionPreviewBaseRefs = null;
@@ -1284,7 +1317,7 @@ export class InkLiveDocument {
       selection,
       state,
       strokeCount: refs.length,
-      strokes: this.appendReadRefs,
+      strokes: this.orderedStrokeProjection,
     });
     const addedIds = refs.filter(({ id }) => !previousById.has(id)).map(({ id }) => id);
     const removedIds = previous.strokes.filter(({ id }) => !nextById.has(id)).map(({ id }) => id);
@@ -1896,6 +1929,25 @@ function aggregateState(snapshots: readonly InkSurfaceSessionSnapshot[]): InkMod
     kind: 'ink-mode',
     saveError: null,
   };
+}
+
+function createLazyInkStrokeProjection(
+  read: () => readonly InkRenderableStrokeRef[],
+): readonly InkRenderableStrokeRef[] {
+  const target: InkRenderableStrokeRef[] = [];
+  return new Proxy(target, {
+    defineProperty: () => false,
+    deleteProperty: () => false,
+    get: (_target, property) => {
+      const current = read();
+      const value: unknown = Reflect.get(current, property, current);
+      if (typeof value !== 'function') return value;
+      const method = value as (...args: unknown[]) => unknown;
+      return (...args: unknown[]) => Reflect.apply(method, current, args);
+    },
+    has: (_target, property) => Reflect.has(read(), property),
+    set: () => false,
+  });
 }
 
 async function settleAll(promises: readonly Promise<void>[]): Promise<void> {

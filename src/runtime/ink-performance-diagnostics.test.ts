@@ -51,7 +51,31 @@ describe('InkPerformanceDiagnostics', () => {
       forbiddenWork: [],
       frameIntervalsMs: { activeWriting: [], hostGaps: [], idle: [] },
       recentSpans: [],
+      schedulerUnitCount: 0,
+      schedulerUnitOverruns: [],
     });
+  });
+
+  it('retains bounded scheduler unit overruns with their priority lane', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+
+    diagnostics.recordSchedulerUnit();
+    diagnostics.recordSchedulerUnit();
+    diagnostics.recordSchedulerUnitOverrun({
+      durationMs: 1.25,
+      lane: 'visible',
+      unitKind: 'preview-canvas-draw',
+    });
+    diagnostics.recordSchedulerUnitOverrun({ durationMs: 3.5, lane: 'cold' });
+
+    expect(diagnostics.snapshot().schedulerUnitOverruns).toEqual([
+      { durationMs: 1.25, lane: 'visible', unitKind: 'preview-canvas-draw' },
+      { durationMs: 3.5, lane: 'cold' },
+    ]);
+    expect(diagnostics.snapshot().schedulerUnitCount).toBe(2);
+    expect(() =>
+      diagnostics.recordSchedulerUnitOverrun({ durationMs: Number.NaN, lane: 'cold' }),
+    ).toThrow(/finite positive/u);
   });
 
   it('reports bounded Recovery v4 entry bytes and write/encode counts', () => {
@@ -82,6 +106,73 @@ describe('InkPerformanceDiagnostics', () => {
         name: 'ink-stroke-commit',
       }),
     );
+  });
+
+  it('records privacy-safe command apply and presentation spans by command kind', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+
+    diagnostics
+      .beginSpan('ink-command-apply', { commandKind: 'undo', workPhase: 'command' })
+      .finish();
+    diagnostics
+      .beginSpan('ink-command-to-submit', { commandKind: 'undo', workPhase: 'command' })
+      .finish({ presentationOutcome: 'submitted' });
+
+    expect(diagnostics.snapshot().recentSpans).toEqual([
+      expect.objectContaining({
+        commandKind: 'undo',
+        name: 'ink-command-apply',
+        workPhase: 'command',
+      }),
+      expect.objectContaining({
+        commandKind: 'undo',
+        name: 'ink-command-to-submit',
+        presentationOutcome: 'submitted',
+        workPhase: 'command',
+      }),
+    ]);
+    expect(diagnostics.snapshot().distributions).toEqual([
+      expect.objectContaining({ commandKind: 'undo', name: 'ink-command-apply' }),
+      expect.objectContaining({ commandKind: 'undo', name: 'ink-command-to-submit' }),
+    ]);
+  });
+
+  it('records Done first-feedback and total spans in the save lane', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+
+    diagnostics.beginSpan('ink-done-first-feedback', { workPhase: 'save' }).finish();
+    diagnostics.beginSpan('ink-done-total', { workPhase: 'save' }).finish({ accepted: true });
+
+    expect(diagnostics.snapshot().recentSpans).toEqual([
+      expect.objectContaining({ name: 'ink-done-first-feedback', workPhase: 'save' }),
+      expect.objectContaining({ accepted: true, name: 'ink-done-total', workPhase: 'save' }),
+    ]);
+  });
+
+  it('keeps Preview canonical, cache, first-pixel, and viewport stages separate', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+
+    for (const name of [
+      'ink-preview-canonical-observation',
+      'ink-preview-cache-lookup',
+      'ink-preview-cache-publish',
+      'ink-preview-first-ink',
+      'ink-preview-viewport-complete',
+      'ink-preview-editable-hydration',
+      'ink-preview-to-edit',
+    ] as const) {
+      diagnostics.beginSpan(name, { workPhase: 'preview' }).finish();
+    }
+
+    expect(diagnostics.snapshot().recentSpans.map(({ name }) => name)).toEqual([
+      'ink-preview-canonical-observation',
+      'ink-preview-cache-lookup',
+      'ink-preview-cache-publish',
+      'ink-preview-first-ink',
+      'ink-preview-viewport-complete',
+      'ink-preview-editable-hydration',
+      'ink-preview-to-edit',
+    ]);
   });
 
   it('records and validates the active presentation outcome', () => {

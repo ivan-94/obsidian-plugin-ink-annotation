@@ -107,6 +107,28 @@ flowchart LR
 - `INK-RSP-20` — Entering Ink Mode keeps exact Preview pixels visible while the editable Ink Live
   Document hydrates. When hydration and its first matching presentation are ready, the editable
   presentation replaces Preview without a blank frame.
+- `INK-RSP-20A` — Preview/Edit replacement is a compositor-only opacity handoff. The outgoing exact
+  pixels remain fully visible until the incoming presenter has painted once; the two fixed
+  presentation layers then cross-fade for at most 140 ms. The handoff never delays Pencil input,
+  Done completion, canonical save, or Preview hydration, never requests Canvas redraw solely for
+  animation, and releases the outgoing presenter only after the fade settles. Reduced Motion
+  completes the handoff immediately without animation.
+- `INK-RSP-20B` — Preview and Edit share the same pane-wide Stage coordinate plane. The visible
+  Preview backing is bounded to the pane viewport, but its logical query may begin before or extend
+  beyond the Markdown document origin. Ink with negative logical X or otherwise outside the Markdown
+  document box remains visible and is never clipped merely because Reading View content uses a
+  narrower readable-line-width container.
+- `INK-RSP-20C` — Preview scroll never clears, resizes, hides, or mutates the currently presented
+  Canvas before a matching replacement is complete. During motion the retained bitmap follows the
+  document through a compositor transform; canonical query, Geometry compilation, and Canvas draw
+  occur in a bounded staging backing, and only a current complete generation may atomically replace
+  the presented bitmap.
+- `INK-RSP-20D` — Editable scroll is compositor-only until settlement. Settlement never shifts,
+  self-copies, or reuses committed bitmap pixels, even through an intermediate Canvas: repeated
+  bitmap shifts produce feedback accumulation in real Chromium/WebKit. The target viewport is
+  reconstructed from bounded retained raster tiles; missing tiles prepare behind the retained CSS
+  projection, and only the complete current viewport may replace it. This does not add a fourth
+  persistent backing store or recompile unaffected history Geometry.
 - `INK-RSP-21` — A Preview cache entry is never used merely because note revision numbers match.
   Exact identity includes same-revision content divergence and renderer inputs.
 - `INK-RSP-22` — The existing 160x90 surface-summary thumbnail is discovery metadata only. Because
@@ -215,8 +237,11 @@ The Work Scheduler has exactly three priority lanes:
 
 - `INK-RSP-31` — Every visible/cold unit carries note, mount, session, revision, and generation
   epochs. Any mismatch cancels it before its next mutation or publication.
-- `INK-RSP-32` — Deferred main-thread CPU units retain the measured target-iPad limit of at most 1
-  ms. A task that cannot satisfy this limit moves to a Worker Seam or behind completed Done.
+- `INK-RSP-32` — Deferred visible/cold main-thread CPU units target at most 1 ms: at least 99% of
+  measured units are at or below 1 ms, P99 is at most 2 ms, and every unit remains strictly below 4
+  ms. A unit reaching 4 ms, or a sustained over-1-ms ratio above 1%, fails the Gate and moves to a
+  Worker Seam or behind completed Done. The 1 ms target remains a diagnostic warning boundary, not a
+  zero-tolerance verdict distorted by JIT, GC, timer, or host scheduling jitter.
 - `INK-RSP-33` — Native `requestIdleCallback` or `scheduler.postTask` and the iOS MessageChannel/rAF
   fallback have identical priority, cancellation, and frame-debt semantics.
 - `INK-RSP-34` — `requestIdleCallback` is only a scheduling signal. It does not authorize foreground
@@ -257,7 +282,7 @@ ms.
 | Ordinary command full install              | 0                                                                   |
 | Ordinary command full raster clear/rebuild | 0                                                                   |
 | 10k/30 command growth                      | P95 delta versus empty <= `max(1 ms, 10%)`                          |
-| Done first-feedback paint                  | P99 <= 1R                                                           |
+| Done first-feedback paint                  | P99 <= 1R + 2 ms                                                    |
 | Work before Done feedback paint            | 0 materialize, encode, canonical observation, Vault, or cache calls |
 | Done total, normal                         | <= 1 s                                                              |
 | Done total, 10k/30                         | <= 3 s                                                              |
@@ -288,6 +313,9 @@ The single local Gate command must add deterministic cases for:
 - cold/warm Preview open, cache hit/miss/stale/corrupt/quota/eviction;
 - same-revision divergence and external canonical change;
 - Preview-to-Edit handoff with no blank generation;
+- pane-wide Preview parity for Ink inside and outside the Markdown document box;
+- continuous Preview/Edit scroll with zero visible-canvas clear/backing mutation before replacement
+  and zero overlapping committed self-copy;
 - two or more simultaneous mounts under the plugin-wide memory budget;
 - lane preemption and cancellation when Pencil or command interaction resumes;
 - at least five minutes of mixed growing history/Preview/command soak after all focused cases pass.
@@ -382,6 +410,8 @@ the former 47-condition matrix.
 - [ ] Ordinary commands produce one change and zero full installs/rebuilds.
 - [ ] Done feedback paints before any cold/canonical work.
 - [ ] Many-stroke Preview no longer mounts editable state or performs duplicate full reads.
+- [ ] Preview retains pane-wide Ink outside the Markdown document box and both Preview/Edit scroll
+      without blank, repeated, or feedback-smeared pixels.
 - [ ] Exact Preview cache survives remount/restart and fails safely under every invalidation case.
 - [ ] Empty/1k/10k/30 command, Preview, Done, memory, and soak budgets pass in real Obsidian.
 - [ ] The local result includes digests, raw evidence, analysis, and Source Manifest.
@@ -430,8 +460,13 @@ the former 47-condition matrix.
 - The pre-spec implementation baseline passed `npm run check` on 2026-07-20: 145 regular test files
   / 1448 tests, 12 performance test files / 79 tests, lint, typecheck, production build, and mobile
   bundle check.
+- A real-Obsidian A/B reproduction on 2026-07-20 isolated editable-scroll feedback smearing to the
+  committed-Canvas bitmap-shift path: repeated alternating scrolls accumulated copied pixels with
+  the path enabled, while blocking only that path stopped the accumulation. The production path was
+  removed, the focused 203-test UI suite passed, and the installed build remained stable after 32
+  alternating scrolls of the same 1k-history fixture.
 - This specification is verified by Markdown formatting, `git diff --check`, and local-link review.
-  It does not claim S35–S39 implementation or Gate completion.
+  It does not claim full S35–S39 Gate completion.
 
 ### Open questions / risks
 

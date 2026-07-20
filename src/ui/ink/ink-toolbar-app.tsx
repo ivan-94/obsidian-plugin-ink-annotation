@@ -50,6 +50,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       <ToolbarButton
         className={`inkstone-ink-controls__drag-handle${state.dragging ? ' is-dragging' : ''}`}
         data={{ inkstoneInkDragHandle: 'true' }}
+        disabled={state.committing}
         icon="grip-vertical"
         label="Move Ink toolbar"
         onKeyDown={props.onDragKeyDown}
@@ -57,6 +58,8 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       />
       <ToolbarButton
         className="inkstone-ink-controls__done"
+        data={{ inkstoneInkDone: 'true' }}
+        disabled={state.committing}
         hidden={!state.active}
         icon="circle-check"
         label="Exit Ink Mode"
@@ -65,6 +68,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       {(['pen', 'highlighter', 'eraser'] as const).map((tool) => (
         <ToolbarButton
           data={{ inkstoneInkTool: tool }}
+          disabled={state.committing}
           icon={tool === 'pen' ? 'pen-line' : tool === 'highlighter' ? 'highlighter' : 'eraser'}
           key={tool}
           label={
@@ -88,6 +92,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       ))}
       <ToolbarButton
         data={{ inkstoneInkSelectMove: 'true' }}
+        disabled={state.committing}
         icon="move"
         label="Select and move Ink"
         onClick={props.onSelectMove}
@@ -95,6 +100,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       />
       <ToolbarButton
         data={{ inkstoneInkMultiple: 'true' }}
+        disabled={state.committing}
         hidden={state.interaction !== 'select'}
         icon="list-checks"
         label="Select multiple Ink strokes"
@@ -103,6 +109,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       />
       <ToolbarButton
         data={{ inkstoneInkDeleteSelection: 'true' }}
+        disabled={state.committing}
         hidden={state.interaction !== 'select' || state.selectedCount === 0}
         icon="trash-2"
         label={`Delete ${state.selectedCount} selected Ink stroke${state.selectedCount === 1 ? '' : 's'}`}
@@ -111,6 +118,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       <input
         aria-label="Ink color"
         data-inkstone-ink-color="true"
+        disabled={state.committing}
         hidden={!state.optionsVisible}
         onInput={(event) => props.onColor(event.currentTarget.value)}
         type="color"
@@ -135,6 +143,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         <select
           aria-label="Ink width"
           data-inkstone-ink-width-select="true"
+          disabled={state.committing}
           onChange={(event) => props.onWidth(Number(event.currentTarget.value))}
           value={state.width}
         >
@@ -147,6 +156,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       </div>
       <ToolbarButton
         data={{ inkstoneInkZoomOut: 'true' }}
+        disabled={state.committing}
         hidden={!state.optionsVisible}
         icon="zoom-out"
         label="Zoom Ink workspace out"
@@ -155,6 +165,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       <ToolbarButton
         className="inkstone-ink-controls__zoom-fit"
         data={{ inkstoneInkZoomFit: 'true' }}
+        disabled={state.committing}
         hidden={!state.optionsVisible}
         icon="scan"
         label={`Fit Ink workspace to pane · ${Math.round(state.zoomScale * 100)}%`}
@@ -164,6 +175,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       />
       <ToolbarButton
         data={{ inkstoneInkZoomIn: 'true' }}
+        disabled={state.committing}
         hidden={!state.optionsVisible}
         icon="zoom-in"
         label="Zoom Ink workspace in"
@@ -171,19 +183,20 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       />
       <ToolbarButton
         data={{ inkstoneInkUndo: 'true' }}
-        disabled={!state.canUndo}
+        disabled={state.committing || !state.canUndo}
         icon="undo-2"
         label="Undo Ink change"
         onClick={props.onUndo}
       />
       <ToolbarButton
         data={{ inkstoneInkRedo: 'true' }}
-        disabled={!state.canRedo}
+        disabled={state.committing || !state.canRedo}
         icon="redo-2"
         label="Redo Ink change"
         onClick={props.onRedo}
       />
       <ToolbarButton
+        disabled={state.committing}
         expanded={state.optionsVisible}
         icon="ellipsis"
         label="Show or hide Ink options"
@@ -191,6 +204,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       />
       <ToolbarButton
         data={{ inkstoneInkRetry: 'true' }}
+        disabled={state.committing}
         hidden={state.saveError === null}
         icon="refresh-cw"
         label="Retry local Ink save"
@@ -199,6 +213,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
       />
       <ToolbarButton
         data={{ inkstoneInkExportUnsaved: 'true' }}
+        disabled={state.committing}
         hidden={state.saveError === null}
         icon="download"
         label="Export retained unsaved Ink as SVG"
@@ -209,7 +224,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         aria-live="polite"
         data-inkstone-ink-error={state.saveError ?? undefined}
         data-inkstone-ink-status="true"
-        hidden={state.saveError === null}
+        hidden={!state.committing && state.saveError === null}
         role="status"
       >
         {state.statusText}

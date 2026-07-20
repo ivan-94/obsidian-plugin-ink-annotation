@@ -398,6 +398,25 @@ describe('continuous Ink document session', () => {
     expect(session.snapshot().persistence).toMatchObject({ kind: 'error' });
   });
 
+  it('publishes one document-level saving transition and one terminal outcome for a multi-surface Done', async () => {
+    const writer = new RecordingWriter();
+    const persistence: string[] = [];
+    const session = new InkDocumentSession({
+      onChange: (read) => persistence.push(read.persistence.kind),
+      surfaces: [surface('a', 600), surface('b', 400)],
+      writer,
+    });
+    session.addStroke(stroke('crossing', 550, 650));
+    persistence.length = 0;
+
+    await session.exit();
+
+    expect(persistence.filter((kind) => kind === 'saving')).toHaveLength(1);
+    expect(persistence.filter((kind) => kind === 'saved-locally')).toHaveLength(1);
+    expect(persistence.at(-1)).toBe('saved-locally');
+    expect(writer.atomicBatches).toHaveLength(1);
+  });
+
   it('retries one failed atomic exit without discarding the live cross-chunk move', async () => {
     const writer = new FailOnceAtomicWriter();
     const session = new InkDocumentSession({
@@ -533,6 +552,31 @@ describe('continuous Ink document session', () => {
     expect(session.canRedo()).toBe(true);
     expect(session.eraseStrokesInPolygon(emptyLoop)).toEqual([]);
     expect(session.canRedo()).toBe(true);
+  });
+
+  it('keeps the ordered stroke projection stable across exact history commands', () => {
+    const history = Array.from({ length: 1_000 }, (_, index) =>
+      stroke(`history-${index}`, 20 + (index % 200), 40 + (index % 200)),
+    );
+    const session = createSession([{ ...surface('a', 600), strokes: history }]).session;
+    const projection = session.read().strokes;
+
+    session.apply({
+      id: 'restyle-first',
+      ids: ['history-0'],
+      kind: 'restyle',
+      style: { color: '#7c3aed' },
+    });
+    expect(session.read().strokes).toBe(projection);
+    expect(session.undo()).toBe(true);
+    expect(session.read().strokes).toBe(projection);
+    expect(session.redo()).toBe(true);
+    expect(session.read().strokes).toBe(projection);
+
+    session.apply({ id: 'erase-first', ids: ['history-0'], kind: 'erase' });
+    expect(session.read().strokes).toBe(projection);
+    expect(session.undo()).toBe(true);
+    expect(session.read().strokes).toBe(projection);
   });
 
   it('atomically removes every linked fragment enclosed across chunks', async () => {

@@ -14,6 +14,7 @@ export interface InkToolbarState {
   readonly canRedo: boolean;
   readonly canUndo: boolean;
   readonly color: string;
+  readonly committing: boolean;
   readonly dragging: boolean;
   readonly interaction: 'draw' | 'select';
   readonly multiple: boolean;
@@ -39,6 +40,7 @@ export function createInkToolbarStore(preference: InkToolPreference): InkToolbar
       canRedo: false,
       canUndo: false,
       color: preference.color,
+      committing: false,
       dragging: false,
       interaction: preference.interaction ?? 'draw',
       multiple: preference.multiple ?? false,

@@ -1,7 +1,10 @@
 export type InkInputAdapter = 'pointer' | 'stylus-touch';
 export type InkInputPhase = 'cancel' | 'down' | 'move' | 'up';
 export type InkFrameIntervalPhase = 'active-writing' | 'host-gap' | 'idle';
-export type InkPerformanceWorkPhase = 'active-frame' | 'cold' | 'completion' | 'input' | 'viewport';
+export type InkCommandKind =
+  'delete-selection' | 'erase' | 'move' | 'redo' | 'restyle' | 'selection' | 'undo';
+export type InkPerformanceWorkPhase =
+  'active-frame' | 'cold' | 'command' | 'completion' | 'input' | 'preview' | 'save' | 'viewport';
 export type InkPresentationOutcome = 'cancelled' | 'submitted' | 'superseded' | 'unpresented';
 export type InkCausalRepair = 'front-loaded-parent';
 export type InkPerformanceAuditGuard =
@@ -17,9 +20,20 @@ export type InkForbiddenWorkKind =
   | 'recovery-storage-write';
 export type InkPerformanceSpanName =
   | 'ink-canonical-persistence-submit'
+  | 'ink-command-apply'
+  | 'ink-command-to-submit'
+  | 'ink-done-first-feedback'
+  | 'ink-done-total'
   | 'ink-frame-work'
   | 'ink-input-handler'
   | 'ink-input-to-submit'
+  | 'ink-preview-cache-lookup'
+  | 'ink-preview-cache-publish'
+  | 'ink-preview-canonical-observation'
+  | 'ink-preview-editable-hydration'
+  | 'ink-preview-first-ink'
+  | 'ink-preview-to-edit'
+  | 'ink-preview-viewport-complete'
   | 'ink-recovery-journal'
   | 'ink-stroke-commit'
   | 'ink-viewport-redraw';
@@ -54,6 +68,7 @@ export interface InkPerformanceRecorder {
     name: InkPerformanceSpanName,
     input: {
       readonly adapter?: InkInputAdapter;
+      readonly commandKind?: InkCommandKind;
       readonly contact?: InkPerformanceContact | null;
       readonly inputPhase?: InkInputPhase;
       readonly workPhase: InkPerformanceWorkPhase;
@@ -71,6 +86,12 @@ export interface InkPerformanceRecorder {
     readonly backingStoreBytes: number;
     readonly disposableCacheBytes: number;
   }): void;
+  recordSchedulerUnitOverrun(input: {
+    readonly durationMs: number;
+    readonly lane: 'cold' | 'visible';
+    readonly unitKind?: string;
+  }): void;
+  recordSchedulerUnit(): void;
 }
 
 export interface InkPerformanceSpanSample {
@@ -78,6 +99,7 @@ export interface InkPerformanceSpanSample {
   readonly adapter?: InkInputAdapter;
   readonly batchSequence?: number;
   readonly causalRepair?: InkCausalRepair;
+  readonly commandKind?: InkCommandKind;
   readonly contactSequence?: number;
   readonly documentCommandProduced?: boolean;
   readonly durationMs: number;
@@ -96,6 +118,7 @@ export interface InkPerformanceSpanSample {
 
 export interface InkPerformanceDistribution {
   readonly adapter?: InkInputAdapter;
+  readonly commandKind?: InkCommandKind;
   readonly inputPhase?: InkInputPhase;
   readonly maximumMs: number;
   readonly name: InkPerformanceSpanName;
@@ -136,6 +159,8 @@ export const NOOP_INK_PERFORMANCE_RECORDER: InkPerformanceRecorder = Object.free
   recordAuditedWork: () => undefined,
   recordForbiddenWork: () => undefined,
   recordMemory: () => undefined,
+  recordSchedulerUnit: () => undefined,
+  recordSchedulerUnitOverrun: () => undefined,
 });
 
 /** Keeps opt-in Ink timing local, bounded, and free of authored geometry. */
@@ -165,6 +190,12 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
   };
   private readonly openContacts = new Set<number>();
   private readonly recentSpans: InkPerformanceSpanSample[] = [];
+  private readonly schedulerUnitOverruns: Array<{
+    readonly durationMs: number;
+    readonly lane: 'cold' | 'visible';
+    readonly unitKind?: string;
+  }> = [];
+  private schedulerUnitCount = 0;
   private droppedSpanCount = 0;
 
   constructor(
@@ -221,6 +252,27 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
     }
   }
 
+  recordSchedulerUnitOverrun(input: {
+    readonly durationMs: number;
+    readonly lane: 'cold' | 'visible';
+    readonly unitKind?: string;
+  }): void {
+    if (!Number.isFinite(input.durationMs) || input.durationMs <= 0) {
+      throw new Error('Ink scheduler unit overrun must have a finite positive duration.');
+    }
+    if (!this.enabled) return;
+    this.schedulerUnitOverruns.push({
+      durationMs: round(input.durationMs),
+      lane: input.lane,
+      ...(input.unitKind === undefined ? {} : { unitKind: input.unitKind }),
+    });
+    if (this.schedulerUnitOverruns.length > 1_024) this.schedulerUnitOverruns.shift();
+  }
+
+  recordSchedulerUnit(): void {
+    if (this.enabled) this.schedulerUnitCount += 1;
+  }
+
   recordForbiddenWork(kind: InkForbiddenWorkKind, phase: InkPerformanceWorkPhase): void {
     if (!this.enabled) return;
     const key = `${phase}\u0000${kind}`;
@@ -272,13 +324,23 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
     name: InkPerformanceSpanName,
     input: {
       readonly adapter?: InkInputAdapter;
+      readonly commandKind?: InkCommandKind;
       readonly contact?: InkPerformanceContact | null;
       readonly inputPhase?: InkInputPhase;
       readonly workPhase: InkPerformanceWorkPhase;
     },
   ): InkPerformanceSpan {
     if (!this.enabled) return NOOP_INK_PERFORMANCE_SPAN;
-    assertPrivacySafeFields(input, ['adapter', 'contact', 'inputPhase', 'workPhase']);
+    assertPrivacySafeFields(input, [
+      'adapter',
+      'commandKind',
+      'contact',
+      'inputPhase',
+      'workPhase',
+    ]);
+    if (input.commandKind !== undefined && !isInkCommandKind(input.commandKind)) {
+      throw new Error('Ink command kind is invalid.');
+    }
     if (input.contact !== undefined && input.contact !== null) {
       assertPrivacySafeFields(input.contact, ['adapter', 'sequence']);
     }
@@ -360,6 +422,7 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
           ...(adapter === undefined ? {} : { adapter }),
           ...(result.batchSequence === undefined ? {} : { batchSequence: result.batchSequence }),
           ...(result.causalRepair === undefined ? {} : { causalRepair: result.causalRepair }),
+          ...(input.commandKind === undefined ? {} : { commandKind: input.commandKind }),
           ...(contact === null ? {} : { contactSequence: contact.sequence }),
           ...(result.documentCommandProduced === undefined
             ? {}
@@ -427,6 +490,12 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
     };
     readonly openContactCount: number;
     readonly recentSpans: readonly InkPerformanceSpanSample[];
+    readonly schedulerUnitOverruns: readonly {
+      readonly durationMs: number;
+      readonly lane: 'cold' | 'visible';
+      readonly unitKind?: string;
+    }[];
+    readonly schedulerUnitCount: number;
   } {
     return {
       armedAuditGuards: [...this.armedAuditGuards],
@@ -443,6 +512,8 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
       memory: { ...this.memory },
       openContactCount: this.openContacts.size,
       recentSpans: this.recentSpans.map((sample) => ({ ...sample })),
+      schedulerUnitOverruns: this.schedulerUnitOverruns.map((overrun) => ({ ...overrun })),
+      schedulerUnitCount: this.schedulerUnitCount,
     };
   }
 
@@ -461,6 +532,8 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
     };
     this.openContacts.clear();
     this.recentSpans.splice(0);
+    this.schedulerUnitOverruns.splice(0);
+    this.schedulerUnitCount = 0;
   }
 }
 
@@ -473,9 +546,13 @@ function distributions(
   >();
   for (const sample of samples) {
     if (!sample.accepted) continue;
-    const key = [sample.name, sample.workPhase, sample.adapter ?? '', sample.inputPhase ?? ''].join(
-      '\u0000',
-    );
+    const key = [
+      sample.name,
+      sample.workPhase,
+      sample.adapter ?? '',
+      sample.inputPhase ?? '',
+      sample.commandKind ?? '',
+    ].join('\u0000');
     const group = grouped.get(key);
     if (group === undefined) {
       grouped.set(key, { sample, values: [sample.durationMs] });
@@ -487,6 +564,7 @@ function distributions(
     const sorted = [...values].sort((left, right) => left - right);
     return {
       ...(sample.adapter === undefined ? {} : { adapter: sample.adapter }),
+      ...(sample.commandKind === undefined ? {} : { commandKind: sample.commandKind }),
       ...(sample.inputPhase === undefined ? {} : { inputPhase: sample.inputPhase }),
       maximumMs: round(sorted.at(-1) ?? 0),
       name: sample.name,
@@ -497,6 +575,18 @@ function distributions(
       workPhase: sample.workPhase,
     };
   });
+}
+
+function isInkCommandKind(value: string): value is InkCommandKind {
+  return (
+    value === 'delete-selection' ||
+    value === 'erase' ||
+    value === 'move' ||
+    value === 'redo' ||
+    value === 'restyle' ||
+    value === 'selection' ||
+    value === 'undo'
+  );
 }
 
 function assertPrivacySafeFields(input: object, allowed: readonly string[]): void {
