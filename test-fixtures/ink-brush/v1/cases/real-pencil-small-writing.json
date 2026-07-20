@@ -1,0 +1,16 @@
+{
+  "captureStatus": "deferred-to-s34",
+  "fixtureSchemaVersion": 1,
+  "id": "real-pencil-small-writing",
+  "kind": "physical-placeholder",
+  "privacy": {
+    "forbiddenFields": [
+      "account-identifiers",
+      "device-serial-numbers",
+      "note-content",
+      "user-identifying-text",
+      "user-vault-paths"
+    ],
+    "reviewStatus": "pending"
+  }
+}

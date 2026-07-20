@@ -1,12 +1,16 @@
 import {
   decodeInkSurfaceRecord,
   encodeInkSurfaceRecord,
+  safeDecodeInkSurfaceRecord,
+  type InkSurfaceDecodeResult,
   type InkSurfaceRecord,
 } from '../domain/ink-surface';
+import { digestInkBrushGolden } from '../domain/ink-brush-contract';
 import {
   planConcurrentInkAppendMerge,
   type InkConcurrentAppendConflictReason,
 } from '../domain/ink-concurrent-append-merge';
+import { upgradeInkSurfaceRecordsToV3 } from '../domain/ink-surface-migration';
 import { hashText } from '../domain/text-anchor';
 import {
   decodeInkSurfaceSummaryIndex,
@@ -29,16 +33,40 @@ export interface InkSurfaceCandidate {
 
 export interface InkSurfaceConflict {
   readonly candidates: readonly InkSurfaceCandidate[];
-  readonly kind: 'duplicate-artifact' | 'same-revision-divergence';
+  readonly kind: 'duplicate-artifact' | 'same-revision-divergence' | 'schema-version-mismatch';
   readonly selectedPath: string;
   readonly surfaceId: string;
 }
 
 export interface InkSurfaceRepositoryIssue {
-  readonly kind: 'conflict' | 'corrupt-record' | 'duplicate-artifact';
+  readonly kind: 'conflict' | 'corrupt-record' | 'duplicate-artifact' | 'unsupported-record';
   readonly message: string;
   readonly path: string;
+  readonly reason?: InkSurfaceUnsupportedReason;
 }
+
+interface LoadedInkSurfaces {
+  readonly conflicts: readonly InkSurfaceConflict[];
+  readonly issues: readonly InkSurfaceRepositoryIssue[];
+  readonly records: readonly InkSurfaceRecord[];
+}
+
+type InkColdLaneCheckpoint = () => Promise<void>;
+
+export type InkSurfaceCanonicalProjectionBlock =
+  | {
+      readonly conflict: InkSurfaceConflict;
+      readonly kind: 'conflict';
+    }
+  | {
+      readonly issue: InkSurfaceRepositoryIssue;
+      readonly kind: 'corrupt-record' | 'unsupported-record';
+    };
+
+type InkSurfaceUnsupportedReason = Extract<
+  InkSurfaceDecodeResult,
+  { readonly kind: 'unsupported' }
+>['reason'];
 
 interface InkSurfaceBatchJournal {
   readonly entries: readonly {
@@ -48,6 +76,15 @@ interface InkSurfaceBatchJournal {
   }[];
   readonly filePath: string;
   readonly phase: 'committed' | 'prepared';
+  readonly schemaActivation?: {
+    readonly planDigest: string;
+    readonly planReference: string;
+    readonly sourceBaseDigest: string;
+  };
+  readonly schemaUpgrade?: {
+    readonly kind: 'cold-v3-normalization';
+    readonly sourceBaseDigest: string;
+  };
   readonly schemaVersion: 1;
 }
 
@@ -68,6 +105,67 @@ export class InkSurfaceStaleBaseError extends Error {
     );
     this.name = 'InkSurfaceStaleBaseError';
   }
+}
+
+export class InkSurfaceUnsupportedError extends Error {
+  constructor(
+    readonly path: string,
+    readonly reason: InkSurfaceUnsupportedReason,
+  ) {
+    super(
+      `Ink at ${path} uses unsupported canonical data (${reason}); update Inkstone before editing this note.`,
+    );
+    this.name = 'InkSurfaceUnsupportedError';
+  }
+}
+
+export class InkSurfaceCorruptError extends Error {
+  constructor(readonly issue: InkSurfaceRepositoryIssue) {
+    super(`Ink at ${issue.path} is corrupt; repair it before editing this note.`);
+    this.name = 'InkSurfaceCorruptError';
+  }
+}
+
+export function findInkSurfaceCanonicalProjectionBlock(input: {
+  readonly conflicts: readonly InkSurfaceConflict[];
+  readonly issues?: readonly InkSurfaceRepositoryIssue[];
+}): InkSurfaceCanonicalProjectionBlock | null {
+  const conflict = input.conflicts.find(
+    ({ kind }) => kind === 'same-revision-divergence' || kind === 'schema-version-mismatch',
+  );
+  if (conflict !== undefined) return { conflict, kind: 'conflict' };
+  const issue = input.issues?.find(
+    ({ kind }) => kind === 'unsupported-record' || kind === 'corrupt-record',
+  );
+  if (issue?.kind === 'unsupported-record' || issue?.kind === 'corrupt-record') {
+    return { issue, kind: issue.kind };
+  }
+  return null;
+}
+
+/** Finds the minimal summary set whose joined Logical Stroke inputs changed. */
+export function affectedInkSummarySurfaceIds(input: {
+  readonly current: readonly InkSurfaceRecord[];
+  readonly previous: readonly InkSurfaceRecord[];
+  readonly replacements: readonly InkSurfaceRecord[];
+}): readonly string[] {
+  const replacementIds = new Set(input.replacements.map(({ id }) => id));
+  const linkedStrokeIds = new Set<string>();
+  for (const record of [...input.previous, ...input.replacements]) {
+    if (!replacementIds.has(record.id)) continue;
+    for (const stroke of record.strokes) {
+      if (stroke.linkedStrokeId !== undefined) linkedStrokeIds.add(stroke.linkedStrokeId);
+    }
+  }
+  const affected = new Set(replacementIds);
+  if (linkedStrokeIds.size > 0) {
+    for (const record of input.current) {
+      if (record.strokes.some((stroke) => linkedStrokeIds.has(stroke.linkedStrokeId ?? ''))) {
+        affected.add(record.id);
+      }
+    }
+  }
+  return [...affected].sort();
 }
 
 /** Canonical per-surface persistence with the same conservative iCloud rules as text records. */
@@ -106,10 +204,12 @@ export class InkSurfaceRepository {
     await this.withNoteBatchLock(record.filePath, () =>
       this.enqueueWrite(key, async () => {
         await this.assertNoteIdentity(record);
+        await this.assertCanonicalProjectionWritable(record.filePath);
         const candidates = await this.readCandidates(record.filePath, record.id);
         if (candidates.length > 0) {
           throw new Error(`Cannot create existing ink surface ${record.id}.`);
         }
+        await this.assertActiveSchemaCompatible(record);
         const path = await this.surfacePath(record.filePath, record.id);
         await this.store.mkdir(path.slice(0, path.lastIndexOf('/')));
         try {
@@ -134,20 +234,29 @@ export class InkSurfaceRepository {
   async updateSurface(
     record: InkSurfaceRecord,
     expectedBase?: InkSurfaceRecord,
+    checkpoint?: InkColdLaneCheckpoint,
   ): Promise<InkSurfaceRecord | void> {
     const key = surfaceWriteKey(record.filePath, record.id);
     return this.withNoteBatchLock(record.filePath, () =>
       this.enqueueWrite(key, async () => {
+        await checkpoint?.();
         await this.assertNoteIdentity(record);
-        const candidates = await this.readCandidates(record.filePath, record.id);
-        if (candidates.length === 0) {
+        await checkpoint?.();
+        const loaded = await this.assertCanonicalProjectionWritable(record.filePath);
+        await checkpoint?.();
+        const existing = loaded.records.find(({ id }) => id === record.id);
+        if (existing === undefined) {
           throw new Error(`Cannot update missing ink surface ${record.id}.`);
         }
-        const existing = selectLatestCandidate(candidates, record.id).record;
         if (sameSurfaceRecord(existing, record)) {
-          await this.refreshSummaryIndex(record);
+          await this.refreshSummaryIndex(record, loaded, checkpoint);
           this.onSurfaceChanged(record);
           return;
+        }
+        if (crossesSchemaV3Boundary(existing, record)) {
+          throw new Error(
+            'Ink schema v3 can only be committed through the cold whole-document upgrade.',
+          );
         }
         let nextRecord = record;
         let rebased = false;
@@ -161,7 +270,7 @@ export class InkSurfaceRepository {
             throw new InkSurfaceStaleBaseError(record.id, plan.reason);
           }
           if (plan.kind === 'already-merged') {
-            await this.refreshSummaryIndex(plan.record);
+            await this.refreshSummaryIndex(plan.record, loaded, checkpoint);
             this.onSurfaceChanged(plan.record);
             return plan.record;
           }
@@ -176,9 +285,13 @@ export class InkSurfaceRepository {
         }
 
         const path = await this.surfacePath(record.filePath, record.id);
+        await checkpoint?.();
         const previousContents = await this.store.read(path);
+        await checkpoint?.();
+        const nextContents = encodeInkSurfaceRecord(nextRecord);
         try {
-          await this.store.write(path, encodeInkSurfaceRecord(nextRecord));
+          await this.store.write(path, nextContents);
+          await checkpoint?.();
         } catch (error) {
           try {
             if (previousContents === null) {
@@ -200,7 +313,7 @@ export class InkSurfaceRepository {
           }
           throw error;
         }
-        await this.refreshSummaryIndex(nextRecord);
+        await this.refreshSummaryIndex(nextRecord, loaded, checkpoint);
         this.onSurfaceChanged(nextRecord);
         return rebased ? nextRecord : undefined;
       }),
@@ -211,6 +324,24 @@ export class InkSurfaceRepository {
   async updateSurfacesAtomically(
     records: readonly InkSurfaceRecord[],
     expectedBases?: readonly InkSurfaceRecord[],
+    checkpoint?: InkColdLaneCheckpoint,
+  ): Promise<readonly InkSurfaceRecord[] | void> {
+    return this.commitSurfacesAtomically(records, expectedBases, false, checkpoint);
+  }
+
+  /** One cold, exact whole-document migration; never called from pointer move/up. */
+  async upgradeSurfacesToSchemaV3(
+    records: readonly InkSurfaceRecord[],
+    expectedBases: readonly InkSurfaceRecord[],
+  ): Promise<readonly InkSurfaceRecord[] | void> {
+    return this.commitSurfacesAtomically(records, expectedBases, true);
+  }
+
+  private async commitSurfacesAtomically(
+    records: readonly InkSurfaceRecord[],
+    expectedBases?: readonly InkSurfaceRecord[],
+    coldSchemaUpgrade = false,
+    checkpoint?: InkColdLaneCheckpoint,
   ): Promise<readonly InkSurfaceRecord[] | void> {
     if (records.length === 0) return;
     if (new Set(records.map((record) => record.id)).size !== records.length) {
@@ -222,7 +353,20 @@ export class InkSurfaceRepository {
       throw new Error('Atomic Ink update must stay within one note.');
     }
     return this.withNoteBatchLock(filePath, async () => {
+      await checkpoint?.();
+      await this.assertCanonicalProjectionWritable(filePath);
+      await checkpoint?.();
+      if (coldSchemaUpgrade) {
+        const loaded = await this.listSurfacesNow(filePath);
+        await checkpoint?.();
+        assertColdSchemaUpgrade({
+          currentActive: loaded.records.filter(isActiveSurface),
+          expectedBases: expectedBases ?? [],
+          records,
+        });
+      }
       const prepared: Array<{
+        readonly nextContents: string;
         readonly path: string;
         readonly previousContents: string;
         readonly record: InkSurfaceRecord;
@@ -231,7 +375,9 @@ export class InkSurfaceRepository {
       let rebased = false;
       for (const record of records) {
         await this.assertNoteIdentity(record);
+        await checkpoint?.();
         const candidates = await this.readCandidates(record.filePath, record.id);
+        await checkpoint?.();
         if (candidates.length === 0) {
           throw new Error(`Cannot update missing ink surface ${record.id}.`);
         }
@@ -239,6 +385,11 @@ export class InkSurfaceRepository {
         if (sameSurfaceRecord(existing, record)) {
           committedRecords.push(existing);
           continue;
+        }
+        if (!coldSchemaUpgrade && crossesSchemaV3Boundary(existing, record)) {
+          throw new Error(
+            'Ink schema v3 can only be committed through the cold whole-document upgrade.',
+          );
         }
         const expectedBase = expectedById?.get(record.id);
         let nextRecord = record;
@@ -268,16 +419,23 @@ export class InkSurfaceRepository {
           );
         }
         const path = await this.surfacePath(record.filePath, record.id);
+        await checkpoint?.();
         const previousContents = await this.store.read(path);
+        await checkpoint?.();
         if (previousContents === null) {
           throw new Error(`Canonical Ink surface ${record.id} disappeared during batch update.`);
         }
-        prepared.push({ path, previousContents, record: nextRecord });
+        prepared.push({
+          nextContents: encodeInkSurfaceRecord(nextRecord),
+          path,
+          previousContents,
+          record: nextRecord,
+        });
         committedRecords.push(nextRecord);
       }
 
       if (prepared.length === 0) {
-        for (const record of committedRecords) await this.refreshSummaryIndex(record);
+        await this.refreshSummaryIndexes(committedRecords, undefined, checkpoint);
         for (const record of committedRecords) this.onSurfaceChanged(record);
         return rebased ? committedRecords : undefined;
       }
@@ -286,22 +444,42 @@ export class InkSurfaceRepository {
       }
 
       const journalPath = await this.batchJournalPath(filePath);
+      await checkpoint?.();
       const journal: InkSurfaceBatchJournal = {
         entries: prepared.map((item) => ({
-          nextContents: encodeInkSurfaceRecord(item.record),
+          nextContents: item.nextContents,
           path: item.path,
           previousContents: item.previousContents,
         })),
         filePath,
         phase: 'prepared',
+        ...(coldSchemaUpgrade
+          ? {
+              schemaUpgrade: {
+                kind: 'cold-v3-normalization' as const,
+                sourceBaseDigest: digestInkBrushGolden({
+                  sourceSurfaceBytes: (expectedBases ?? []).map(encodeInkSurfaceRecord),
+                }),
+              },
+            }
+          : {}),
         schemaVersion: 1,
       };
       await this.store.write(journalPath, JSON.stringify(journal));
+      await checkpoint?.();
       try {
-        for (const item of prepared) {
-          await this.store.write(item.path, encodeInkSurfaceRecord(item.record));
+        const writes = await Promise.allSettled(
+          prepared.map((item) => this.store.write(item.path, item.nextContents)),
+        );
+        const writeFailure = writes.find(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        if (writeFailure !== undefined) {
+          throw writeFailure.reason;
         }
+        await checkpoint?.();
         await this.store.write(journalPath, JSON.stringify({ ...journal, phase: 'committed' }));
+        await checkpoint?.();
       } catch (error) {
         const restoreResults = await Promise.allSettled(
           prepared.map((item) => this.store.write(item.path, item.previousContents)),
@@ -321,7 +499,12 @@ export class InkSurfaceRepository {
       }
 
       await this.clearBatchJournal(journalPath).catch(() => undefined);
-      for (const { record } of prepared) await this.refreshSummaryIndex(record);
+      await checkpoint?.();
+      await this.refreshSummaryIndexes(
+        prepared.map(({ record }) => record),
+        undefined,
+        checkpoint,
+      );
       for (const { record } of prepared) this.onSurfaceChanged(record);
       return rebased ? committedRecords : undefined;
     });
@@ -488,7 +671,7 @@ export class InkSurfaceRepository {
     const reclaimed: InkSurfaceRecord[] = [];
     for (const record of loaded.records) {
       if (
-        record.schemaVersion === 2 ||
+        record.schemaVersion >= 2 ||
         record.deletedAt !== undefined ||
         record.strokes.some((stroke) => stroke.tool !== 'eraser')
       ) {
@@ -536,6 +719,7 @@ export class InkSurfaceRepository {
     const normalizedPath = normalizeVaultPath(filePath);
     return this.withNoteBatchLock(normalizedPath, async () => {
       const root = await this.surfaceRoot(normalizedPath);
+      const readable: Array<{ readonly path: string; readonly record: InkSurfaceRecord }> = [];
       const updated: InkSurfaceRecord[] = [];
       for (const filename of (await this.store.list(root)).filter((name) =>
         name.endsWith('.json'),
@@ -543,13 +727,17 @@ export class InkSurfaceRepository {
         const path = `${root}/${filename}`;
         const contents = await this.store.read(path);
         if (contents === null) continue;
-        let record: InkSurfaceRecord;
-        try {
-          record = decodeInkSurfaceRecord(contents);
-        } catch {
+        const decoded = safeDecodeInkSurfaceRecord(contents);
+        if (decoded.kind === 'unsupported') {
+          throw new InkSurfaceUnsupportedError(path, decoded.reason);
+        }
+        if (decoded.kind === 'corrupt') {
           // Preserve damaged/conflict artifacts byte-for-byte for explicit repair.
           continue;
         }
+        readable.push({ path, record: decoded.record });
+      }
+      for (const { path, record } of readable) {
         if (normalizeVaultPath(record.filePath) === normalizedPath) continue;
         const reconciled: InkSurfaceRecord = {
           ...record,
@@ -567,35 +755,55 @@ export class InkSurfaceRepository {
     });
   }
 
-  private async listSurfacesNow(filePath: string): Promise<{
-    readonly conflicts: readonly InkSurfaceConflict[];
-    readonly issues: readonly InkSurfaceRepositoryIssue[];
-    readonly records: readonly InkSurfaceRecord[];
-  }> {
+  private async listSurfacesNow(filePath: string): Promise<LoadedInkSurfaces> {
     const root = await this.surfaceRoot(filePath);
     const filenames = await this.store.list(root);
     const candidates: InkSurfaceCandidate[] = [];
     const issues: InkSurfaceRepositoryIssue[] = [];
 
-    for (const filename of filenames.filter((name) => name.endsWith('.json')).sort()) {
-      const path = `${root}/${filename}`;
-      const contents = await this.store.read(path);
+    const files = await Promise.all(
+      filenames
+        .filter((name) => name.endsWith('.json'))
+        .sort()
+        .map(async (filename) => {
+          const path = `${root}/${filename}`;
+          return { contents: await this.store.read(path), path };
+        }),
+    );
+    for (const { contents, path } of files) {
       if (contents === null) {
         continue;
       }
-      try {
-        const record = decodeInkSurfaceRecord(contents);
-        if (normalizeVaultPath(record.filePath) !== normalizeVaultPath(filePath)) {
-          throw new Error('Ink surface file path does not match its note directory.');
-        }
-        candidates.push({ path, record });
-      } catch (error) {
+      const decoded = safeDecodeInkSurfaceRecord(contents);
+      if (decoded.kind === 'unsupported') {
+        issues.push({
+          kind: 'unsupported-record',
+          message: unsupportedInkMessage(path, decoded.reason),
+          path,
+          reason: decoded.reason,
+        });
+        continue;
+      }
+      if (decoded.kind === 'corrupt') {
         issues.push({
           kind: 'corrupt-record',
-          message: error instanceof Error ? error.message : String(error),
+          message:
+            decoded.reason === 'invalid-json'
+              ? 'Ink surface record is not valid JSON.'
+              : 'Ink surface record does not match a supported schema version.',
           path,
         });
+        continue;
       }
+      if (normalizeVaultPath(decoded.record.filePath) !== normalizeVaultPath(filePath)) {
+        issues.push({
+          kind: 'corrupt-record',
+          message: 'Ink surface file path does not match its note directory.',
+          path,
+        });
+        continue;
+      }
+      candidates.push({ path, record: decoded.record });
     }
 
     const grouped = new Map<string, InkSurfaceCandidate[]>();
@@ -615,6 +823,20 @@ export class InkSurfaceRepository {
       }
       const latest = ordered.filter((candidate) => candidate.record.revision === highestRevision);
       const selected = selectPreferredCandidate(latest, surfaceId);
+      if (hasSchemaV3Mismatch(ordered)) {
+        conflicts.push({
+          candidates: ordered,
+          kind: 'schema-version-mismatch',
+          selectedPath: selected.path,
+          surfaceId,
+        });
+        issues.push({
+          kind: 'conflict',
+          message: `Ink surface ${surfaceId} has a schema-version-mismatch across visible artifacts; no candidate is editable.`,
+          path: selected.path,
+        });
+        continue;
+      }
       records.push(selected.record);
       if (ordered.length > 1) {
         const divergent = hasDivergentRecords(latest);
@@ -664,6 +886,41 @@ export class InkSurfaceRepository {
     }
   }
 
+  private async assertCanonicalProjectionWritable(filePath: string): Promise<LoadedInkSurfaces> {
+    const loaded = await this.listSurfacesNow(filePath);
+    const block = findInkSurfaceCanonicalProjectionBlock(loaded);
+    if (block?.kind === 'conflict') {
+      throw new InkSurfaceConflictError(block.conflict);
+    }
+    if (block?.kind === 'unsupported-record') {
+      if (block.issue.reason === undefined) {
+        throw new Error(
+          `Ink at ${block.issue.path} is unsupported; update Inkstone before editing this note.`,
+        );
+      }
+      throw new InkSurfaceUnsupportedError(block.issue.path, block.issue.reason);
+    }
+    if (block?.kind === 'corrupt-record') {
+      throw new InkSurfaceCorruptError(block.issue);
+    }
+    return loaded;
+  }
+
+  private async assertActiveSchemaCompatible(record: InkSurfaceRecord): Promise<void> {
+    if (!isActiveSurface(record)) return;
+    const loaded = await this.listSurfacesNow(record.filePath);
+    if (
+      loaded.records.some(
+        (existing) =>
+          existing.id !== record.id &&
+          isActiveSurface(existing) &&
+          crossesSchemaV3Boundary(existing, record),
+      )
+    ) {
+      throw new Error('Ink note cannot contain mixed legacy and schema v3 active surfaces.');
+    }
+  }
+
   private async readCandidates(
     filePath: string,
     surfaceId: string,
@@ -671,22 +928,32 @@ export class InkSurfaceRepository {
     normalizeSurfaceId(surfaceId);
     const root = await this.surfaceRoot(filePath);
     const candidates: InkSurfaceCandidate[] = [];
-    for (const filename of (await this.store.list(root)).filter((name) => name.endsWith('.json'))) {
-      const path = `${root}/${filename}`;
-      const contents = await this.store.read(path);
+    const files = await Promise.all(
+      (await this.store.list(root))
+        .filter((filename) => mayContainSurfaceCandidate(filename, surfaceId))
+        .map(async (filename) => {
+          const path = `${root}/${filename}`;
+          return { contents: await this.store.read(path), path };
+        }),
+    );
+    for (const { contents, path } of files) {
       if (contents === null) {
         continue;
       }
-      try {
-        const record = decodeInkSurfaceRecord(contents);
-        if (
-          record.id === surfaceId &&
-          normalizeVaultPath(record.filePath) === normalizeVaultPath(filePath)
-        ) {
-          candidates.push({ path, record });
-        }
-      } catch {
+      const decoded = safeDecodeInkSurfaceRecord(contents);
+      if (decoded.kind === 'unsupported') {
+        throw new InkSurfaceUnsupportedError(path, decoded.reason);
+      }
+      if (decoded.kind === 'corrupt') {
         // listSurfaces reports damaged siblings; they cannot be a safe update base.
+        continue;
+      }
+      const record = decoded.record;
+      if (
+        record.id === surfaceId &&
+        normalizeVaultPath(record.filePath) === normalizeVaultPath(filePath)
+      ) {
+        candidates.push({ path, record });
       }
     }
     return candidates.sort(compareCandidates);
@@ -797,11 +1064,66 @@ export class InkSurfaceRepository {
     await this.store.write(path, '');
   }
 
-  private async refreshSummaryIndex(record: InkSurfaceRecord): Promise<void> {
-    const key = summaryWriteKey(record.filePath);
+  private async refreshSummaryIndex(
+    record: InkSurfaceRecord,
+    loaded?: LoadedInkSurfaces,
+    checkpoint?: InkColdLaneCheckpoint,
+  ): Promise<void> {
+    return this.refreshSummaryIndexes([record], loaded, checkpoint);
+  }
+
+  private async refreshSummaryIndexes(
+    records: readonly InkSurfaceRecord[],
+    loadedSnapshot?: LoadedInkSurfaces,
+    checkpoint?: InkColdLaneCheckpoint,
+  ): Promise<void> {
+    const first = records[0];
+    if (first === undefined) return;
+    const normalizedFilePath = normalizeVaultPath(first.filePath);
+    if (records.some(({ filePath }) => normalizeVaultPath(filePath) !== normalizedFilePath)) {
+      throw new Error('Ink summary refresh batch must stay within one note.');
+    }
+    const key = summaryWriteKey(first.filePath);
     await this.enqueueWrite(key, async () => {
-      const path = await this.summaryIndexPath(record.filePath);
+      await checkpoint?.();
+      const path = await this.summaryIndexPath(first.filePath);
+      await checkpoint?.();
+      const linkedSummaryImpact =
+        records.some((record) => record.strokes.some(hasLinkedLogicalStroke)) ||
+        loadedSnapshot?.records.some(
+          (record) =>
+            records.some(({ id }) => id === record.id) &&
+            record.strokes.some(hasLinkedLogicalStroke),
+        ) === true;
+      if (linkedSummaryImpact) {
+        const previous = loadedSnapshot ?? (await this.listSurfacesNow(first.filePath));
+        await checkpoint?.();
+        const loaded = replaceLoadedInkSurfaces(previous, records);
+        try {
+          const contents = await this.store.read(path);
+          await checkpoint?.();
+          const existing = contents === null ? null : decodeSummaryIndexOrNull(contents);
+          const next =
+            existing === null || !summarySetMatchesRecords(existing.summaries, loaded.records)
+              ? summarizeLoadedSurfaces(loaded)
+              : rebuildAffectedInkSummaries({
+                  affectedIds: affectedInkSummarySurfaceIds({
+                    current: loaded.records,
+                    previous: previous.records,
+                    replacements: records,
+                  }),
+                  existing: existing.summaries,
+                  loaded,
+                });
+          await this.writeSummaryIndex(first.filePath, next, checkpoint);
+        } catch (error) {
+          await this.store.remove?.(path).catch(() => undefined);
+          throw error;
+        }
+        return;
+      }
       const contents = await this.store.read(path);
+      await checkpoint?.();
       let summaries: readonly InkSurfaceSummary[] = [];
       if (contents !== null) {
         try {
@@ -811,11 +1133,11 @@ export class InkSurfaceRepository {
         }
       }
       const next = [
-        ...summaries.filter((summary) => summary.id !== record.id),
-        summarizeInkSurface(record),
+        ...summaries.filter((summary) => !records.some(({ id }) => summary.id === id)),
+        ...records.map((record) => summarizeInkSurface(record)),
       ];
       try {
-        await this.writeSummaryIndex(record.filePath, next);
+        await this.writeSummaryIndex(first.filePath, next, checkpoint);
       } catch (error) {
         await this.store.remove?.(path).catch(() => undefined);
         throw error;
@@ -826,14 +1148,17 @@ export class InkSurfaceRepository {
   private async writeSummaryIndex(
     filePath: string,
     summaries: readonly InkSurfaceSummary[],
+    checkpoint?: InkColdLaneCheckpoint,
   ): Promise<void> {
     const path = await this.summaryIndexPath(filePath);
+    await checkpoint?.();
     const index: InkSurfaceSummaryIndex = {
       filePath: normalizeVaultPath(filePath),
       schemaVersion: 1,
       summaries: sortSummaries(summaries),
     };
     await this.store.write(path, encodeInkSurfaceSummaryIndex(index));
+    await checkpoint?.();
   }
 
   private async enqueueWrite<T>(key: string, write: () => Promise<T>): Promise<T> {
@@ -885,8 +1210,78 @@ function summarizeLoadedSurfaces(loaded: {
       .map(({ surfaceId }) => surfaceId),
   );
   return loaded.records.map((record) =>
-    summarizeInkSurface(record, { conflict: conflicted.has(record.id) }),
+    summarizeInkSurface(record, {
+      conflict: conflicted.has(record.id),
+      relatedRecords: loaded.records,
+    }),
   );
+}
+
+function decodeSummaryIndexOrNull(contents: string): InkSurfaceSummaryIndex | null {
+  try {
+    return decodeInkSurfaceSummaryIndex(contents);
+  } catch {
+    return null;
+  }
+}
+
+function summarySetMatchesRecords(
+  summaries: readonly InkSurfaceSummary[],
+  records: readonly InkSurfaceRecord[],
+): boolean {
+  if (summaries.length !== records.length) return false;
+  const ids = new Set(summaries.map(({ id }) => id));
+  return ids.size === records.length && records.every(({ id }) => ids.has(id));
+}
+
+function rebuildAffectedInkSummaries(input: {
+  readonly affectedIds: readonly string[];
+  readonly existing: readonly InkSurfaceSummary[];
+  readonly loaded: LoadedInkSurfaces;
+}): readonly InkSurfaceSummary[] {
+  const affected = new Set(input.affectedIds);
+  const conflicted = new Set(
+    input.loaded.conflicts
+      .filter(({ kind }) => kind === 'same-revision-divergence')
+      .map(({ surfaceId }) => surfaceId),
+  );
+  const rebuilt = input.loaded.records
+    .filter(({ id }) => affected.has(id))
+    .map((record) => {
+      const linkedIds = new Set(
+        record.strokes
+          .map(({ linkedStrokeId }) => linkedStrokeId)
+          .filter((id): id is string => id !== undefined),
+      );
+      const relatedRecords = input.loaded.records.filter(
+        (candidate) =>
+          candidate.id === record.id ||
+          candidate.strokes.some((stroke) => linkedIds.has(stroke.linkedStrokeId ?? '')),
+      );
+      return summarizeInkSurface(record, {
+        conflict: conflicted.has(record.id),
+        relatedRecords,
+      });
+    });
+  return sortSummaries([...input.existing.filter(({ id }) => !affected.has(id)), ...rebuilt]);
+}
+
+function replaceLoadedInkSurfaces(
+  loaded: LoadedInkSurfaces,
+  replacements: readonly InkSurfaceRecord[],
+): LoadedInkSurfaces {
+  const byId = new Map(replacements.map((record) => [record.id, record]));
+  const seen = new Set<string>();
+  const records = loaded.records.map((record) => {
+    const replacement = byId.get(record.id);
+    if (replacement === undefined) return record;
+    seen.add(record.id);
+    return replacement;
+  });
+  for (const replacement of replacements) {
+    if (!seen.has(replacement.id)) records.push(replacement);
+  }
+  return { ...loaded, records: records.sort((left, right) => left.id.localeCompare(right.id)) };
 }
 
 function compareCandidates(left: InkSurfaceCandidate, right: InkSurfaceCandidate): number {
@@ -917,6 +1312,14 @@ function selectLatestCandidate(
   }
   const latest = ordered.filter((candidate) => candidate.record.revision === highestRevision);
   const selected = selectPreferredCandidate(latest, surfaceId);
+  if (hasSchemaV3Mismatch(ordered)) {
+    throw new InkSurfaceConflictError({
+      candidates: ordered,
+      kind: 'schema-version-mismatch',
+      selectedPath: selected.path,
+      surfaceId,
+    });
+  }
   if (hasDivergentRecords(latest)) {
     throw new InkSurfaceConflictError({
       candidates: ordered,
@@ -932,8 +1335,64 @@ function hasDivergentRecords(candidates: readonly InkSurfaceCandidate[]): boolea
   return new Set(candidates.map((candidate) => encodeInkSurfaceRecord(candidate.record))).size > 1;
 }
 
+function hasSchemaV3Mismatch(candidates: readonly InkSurfaceCandidate[]): boolean {
+  return new Set(candidates.map(({ record }) => record.schemaVersion === 3)).size > 1;
+}
+
 function sameSurfaceRecord(left: InkSurfaceRecord, right: InkSurfaceRecord): boolean {
   return encodeInkSurfaceRecord(left) === encodeInkSurfaceRecord(right);
+}
+
+function crossesSchemaV3Boundary(left: InkSurfaceRecord, right: InkSurfaceRecord): boolean {
+  return (left.schemaVersion === 3) !== (right.schemaVersion === 3);
+}
+
+function isActiveSurface(record: InkSurfaceRecord): boolean {
+  return record.status === 'active' && record.deletedAt === undefined;
+}
+
+function hasLinkedLogicalStroke(stroke: InkSurfaceRecord['strokes'][number]): boolean {
+  return stroke.linkedStrokeId !== undefined;
+}
+
+function mayContainSurfaceCandidate(filename: string, surfaceId: string): boolean {
+  if (!filename.endsWith('.json')) return false;
+  const stem = filename.slice(0, -'.json'.length);
+  return stem === surfaceId || stem.startsWith(`${surfaceId} `);
+}
+
+function assertColdSchemaUpgrade(input: {
+  readonly currentActive: readonly InkSurfaceRecord[];
+  readonly expectedBases: readonly InkSurfaceRecord[];
+  readonly records: readonly InkSurfaceRecord[];
+}): void {
+  const { currentActive, expectedBases, records } = input;
+  const currentById = new Map(currentActive.map((record) => [record.id, record]));
+  if (
+    currentActive.length !== expectedBases.length ||
+    expectedBases.length !== records.length ||
+    expectedBases.some((expected) => {
+      const current = currentById.get(expected.id);
+      return current === undefined || !sameSurfaceRecord(current, expected);
+    }) ||
+    !expectedBases.some(({ schemaVersion }) => schemaVersion < 3)
+  ) {
+    throw new Error('Ink cold schema-v3 upgrade base is stale or incomplete.');
+  }
+  const updatedAt = records[0]?.updatedAt;
+  if (updatedAt === undefined) {
+    throw new Error('Ink cold schema-v3 upgrade is empty.');
+  }
+  const exact = upgradeInkSurfaceRecordsToV3(expectedBases, updatedAt);
+  if (
+    exact.length !== records.length ||
+    exact.some((candidate, index) => {
+      const record = records[index];
+      return record === undefined || !sameSurfaceRecord(candidate, record);
+    })
+  ) {
+    throw new Error('Ink cold schema-v3 upgrade is not the exact normalized document.');
+  }
 }
 
 function alignExpectedBases(
@@ -959,6 +1418,10 @@ function normalizeSurfaceId(surfaceId: string): string {
     throw new Error('Ink surface ID contains unsupported path characters.');
   }
   return surfaceId;
+}
+
+function unsupportedInkMessage(path: string, reason: InkSurfaceUnsupportedReason): string {
+  return `Ink at ${path} uses unsupported canonical data (${reason}); update Inkstone before editing this note.`;
 }
 
 function surfaceWriteKey(filePath: string, surfaceId: string): string {
@@ -1007,8 +1470,69 @@ function isInkSurfaceBatchJournal(
   if (paths.some((path) => path === null) || new Set(paths).size !== paths.length) {
     return false;
   }
-  return value.entries.every((entry) =>
-    isValidInkSurfaceBatchJournalEntry(entry, filePath, surfaceRoot),
+  if (
+    !value.entries.every((entry) =>
+      isValidInkSurfaceBatchJournalEntry(entry, filePath, surfaceRoot),
+    )
+  ) {
+    return false;
+  }
+  const schemaActivation = value.schemaActivation;
+  if (schemaActivation !== undefined && !isValidJournalSchemaActivation(schemaActivation)) {
+    return false;
+  }
+  const schemaUpgrade = value.schemaUpgrade;
+  if (schemaUpgrade !== undefined && !isValidJournalSchemaUpgrade(schemaUpgrade)) return false;
+  if (schemaActivation !== undefined && schemaUpgrade !== undefined) return false;
+  let crossesV3Boundary = false;
+  const previousContents: string[] = [];
+  for (const entry of value.entries) {
+    if (!isRecord(entry)) return false;
+    const previousBytes = entry.previousContents;
+    const nextBytes = entry.nextContents;
+    if (typeof previousBytes !== 'string' || typeof nextBytes !== 'string') return false;
+    const previous = decodeInkSurfaceRecord(previousBytes);
+    const next = decodeInkSurfaceRecord(nextBytes);
+    previousContents.push(previousBytes);
+    crossesV3Boundary ||= crossesSchemaV3Boundary(previous, next);
+  }
+  if (
+    crossesV3Boundary &&
+    !isValidJournalSchemaActivation(schemaActivation) &&
+    !isValidJournalSchemaUpgrade(schemaUpgrade)
+  ) {
+    return false;
+  }
+  const sourceBaseDigest = schemaActivation?.sourceBaseDigest ?? schemaUpgrade?.sourceBaseDigest;
+  return (
+    sourceBaseDigest === undefined ||
+    sourceBaseDigest === digestInkBrushGolden({ sourceSurfaceBytes: previousContents })
+  );
+}
+
+function isValidJournalSchemaActivation(
+  value: unknown,
+): value is NonNullable<InkSurfaceBatchJournal['schemaActivation']> {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 3 &&
+    typeof value.planDigest === 'string' &&
+    /^[0-9a-f]{8}$/u.test(value.planDigest) &&
+    value.planReference === `ink-schema-v3-plan:${value.planDigest}` &&
+    typeof value.sourceBaseDigest === 'string' &&
+    /^[0-9a-f]{8}$/u.test(value.sourceBaseDigest)
+  );
+}
+
+function isValidJournalSchemaUpgrade(
+  value: unknown,
+): value is NonNullable<InkSurfaceBatchJournal['schemaUpgrade']> {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 2 &&
+    value.kind === 'cold-v3-normalization' &&
+    typeof value.sourceBaseDigest === 'string' &&
+    /^[0-9a-f]{8}$/u.test(value.sourceBaseDigest)
   );
 }
 

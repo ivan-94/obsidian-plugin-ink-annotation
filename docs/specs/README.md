@@ -16,6 +16,8 @@ Inkstone Annotations plugin.
 - [Sidecar lifecycle, Trash, and garbage collection](2026-07-16-sidecar-lifecycle-trash-and-garbage-collection.md)
 - [Editing mode dormancy and Reading View remount correction](2026-07-17-editing-mode-dormancy.md)
 - [Ink iCloud-resilient persistence](2026-07-17-ink-icloud-resilient-persistence.md)
+- [Ink explicit-commit and Canvas presentation foundation](2026-07-20-ink-explicit-commit-session.md)
+- [Entire Vault demand-bounded local index and automated Gate](2026-07-19-entire-vault-demand-bounded-index.md)
 - [Preact UI architecture refactor specification](2026_07_15_refactor_to_preact.md)
 
 Historical plan updates that have already been reconciled into the master plan are retained here for
@@ -62,6 +64,8 @@ are no longer valid sources of truth.
 - `docs/specs/2026-07-16-sidecar-lifecycle-trash-and-garbage-collection.md`
 - `docs/specs/2026-07-17-editing-mode-dormancy.md`
 - `docs/specs/2026-07-17-ink-icloud-resilient-persistence.md`
+- `docs/specs/2026-07-20-ink-explicit-commit-session.md`
+- `docs/specs/2026-07-19-entire-vault-demand-bounded-index.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`
 - `docs/specs/2026-07-15-preact-execution-plan-update.md`
 - `docs/specs/assets/obsidian-annotation-plugin-ui-v2/`
@@ -73,6 +77,13 @@ are no longer valid sources of truth.
   the historical design and master execution documents.
 - Historical Slice evidence remains in `docs/delivery/slices/` and links back to the local master
   execution plan.
+- The 2026-07-19 Entire Vault specification supersedes the earlier full-memory index assumptions
+  while preserving canonical sidecars and deferring UI cutover to separately authorized work.
+- The 2026-07-20 explicit-commit specification supersedes automatic foreground Draft and short-idle
+  canonical persistence: foreground Ink Mode is memory-only until Done or sustained inactivity,
+  while background/inactivity save is explicitly best-effort. The same specification narrows Canvas
+  invalidation, prohibits full-viewport rebuilds during Pencil contact, accepts temporary compositor
+  scaling during viewport gestures, and bounds committed raster tiles.
 - Supporting design images moved with the plan so all relative references remain repository-local.
 
 ### Verification evidence

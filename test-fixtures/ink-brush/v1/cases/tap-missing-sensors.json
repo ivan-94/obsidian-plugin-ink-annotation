@@ -1,0 +1,130 @@
+{
+  "cases": [
+    {
+      "batchings": [
+        {
+          "batches": [
+            { "phase": "down", "sampleIndexes": [0] },
+            { "phase": "up", "sampleIndexes": [1] }
+          ],
+          "id": "parent-events"
+        }
+      ],
+      "brush": {
+        "color": "#111111",
+        "inputProfile": { "pressure": "legacy-unknown", "tilt": "legacy-unknown" },
+        "tool": "pen",
+        "version": "legacy-round-v1"
+      },
+      "id": "legacy-tap",
+      "kind": "normalized-contact",
+      "samples": [
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "measured", "value": 0.5 },
+          "time": 0,
+          "x": 10,
+          "y": 10
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "measured", "value": 0.5 },
+          "time": 8,
+          "x": 10,
+          "y": 10
+        }
+      ]
+    },
+    {
+      "batchings": [
+        {
+          "batches": [
+            { "phase": "down", "sampleIndexes": [0] },
+            { "phase": "up", "sampleIndexes": [1] }
+          ],
+          "id": "parent-events"
+        }
+      ],
+      "brush": {
+        "color": "#111111",
+        "inputProfile": { "pressure": "legacy-unknown", "tilt": "legacy-unknown" },
+        "tool": "pen",
+        "version": "legacy-round-v1"
+      },
+      "id": "legacy-mouse-fallback",
+      "kind": "normalized-contact",
+      "samples": [
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "unavailable" },
+          "time": 0,
+          "x": 20,
+          "y": 12
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "unavailable" },
+          "time": 12,
+          "x": 20,
+          "y": 12
+        }
+      ]
+    },
+    {
+      "batchings": [
+        {
+          "batches": [
+            { "phase": "down", "sampleIndexes": [0] },
+            { "phase": "up", "sampleIndexes": [1] }
+          ],
+          "id": "parent-events"
+        }
+      ],
+      "brush": {
+        "color": "#111111",
+        "inputProfile": { "pressure": "measured", "tilt": "unavailable" },
+        "tool": "pen",
+        "version": "pen-physical-v1"
+      },
+      "id": "pointer-up-zero-pressure",
+      "kind": "normalized-contact",
+      "samples": [
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "measured", "value": 0.6 },
+          "time": 0,
+          "x": 30,
+          "y": 14
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "measured", "value": 0 },
+          "time": 10,
+          "x": 31,
+          "y": 14
+        }
+      ]
+    }
+  ],
+  "fixtureSchemaVersion": 1,
+  "id": "tap-missing-sensors",
+  "kind": "synthetic"
+}

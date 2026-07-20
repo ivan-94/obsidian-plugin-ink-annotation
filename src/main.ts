@@ -10,12 +10,18 @@ import {
 } from 'obsidian';
 
 import { ObsidianVaultTextFileStore } from './adapters/obsidian/vault-text-file-store';
+import { InkPhysicalGateExport } from './adapters/obsidian/ink-physical-gate-export';
+import { ObsidianLocalPerformanceGate } from './adapters/obsidian/ink-local-performance-gate';
 import {
   ANNOTATION_SIDEBAR_VIEW_TYPE,
   AnnotationSidebarView,
 } from './adapters/obsidian/annotation-sidebar-view';
 import { ReadingViewIntegration } from './adapters/obsidian/reading-view-integration';
 import { ObsidianInkModeManager } from './adapters/obsidian/ink-mode-manager';
+import {
+  INKSTONE_LOCAL_PERFORMANCE_GATE,
+  INKSTONE_UNPUBLISHED_PHYSICAL_INK_HAT,
+} from './build-flags';
 import { LivePreviewAnnotationCoordinator } from './adapters/obsidian/live-preview-extension';
 import { shouldRefreshAnnotationSurfacesForModify } from './adapters/obsidian/markdown-view-mode';
 import type {
@@ -35,34 +41,62 @@ import {
 import { writeTextExportFile } from './application/text-export-file-writer';
 import { planVaultTextExport } from './application/vault-text-export-plan';
 import {
+  assertInkExportLoadSupported,
   writeInkPngExport,
   writeInkStandaloneReport,
   writeInkSvgExport,
 } from './application/ink-export-file-writer';
 import { VaultIndexBuilder } from './application/vault-index-builder';
 import {
-  applyCanonicalInkSurfaceChanged,
+  CanonicalInkSurfaceProjectionCoordinator,
   applyCanonicalRecordChanged,
   applyCanonicalRecordRemoved,
 } from './application/vault-index-events';
+import type { InkSurfaceRecord } from './domain/ink-surface';
 import { StylePresetCatalog } from './domain/style-preset';
 import { annotationTargetText, type TextAnnotationRecord } from './domain/text-annotation';
 import { VaultAnnotationIndex, type AnnotationIndexEntry } from './domain/vault-annotation-index';
 import { AnnotationInspector } from './ui/annotation-inspector';
 import { AnnotationExportDialog } from './ui/annotation-export-dialog';
 import { Diagnostics, type DiagnosticMemoryMetricName } from './runtime/diagnostics';
+import {
+  INK_PERFORMANCE_LOCAL_GATE_MAX_RECENT_SPANS,
+  InkPerformanceDiagnostics,
+} from './runtime/ink-performance-diagnostics';
+import { S27PhysicalGateCapture } from './runtime/ink-physical-gate-capture';
 import { PluginRuntime } from './runtime/plugin-runtime';
 import { VersionedSourceCache } from './runtime/versioned-source-cache';
 import { InkstoneSettingTab } from './settings-tab';
-import { DEFAULT_SETTINGS, ensureDeviceId, parseSettings, type InkstoneSettings } from './settings';
+import {
+  DEFAULT_SETTINGS,
+  ensureDeviceId,
+  parseSettings,
+  type InkPresentationAdapter,
+  type InkstoneSettings,
+} from './settings';
 import { SidecarRepository } from './storage/sidecar-repository';
 import { InkSurfaceRepository } from './storage/ink-surface-repository';
 import { VaultIndexCache } from './storage/vault-index-cache';
 import { LocalInkToolPreferenceStore } from './storage/local-ink-tool-preference';
-import { LocalInkRecoveryStore } from './storage/local-ink-recovery';
+import { LocalInkRecoveryReader } from './storage/local-ink-recovery';
+import {
+  IndexedDbInkRecoveryArchiveReader,
+  LegacyInkRecoveryStorage,
+  createInkRecoveryStorageKeyspace,
+} from './storage/tiered-ink-recovery-storage';
 
 export default class InkstoneAnnotationsPlugin extends Plugin {
   private readonly diagnostics = new Diagnostics(false);
+  private readonly inkPerformance = new InkPerformanceDiagnostics(
+    false,
+    undefined,
+    INK_PERFORMANCE_LOCAL_GATE_MAX_RECENT_SPANS,
+  );
+  private readonly physicalGateCapture = new S27PhysicalGateCapture({
+    diagnostics: this.inkPerformance,
+    selectedPresentationAdapterState: () =>
+      this.inkModeManager?.activePresentationAdapterState ?? null,
+  });
   private readonly runtime = new PluginRuntime();
   private pluginSettings: InkstoneSettings = DEFAULT_SETTINGS;
   private inkModeManager: ObsidianInkModeManager | null = null;
@@ -79,7 +113,9 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
       await this.saveData(this.pluginSettings);
     }
     this.diagnostics.setEnabled(this.pluginSettings.diagnosticsEnabled);
+    this.inkPerformance.setEnabled(this.pluginSettings.diagnosticsEnabled);
     this.runtime.start();
+    this.runtime.registerDisposer(() => this.physicalGateCapture.cancel());
     const readingSourceCache = new VersionedSourceCache(8);
     this.runtime.registerDisposer(() => readingSourceCache.clear());
 
@@ -96,13 +132,23 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         applyCanonicalRecordRemoved(vaultIndex, record);
       },
     });
+    let refreshInkSurfaceProjection: (record: InkSurfaceRecord) => void = () => undefined;
     const inkRepository = new InkSurfaceRepository(sidecarStore, {
       onEventIssue: (error) => console.warn('[Inkstone Annotations]', error),
-      onSurfaceChanged: (record) => {
-        applyCanonicalInkSurfaceChanged(vaultIndex, record);
-        this.sidebarView?.applyInkSurfaceChanged(record);
-      },
+      onSurfaceChanged: (record) => refreshInkSurfaceProjection(record),
     });
+    const inkSurfaceProjections = new CanonicalInkSurfaceProjectionCoordinator({
+      applySummaries: (filePath, summaries) =>
+        this.sidebarView?.applyInkSurfaceSummaries(filePath, summaries),
+      index: vaultIndex,
+      listSurfaceSummaries: (filePath) => inkRepository.listSurfaceSummaries(filePath),
+    });
+    refreshInkSurfaceProjection = (record) => {
+      void inkSurfaceProjections
+        .refresh(record)
+        .catch((error) => console.warn('[Inkstone Annotations]', error));
+    };
+    this.runtime.registerDisposer(() => inkSurfaceProjections.dispose());
     const annotationService = new AnnotationService({
       deviceId: this.pluginSettings.deviceId,
       repository,
@@ -599,13 +645,16 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
               .catch((error) => console.warn('[Inkstone Annotations]', error));
           },
           exportInkPng: async (filePath, surfaceId) => {
-            const record = await inkRepository.readSurface(filePath, surfaceId);
+            const loaded = await inkRepository.listSurfaces(filePath);
+            assertInkExportLoadSupported(loaded.issues);
+            const record = loaded.records.find((candidate) => candidate.id === surfaceId) ?? null;
             if (record === null) throw new Error(`Ink surface no longer exists: ${surfaceId}`);
-            const path = await writeInkPngExport(record, sidecarStore);
+            const path = await writeInkPngExport(record, sidecarStore, loaded.records);
             new Notice(`Exported Ink PNG to ${path}`);
           },
           exportInkReport: async (filePath) => {
             const loaded = await inkRepository.listSurfaces(filePath);
+            assertInkExportLoadSupported(loaded.issues);
             const path = await writeInkStandaloneReport(
               loaded.records,
               {
@@ -617,9 +666,11 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             new Notice(`Exported Ink report to ${path}`);
           },
           exportInkSvg: async (filePath, surfaceId) => {
-            const record = await inkRepository.readSurface(filePath, surfaceId);
+            const loaded = await inkRepository.listSurfaces(filePath);
+            assertInkExportLoadSupported(loaded.issues);
+            const record = loaded.records.find((candidate) => candidate.id === surfaceId) ?? null;
             if (record === null) throw new Error(`Ink surface no longer exists: ${surfaceId}`);
-            const path = await writeInkSvgExport(record, sidecarStore);
+            const path = await writeInkSvgExport(record, sidecarStore, loaded.records);
             new Notice(`Exported Ink SVG to ${path}`);
           },
           exportVaultEntries: (entries, invoker) => {
@@ -800,10 +851,37 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     });
     this.readingView = readingView;
     this.runtime.registerDisposer(() => readingView.dispose());
+    let legacyRecoveryStorage: Pick<Storage, 'getItem' | 'key' | 'length'> =
+      globalThis.localStorage;
+    if (globalThis.indexedDB !== undefined) {
+      const mergedLegacyStorage = new LegacyInkRecoveryStorage({
+        archive: new IndexedDbInkRecoveryArchiveReader(globalThis.indexedDB),
+        front: globalThis.localStorage,
+        keyspace: createInkRecoveryStorageKeyspace(
+          this.app.vault.getName(),
+          this.pluginSettings.deviceId,
+        ),
+      });
+      try {
+        await mergedLegacyStorage.ready();
+        legacyRecoveryStorage = mergedLegacyStorage;
+        this.runtime.registerDisposer(() => mergedLegacyStorage.close());
+      } catch (error) {
+        mergedLegacyStorage.close();
+        console.warn('[Inkstone Annotations] Legacy Ink recovery could not be read.', error);
+      }
+    }
+    const legacyInkRecoveryReader = new LocalInkRecoveryReader(
+      legacyRecoveryStorage,
+      this.app.vault.getName(),
+      this.pluginSettings.deviceId,
+    );
     inkMode = new ObsidianInkModeManager({
       app: this.app,
       deviceId: this.pluginSettings.deviceId,
       document: globalThis.document,
+      exportUnsavedInk: (surface) => writeInkSvgExport(surface, sidecarStore),
+      inkPerformance: this.inkPerformance,
       inkRepository,
       onIssue: (error) => {
         console.warn('[Inkstone Annotations]', error);
@@ -817,15 +895,17 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         this.app.vault.getName(),
         this.pluginSettings.deviceId,
       ),
-      recoveryStore: new LocalInkRecoveryStore(
-        globalThis.localStorage,
-        this.app.vault.getName(),
-        this.pluginSettings.deviceId,
-      ),
+      liveFirstPersistence: {
+        legacyRecoveryReader: legacyInkRecoveryReader,
+      },
       recordInputToPaint: (durationMs) =>
         this.diagnostics.recordLatency('ink-input-to-paint', durationMs),
       showInkPreviewByDefault: this.pluginSettings.showInkPreviewByDefault,
       textRepository: repository,
+      ...(INKSTONE_UNPUBLISHED_PHYSICAL_INK_HAT ? { unpublishedPhysicalInkHat: {} } : {}),
+      ...(this.pluginSettings.inkPresentationAdapter === 'worker-offscreen-2d'
+        ? { workerPresentation: { enabled: true as const } }
+        : {}),
     });
     this.inkModeManager = inkMode;
     this.runtime.registerDisposer(() => inkMode.dispose());
@@ -853,6 +933,16 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
       id: 'show-diagnostics',
       name: 'Show diagnostics',
       callback: () => this.showDiagnostics(),
+    });
+    this.addCommand({
+      id: 'start-s27-physical-gate-capture',
+      name: 'Start S27 physical Gate capture',
+      callback: () => void this.startS27PhysicalGateCapture(),
+    });
+    this.addCommand({
+      id: 'export-s27-physical-gate-capture',
+      name: 'Export S27 physical Gate capture',
+      callback: () => void this.exportS27PhysicalGateCapture(),
     });
     this.addCommand({
       id: 'capture-memory-diagnostics',
@@ -959,6 +1049,16 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         performance.now() - workspaceWaitStartedAt,
       );
       inkMode.registerAllMarkdownViews();
+      if (INKSTONE_LOCAL_PERFORMANCE_GATE) {
+        const localGate = new ObsidianLocalPerformanceGate({
+          app: this.app,
+          diagnostics: this.inkPerformance,
+          inkMode,
+        });
+        void localGate.runIfRequested().catch((error: unknown) => {
+          console.error('[Inkstone Annotations] Local performance Gate failed.', error);
+        });
+      }
     });
     this.registerEvent(
       this.app.workspace.on('layout-change', () => inkMode.registerAllMarkdownViews()),
@@ -1113,6 +1213,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
   async setDiagnosticsEnabled(enabled: boolean): Promise<void> {
     this.pluginSettings = { ...this.pluginSettings, diagnosticsEnabled: enabled };
     this.diagnostics.setEnabled(enabled);
+    this.inkPerformance.setEnabled(enabled);
     await this.saveData(this.pluginSettings);
   }
 
@@ -1120,6 +1221,12 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     this.pluginSettings = { ...this.pluginSettings, showInkPreviewByDefault: enabled };
     await this.saveData(this.pluginSettings);
     await this.inkModeManager?.setPreviewByDefault(enabled);
+  }
+
+  async setInkPresentationAdapter(adapter: InkPresentationAdapter): Promise<void> {
+    this.pluginSettings = { ...this.pluginSettings, inkPresentationAdapter: adapter };
+    await this.saveData(this.pluginSettings);
+    new Notice('Ink renderer selection applies after reloading Inkstone Annotations.');
   }
 
   async updateStylePreset(
@@ -1142,10 +1249,41 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     }
 
     const metrics = this.diagnostics.snapshot();
+    const inkPerformance = this.inkPerformance.snapshot();
     const summary =
-      metrics.length === 0 ? 'No timing samples yet.' : JSON.stringify(metrics, null, 2);
+      metrics.length === 0 &&
+      inkPerformance.recentSpans.length === 0 &&
+      inkPerformance.forbiddenWork.length === 0
+        ? 'No timing samples yet.'
+        : JSON.stringify({ inkPerformance, metrics }, null, 2);
 
     new Notice(summary, 10_000);
+  }
+
+  private async startS27PhysicalGateCapture(): Promise<void> {
+    if (!this.pluginSettings.diagnosticsEnabled) {
+      new Notice('Diagnostics are disabled. Enable them in Inkstone Annotations settings.');
+      return;
+    }
+    try {
+      const exporter = new InkPhysicalGateExport(this.app.vault.adapter);
+      const condition = await exporter.readCondition();
+      new Notice('S27 capture is calibrating 120 idle refresh intervals…');
+      await this.physicalGateCapture.start(condition);
+      new Notice(`S27 ${condition.conditionId} run ${condition.runIndex} is ready. Start writing.`);
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : 'Could not start S27 capture.');
+    }
+  }
+
+  private async exportS27PhysicalGateCapture(): Promise<void> {
+    try {
+      const exporter = new InkPhysicalGateExport(this.app.vault.adapter);
+      await exporter.writeCapture(this.physicalGateCapture.finish());
+      new Notice('S27 diagnostics exported to the owned fixture Vault.');
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : 'Could not export S27 capture.');
+    }
   }
 
   private captureMemoryCheckpoint(name: DiagnosticMemoryMetricName, notifyUser: boolean): boolean {

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { encodeInkSurfaceRecord, type InkSurfaceRecord } from '../../domain/ink-surface';
 import type { InkSurfaceSummary } from '../../domain/ink-surface-summary';
+import type { InkWorkerPresentationPreparationFactory } from '../../ui/ink-render-runtime';
 import { ObsidianInkModeManager } from './ink-mode-manager';
 
 interface LoadedInkSurfacesForTest {
@@ -61,6 +62,314 @@ function menuRecorder<Item extends { icon?: string; onClick?: () => void; title?
 }
 
 describe('Obsidian Ink Mode action', () => {
+  it('does not treat a transient window blur as a confirmed background-idle save signal', async () => {
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+    const background = vi.spyOn(manager, 'background').mockResolvedValue();
+
+    document.defaultView?.dispatchEvent(new Event('blur'));
+    await Promise.resolve();
+
+    expect(background).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it('fails closed before mounting a partial note when one surface has a schema-version conflict', async () => {
+    const view = markdownView('Ink.md');
+    const partialRecord = inkSurface('Ink.md');
+    const conflictedV2 = { ...partialRecord, id: 'conflicted', schemaVersion: 2 as const };
+    const conflictedV3 = { ...conflictedV2, schemaVersion: 3 as const };
+    const getOrCreateNote = vi.fn(() => Promise.resolve({ noteId: partialRecord.noteId }));
+    const writeSurface = vi.fn(() => Promise.resolve());
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          Promise.resolve({
+            conflicts: [
+              {
+                candidates: [
+                  { path: 'conflicted.json', record: conflictedV3 },
+                  { path: 'conflicted iCloud.json', record: conflictedV2 },
+                ],
+                kind: 'schema-version-mismatch',
+                selectedPath: 'conflicted.json',
+                surfaceId: conflictedV2.id,
+              },
+            ],
+            issues: [
+              {
+                kind: 'conflict',
+                message: 'schema-version-mismatch; no candidate is editable',
+                path: 'conflicted.json',
+              },
+            ],
+            records: [partialRecord],
+          }),
+        writeSurface,
+      } as never,
+      preferenceStore: {} as never,
+      textRepository: { getOrCreateNote } as never,
+    });
+
+    const mounted = await (
+      manager as unknown as {
+        mountView: (view: MarkdownView, createIfMissing: boolean) => Promise<unknown>;
+      }
+    ).mountView(view, true);
+
+    expect(mounted).toBeNull();
+    expect(getOrCreateNote).not.toHaveBeenCalled();
+    expect(writeSurface).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it('fails closed before mounting or writing when the note contains unsupported Ink', async () => {
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_200));
+    const view = {
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const writeSurface = vi.fn(() => Promise.resolve());
+    const getOrCreateNote = vi.fn(() => Promise.resolve({ noteId: 'note-a' }));
+    const onIssue = vi.fn();
+    const unsupportedIssue = {
+      kind: 'unsupported-record',
+      message: 'Ink uses a newer schema; update Inkstone before editing this note.',
+      path: '.obsidian-annotations/v1/notes/hash/surfaces/surface-1.json',
+      reason: 'unsupported-schema-version',
+    } as const;
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          Promise.resolve({ conflicts: [], issues: [unsupportedIssue], records: [] }),
+        writeSurface,
+      } as never,
+      onIssue,
+      preferenceStore: {} as never,
+      textRepository: { getOrCreateNote } as never,
+    });
+
+    const mounted = await (
+      manager as unknown as {
+        mountView: (view: MarkdownView, createIfMissing: boolean) => Promise<unknown>;
+      }
+    ).mountView(view, true);
+
+    expect(mounted).toBeNull();
+    expect(onIssue).toHaveBeenCalledWith(unsupportedIssue);
+    expect(getOrCreateNote).not.toHaveBeenCalled();
+    expect(writeSurface).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it('fails closed before mounting a partial note when canonical Ink is corrupt', async () => {
+    const view = markdownView('Ink.md');
+    const partialRecord = inkSurface('Ink.md');
+    const getOrCreateNote = vi.fn(() => Promise.resolve({ noteId: partialRecord.noteId }));
+    const onIssue = vi.fn();
+    const corruptIssue = {
+      kind: 'corrupt-record',
+      message: 'Ink surface record is not valid JSON.',
+      path: '.obsidian-annotations/v1/notes/hash/surfaces/corrupt.json',
+    } as const;
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          Promise.resolve({
+            conflicts: [],
+            issues: [corruptIssue],
+            records: [partialRecord],
+          }),
+      } as never,
+      onIssue,
+      preferenceStore: {} as never,
+      textRepository: { getOrCreateNote } as never,
+    });
+
+    const mounted = await (
+      manager as unknown as {
+        mountView: (view: MarkdownView, createIfMissing: boolean) => Promise<unknown>;
+      }
+    ).mountView(view, true);
+
+    expect(mounted).toBeNull();
+    expect(onIssue).toHaveBeenCalledWith(corruptIssue);
+    expect(getOrCreateNote).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it('opens one historical v1 surface without eagerly rewriting it to schema v2', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const current = inkSurface('Ink.md');
+    const { originY: _originY, ...legacyLayout } = current.layout;
+    void _originY;
+    const legacy: InkSurfaceRecord = {
+      ...current,
+      layout: legacyLayout,
+      schemaVersion: 1,
+    };
+    const updateSurfacesAtomically = vi.fn(() => Promise.resolve());
+    const view = markdownView('Ink.md');
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () => Promise.resolve({ conflicts: [], issues: [], records: [legacy] }),
+        updateSurfacesAtomically,
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: legacy.noteId }),
+      } as never,
+    });
+
+    const mounted = await (
+      manager as unknown as {
+        mountView: (view: MarkdownView, createIfMissing: boolean) => Promise<unknown>;
+      }
+    ).mountView(view, true);
+
+    expect(updateSurfacesAtomically).not.toHaveBeenCalled();
+    expect(mounted).not.toBeNull();
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
+  it('fails closed without writes when multiple historical v1 surfaces have no canonical order', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const current = inkSurface('Ink.md');
+    const { originY: _originY, ...legacyLayout } = current.layout;
+    void _originY;
+    const first: InkSurfaceRecord = {
+      ...current,
+      layout: legacyLayout,
+      schemaVersion: 1,
+    };
+    const second: InkSurfaceRecord = { ...first, id: 'surface-b' };
+    const updateSurfacesAtomically = vi.fn(() => Promise.resolve());
+    const getOrCreateNote = vi.fn(() => Promise.resolve({ noteId: first.noteId }));
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          Promise.resolve({ conflicts: [], issues: [], records: [second, first] }),
+        updateSurfacesAtomically,
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      textRepository: { getOrCreateNote } as never,
+    });
+
+    const mounted = await (
+      manager as unknown as {
+        mountView: (view: MarkdownView, createIfMissing: boolean) => Promise<unknown>;
+      }
+    ).mountView(markdownView('Ink.md'), true);
+
+    expect(mounted).toBeNull();
+    expect(getOrCreateNote).not.toHaveBeenCalled();
+    expect(updateSurfacesAtomically).not.toHaveBeenCalled();
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
+  it('forwards the explicitly selected Worker presentation Adapter into mounted Ink', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const prepare: InkWorkerPresentationPreparationFactory = vi.fn(() =>
+      Promise.resolve({ failureCategory: 'api-unavailable', kind: 'unavailable' } as const),
+    );
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_200));
+    const view = {
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () => Promise.resolve({ conflicts: [], records: [] }),
+        writeSurface: () => Promise.resolve(),
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: 'note-a' }),
+      } as never,
+      workerPresentation: { enabled: true, prepare },
+    });
+
+    await (
+      manager as unknown as {
+        mountView: (view: MarkdownView, createIfMissing: boolean) => Promise<unknown>;
+      }
+    ).mountView(view, true);
+
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    expect(manager.activePresentationAdapterState).toBeNull();
+    (manager as unknown as { activeView: MarkdownView | null }).activeView = view;
+    expect(manager.activePresentationAdapterState).toEqual({
+      adapter: 'main-canvas-2d',
+      epoch: 1,
+      requestedAdapter: 'worker-offscreen-2d',
+    });
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
   it('locates Ink in the current Markdown file without reopening that file', async () => {
     const file = { path: 'Ink.md' };
     const view = Object.assign(new MarkdownView({} as never), {
@@ -273,7 +582,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Ink.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     });
     privateManager.ensureMounted = ensureMounted;
 
@@ -315,7 +624,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Old.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     });
 
     file = { path: 'New.md' };
@@ -325,6 +634,40 @@ describe('Obsidian Ink Mode action', () => {
     expect(exit.mock.invocationCallOrder[0]).toBeLessThan(dispose.mock.invocationCallOrder[0] ?? 0);
     expect(reclaimEmptySurfaces).toHaveBeenCalledWith('Old.md', expect.any(String), 'device-a');
     expect(privateManager.activeView).toBeNull();
+    manager.dispose();
+  });
+
+  it('provides a barrier behind queued view reconciliation', async () => {
+    const view = { contentEl: document.createElement('div') } as unknown as MarkdownView;
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+    let release = (): void => undefined;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const privateManager = manager as unknown as {
+      refreshQueue: {
+        schedule: (view: MarkdownView, task: () => Promise<void>) => Promise<void>;
+      };
+    };
+    void privateManager.refreshQueue.schedule(view, () => pending);
+    let synchronized = false;
+    const barrier = manager.synchronizeRegisteredView(view).then(() => {
+      synchronized = true;
+    });
+    await Promise.resolve();
+    expect(synchronized).toBe(false);
+
+    release();
+    await barrier;
+
+    expect(synchronized).toBe(true);
     manager.dispose();
   });
 
@@ -357,7 +700,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Ink.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     });
 
     mode = 'source';
@@ -395,7 +738,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Ink.md',
-      session: { snapshot: () => ({ surface: { strokes: [{ id: 'saved' }] } }) },
+      session: { read: () => ({ strokeCount: 1 }) },
     });
 
     await manager.toggle(view);
@@ -477,7 +820,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose: vi.fn(), exit },
       filePath: 'Ink.md',
-      session: {},
+      session: { read: () => ({ state: { dirty: false, kind: 'ink-mode' }, strokeCount: 0 }) },
     });
 
     mode = 'source';
@@ -524,7 +867,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Old.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     });
 
     manager.registerView(view);
@@ -570,7 +913,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose: vi.fn(), exit },
       filePath: 'Ink.md',
-      session: {},
+      session: { read: () => ({ state: { dirty: false, kind: 'ink-mode' }, strokeCount: 0 }) },
     });
 
     manager.registerView(view);
@@ -827,11 +1170,8 @@ describe('Obsidian Ink Mode action', () => {
         load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
         save: () => undefined,
       } as never,
-      recoveryStore: {
-        claim: () => undefined,
-        clear: () => undefined,
-        load: () => null,
-        save: () => 'generation-a',
+      liveFirstPersistence: {
+        legacyRecoveryReader: { load: () => null },
       },
       textRepository: {
         getOrCreateNote: () => Promise.resolve({ noteId: canonical.noteId }),
@@ -863,10 +1203,7 @@ describe('Obsidian Ink Mode action', () => {
     expect(persisted).toMatchObject({
       layout: { logicalHeight: 1_800 },
       revision: 2,
-      strokes: [
-        canonical.strokes[0],
-        expect.objectContaining({ linkedStrokeId: 'after-transient-extent' }),
-      ],
+      strokes: [canonical.strokes[0], expect.objectContaining({ id: 'after-transient-extent' })],
     });
     manager.dispose();
     getContext.mockRestore();
@@ -995,6 +1332,52 @@ describe('Obsidian Ink Mode action', () => {
 
     expect(action.getAttribute('aria-label')).toBe('开始涂鸦');
     expect(action.dataset.icon).toBe('paintbrush');
+    manager.dispose();
+  });
+
+  it('does not derive toolbar state from a partial schema-conflict projection', async () => {
+    const partialRecord = inkSurface('Ink.md');
+    const conflictedV2 = { ...partialRecord, id: 'conflicted' };
+    const conflictedV3 = { ...conflictedV2, schemaVersion: 3 as const };
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () =>
+          Promise.resolve({
+            conflicts: [
+              {
+                candidates: [
+                  { path: 'conflicted.json', record: conflictedV3 },
+                  { path: 'conflicted iCloud.json', record: conflictedV2 },
+                ],
+                kind: 'schema-version-mismatch',
+                selectedPath: 'conflicted.json',
+                surfaceId: conflictedV2.id,
+              },
+            ],
+            issues: [
+              {
+                kind: 'conflict',
+                message: 'schema-version-mismatch; no candidate is editable',
+                path: 'conflicted.json',
+              },
+            ],
+            records: [partialRecord],
+          }),
+      } as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+
+    const hasInk = await (
+      manager as unknown as {
+        readCanonicalFileHasInkState: (filePath: string) => Promise<boolean | null>;
+      }
+    ).readCanonicalFileHasInkState('Ink.md');
+
+    expect(hasInk).toBeNull();
     manager.dispose();
   });
 
@@ -1289,7 +1672,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose: vi.fn(), exit },
       filePath: 'Ink.md',
-      session: { snapshot: () => ({ surface: { strokes: [{ id: 'saved' }] } }) },
+      session: { read: () => ({ strokeCount: 1 }) },
     });
 
     await expect(manager.toggle(view)).rejects.toBe(saveError);
@@ -1382,7 +1765,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller,
       filePath: 'Ink.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     };
     const manager = new ObsidianInkModeManager({
       app: {
@@ -1453,52 +1836,7 @@ describe('Obsidian Ink Mode action', () => {
     manager.dispose();
   });
 
-  it('checkpoints dirty vectors synchronously before dispose releases the live session', () => {
-    const view = { contentEl: document.createElement('div') } as unknown as MarkdownView;
-    const save = vi.fn(() => 'generation-a');
-    const clear = vi.fn();
-    const background = vi.fn(() => new Promise<void>(() => undefined));
-    const dispose = vi.fn();
-    const manager = new ObsidianInkModeManager({
-      app: { workspace: { getLeavesOfType: () => [] } } as never,
-      deviceId: 'device-a',
-      document,
-      inkRepository: {} as never,
-      preferenceStore: {} as never,
-      recoveryStore: { clear, load: vi.fn(), save },
-      textRepository: {} as never,
-    });
-    const privateManager = manager as unknown as {
-      activeView: MarkdownView | null;
-      mounted: Map<MarkdownView, unknown>;
-    };
-    privateManager.activeView = view;
-    privateManager.mounted.set(view, {
-      complete: true,
-      controller: { background, dispose },
-      filePath: 'Ink.md',
-      session: {
-        recoverySnapshot: () => ({
-          expectedBases: [{ id: 'surface-a', revision: 1 }],
-          pendingAttempts: [{ id: 'surface-a', revision: 2 }],
-          records: [{ id: 'surface-a' }],
-          requiresRecovery: true,
-        }),
-      },
-    });
-
-    manager.dispose();
-
-    expect(background).toHaveBeenCalledTimes(1);
-    expect(save).toHaveBeenCalledWith('Ink.md', [{ id: 'surface-a' }], expect.any(String), {
-      expectedBases: [{ id: 'surface-a', revision: 1 }],
-      pendingAttempts: [{ id: 'surface-a', revision: 2 }],
-    });
-    expect(save.mock.invocationCallOrder[0]).toBeLessThan(dispose.mock.invocationCallOrder[0] ?? 0);
-    expect(clear).not.toHaveBeenCalled();
-  });
-
-  it('restores a version-3 multi-surface checkpoint with its exact CAS bases', async () => {
+  it('migrates a legacy version-3 checkpoint with exact CAS bases without mutating its store', async () => {
     const firstBase = inkSurface('Ink.md');
     const secondBase = { ...inkSurface('Ink.md'), id: 'surface-b' };
     const firstPending = {
@@ -1521,18 +1859,18 @@ describe('Obsidian Ink Mode action', () => {
       document,
       inkRepository: { updateSurfacesAtomically } as never,
       preferenceStore: {} as never,
-      recoveryStore: {
-        clear,
-        load: () => ({
-          capturedAt: '2026-07-16T01:00:00.000Z',
-          expectedBases: [firstBase, secondBase],
-          filePath: 'Ink.md',
-          generation: 'generation-v3',
-          pendingAttempts: [firstPending, secondPending],
-          records: [firstPending, secondPending],
-          version: 3,
-        }),
-        save: vi.fn(),
+      liveFirstPersistence: {
+        legacyRecoveryReader: {
+          load: () => ({
+            capturedAt: '2026-07-16T01:00:00.000Z',
+            expectedBases: [firstBase, secondBase],
+            filePath: 'Ink.md',
+            generation: 'generation-v3',
+            pendingAttempts: [firstPending, secondPending],
+            records: [firstPending, secondPending],
+            version: 3,
+          }),
+        },
       },
       textRepository: {} as never,
     });
@@ -1554,296 +1892,8 @@ describe('Obsidian Ink Mode action', () => {
       [firstPending, secondPending],
       [firstBase, secondBase],
     );
-    expect(clear).toHaveBeenCalledWith('Ink.md', 'generation-v3');
+    expect(clear).not.toHaveBeenCalled();
     manager.dispose();
-  });
-
-  it('retains the live session but synchronously detaches its UI when dispose recovery fails', async () => {
-    const view = { contentEl: document.createElement('div') } as unknown as MarkdownView;
-    const checkpointError = new Error('localStorage quota exceeded');
-    const flushError = new Error('Vault unavailable');
-    let rejectFlush!: (error: unknown) => void;
-    const background = vi.fn(
-      () =>
-        new Promise<void>((_resolve, reject) => {
-          rejectFlush = reject;
-        }),
-    );
-    const dispose = vi.fn();
-    const onIssue = vi.fn();
-    const manager = new ObsidianInkModeManager({
-      app: { workspace: { getLeavesOfType: () => [] } } as never,
-      deviceId: 'device-a',
-      document,
-      inkRepository: {} as never,
-      onIssue,
-      preferenceStore: {} as never,
-      recoveryStore: {
-        clear: vi.fn(),
-        load: vi.fn(),
-        save: () => {
-          throw checkpointError;
-        },
-      },
-      textRepository: {} as never,
-    });
-    const privateManager = manager as unknown as {
-      activeView: MarkdownView | null;
-      mounted: Map<MarkdownView, unknown>;
-    };
-    privateManager.activeView = view;
-    privateManager.mounted.set(view, {
-      complete: true,
-      controller: { background, dispose, retrySave: vi.fn() },
-      filePath: 'Ink.md',
-      session: {
-        recoverySnapshot: () => ({ records: [{ id: 'surface-a' }], requiresRecovery: true }),
-      },
-    });
-
-    manager.dispose();
-    expect(dispose).toHaveBeenCalledTimes(1);
-    rejectFlush(flushError);
-    await vi.waitFor(() => expect(onIssue).toHaveBeenCalledWith(flushError));
-
-    expect(onIssue).toHaveBeenCalledWith(checkpointError);
-    expect(dispose).toHaveBeenCalledTimes(1);
-    expect(privateManager.mounted.has(view)).toBe(false);
-  });
-
-  it('blocks same-file replacement views behind one reachable serialized retained retry', async () => {
-    const retainedView = {
-      contentEl: document.createElement('div'),
-      file: { path: 'folder/../Reload.md' },
-      getMode: () => 'preview',
-    } as unknown as MarkdownView;
-    const recoveryAction = document.createElement('button');
-    const removeRecoveryAction = vi.spyOn(recoveryAction, 'remove');
-    const normalAction = document.createElement('button');
-    const actionCallbacks: Array<() => void> = [];
-    const addAction = vi.fn((_icon: string, _label: string, callback: () => void) => {
-      actionCallbacks.push(callback);
-      return actionCallbacks.length === 1 ? recoveryAction : normalAction;
-    });
-    const reloadedView = {
-      addAction,
-      contentEl: document.createElement('div'),
-      file: { path: 'Reload.md' },
-      getMode: () => 'preview',
-    } as unknown as MarkdownView;
-    const secondRecoveryAction = document.createElement('button');
-    const removeSecondRecoveryAction = vi.spyOn(secondRecoveryAction, 'remove');
-    const secondNormalAction = document.createElement('button');
-    const secondActionCallbacks: Array<() => void> = [];
-    const secondAddAction = vi.fn((_icon: string, _label: string, callback: () => void) => {
-      secondActionCallbacks.push(callback);
-      return secondActionCallbacks.length === 1 ? secondRecoveryAction : secondNormalAction;
-    });
-    const secondReloadedView = {
-      addAction: secondAddAction,
-      contentEl: document.createElement('div'),
-      file: { path: './Reload.md' },
-      getMode: () => 'preview',
-    } as unknown as MarkdownView;
-    const checkpointError = new Error('localStorage quota exceeded');
-    const flushError = new Error('Vault unavailable');
-    const retryError = new Error('Vault still unavailable');
-    let rejectFlush!: (error: unknown) => void;
-    let requiresRecovery = true;
-    let retryAttempts = 0;
-    const oldPointerWriter = vi.fn();
-    const oldToolbar = document.createElement('div');
-    oldToolbar.dataset.inkstoneInkToolbarHost = '';
-    document.body.append(oldToolbar);
-    retainedView.contentEl.addEventListener('pointerdown', oldPointerWriter);
-    const oldController = {
-      background: vi.fn(
-        () =>
-          new Promise<void>((_resolve, reject) => {
-            rejectFlush = reject;
-          }),
-      ),
-      dispose: vi.fn(() => {
-        retainedView.contentEl.removeEventListener('pointerdown', oldPointerWriter);
-        oldToolbar.remove();
-      }),
-      retrySave: vi.fn(() => Promise.reject(new Error('The disposed controller is unreachable.'))),
-    };
-    const retryRetainedSession = vi.fn(() => {
-      retryAttempts += 1;
-      if (retryAttempts === 1) return Promise.reject(retryError);
-      requiresRecovery = false;
-      return Promise.resolve();
-    });
-    const oldManager = new ObsidianInkModeManager({
-      app: { workspace: { getLeavesOfType: () => [] } } as never,
-      deviceId: 'device-a',
-      document,
-      inkRepository: {} as never,
-      preferenceStore: {} as never,
-      recoveryStore: {
-        clear: vi.fn(),
-        load: vi.fn(),
-        save: () => {
-          throw checkpointError;
-        },
-      },
-      textRepository: {} as never,
-    });
-    const privateOldManager = oldManager as unknown as {
-      activeView: MarkdownView | null;
-      mounted: Map<MarkdownView, unknown>;
-    };
-    privateOldManager.activeView = retainedView;
-    privateOldManager.mounted.set(retainedView, {
-      complete: true,
-      controller: oldController,
-      filePath: 'folder/../Reload.md',
-      session: {
-        recoverySnapshot: () => ({ records: [{ id: 'surface-a' }], requiresRecovery }),
-        retry: retryRetainedSession,
-      },
-    });
-
-    oldManager.dispose();
-    rejectFlush(flushError);
-    await vi.waitFor(() => expect(oldController.dispose).toHaveBeenCalledTimes(1));
-    expect(document.querySelectorAll('[data-inkstone-ink-toolbar-host]')).toHaveLength(0);
-    retainedView.contentEl.dispatchEvent(new Event('pointerdown'));
-    expect(oldPointerWriter).not.toHaveBeenCalled();
-
-    const onIssue = vi.fn();
-    const newManager = new ObsidianInkModeManager({
-      app: {
-        workspace: { getActiveViewOfType: () => reloadedView, getLeavesOfType: () => [] },
-      } as never,
-      deviceId: 'device-a',
-      document,
-      inkRepository: { reclaimEmptySurfaces: () => Promise.resolve([]) } as never,
-      onIssue,
-      preferenceStore: {} as never,
-      textRepository: {} as never,
-    });
-    const newPointerWriter = vi.fn();
-    const newToolbar = document.createElement('div');
-    newToolbar.dataset.inkstoneInkToolbarHost = '';
-    const enter = vi.fn(() => {
-      document.body.append(newToolbar);
-      reloadedView.contentEl.addEventListener('pointerdown', newPointerWriter);
-    });
-    const exit = vi.fn(() => Promise.resolve());
-    const dispose = vi.fn(() => {
-      reloadedView.contentEl.removeEventListener('pointerdown', newPointerWriter);
-      newToolbar.remove();
-    });
-    const mounted = {
-      complete: true,
-      controller: { dispose, enter, exit },
-      filePath: 'Reload.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
-    };
-    const privateNewManager = newManager as unknown as {
-      ensureMounted: (view: MarkdownView, createIfMissing: boolean) => Promise<typeof mounted>;
-      mounted: Map<MarkdownView, typeof mounted>;
-    };
-    const ensureMounted = vi.fn(() => {
-      privateNewManager.mounted.set(reloadedView, mounted);
-      return Promise.resolve(mounted);
-    });
-    privateNewManager.ensureMounted = ensureMounted;
-
-    newManager.registerView(reloadedView);
-    newManager.registerView(secondReloadedView);
-    await newManager.toggle(reloadedView);
-
-    expect(addAction).toHaveBeenCalledWith(
-      expect.any(String),
-      'Retry unsaved Ink',
-      expect.any(Function),
-    );
-    expect(secondAddAction).toHaveBeenCalledWith(
-      expect.any(String),
-      'Retry unsaved Ink',
-      expect.any(Function),
-    );
-    expect(addAction).toHaveBeenCalledTimes(1);
-    expect(secondAddAction).toHaveBeenCalledTimes(1);
-    expect(ensureMounted).not.toHaveBeenCalled();
-    expect(enter).not.toHaveBeenCalled();
-
-    actionCallbacks[0]?.();
-    await vi.waitFor(() => expect(onIssue).toHaveBeenCalledWith(retryError));
-    expect(addAction).toHaveBeenCalledTimes(1);
-    expect(secondAddAction).toHaveBeenCalledTimes(1);
-    expect(removeRecoveryAction).not.toHaveBeenCalled();
-    expect(removeSecondRecoveryAction).not.toHaveBeenCalled();
-
-    actionCallbacks[0]?.();
-    secondActionCallbacks[0]?.();
-    await vi.waitFor(() => expect(addAction).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() => expect(secondAddAction).toHaveBeenCalledTimes(2));
-    await newManager.toggle(reloadedView);
-
-    expect(retryRetainedSession).toHaveBeenCalledTimes(2);
-    expect(oldController.retrySave).not.toHaveBeenCalled();
-    expect(removeRecoveryAction).toHaveBeenCalledTimes(1);
-    expect(removeSecondRecoveryAction).toHaveBeenCalledTimes(1);
-    expect(ensureMounted).toHaveBeenCalledTimes(1);
-    expect(enter).toHaveBeenCalledTimes(1);
-    expect(document.querySelectorAll('[data-inkstone-ink-toolbar-host]')).toHaveLength(1);
-    reloadedView.contentEl.dispatchEvent(new Event('pointerdown'));
-    expect(oldPointerWriter).not.toHaveBeenCalled();
-    expect(newPointerWriter).toHaveBeenCalledTimes(1);
-    await newManager.exit();
-    newManager.dispose();
-  });
-
-  it('releases a retained live owner after its canonical dispose flush succeeds', async () => {
-    const view = { contentEl: document.createElement('div') } as unknown as MarkdownView;
-    let resolveFlush!: () => void;
-    const background = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveFlush = resolve;
-        }),
-    );
-    const dispose = vi.fn();
-    const manager = new ObsidianInkModeManager({
-      app: { workspace: { getLeavesOfType: () => [] } } as never,
-      deviceId: 'device-a',
-      document,
-      inkRepository: {} as never,
-      preferenceStore: {} as never,
-      recoveryStore: {
-        clear: vi.fn(),
-        load: vi.fn(),
-        save: () => {
-          throw new Error('localStorage disabled');
-        },
-      },
-      textRepository: {} as never,
-    });
-    const privateManager = manager as unknown as {
-      activeView: MarkdownView | null;
-      mounted: Map<MarkdownView, unknown>;
-    };
-    privateManager.activeView = view;
-    privateManager.mounted.set(view, {
-      complete: true,
-      controller: { background, dispose },
-      filePath: 'Ink.md',
-      session: {
-        recoverySnapshot: () => ({ records: [{ id: 'surface-a' }], requiresRecovery: true }),
-      },
-    });
-
-    manager.dispose();
-    expect(dispose).toHaveBeenCalledTimes(1);
-    resolveFlush();
-    await vi.waitFor(() => expect(privateManager.mounted.has(view)).toBe(false));
-
-    expect(dispose).toHaveBeenCalledTimes(1);
-    expect(privateManager.activeView).toBeNull();
   });
 
   it('invalidates stale preview mounts for the same file after one owner saves', () => {
@@ -1882,61 +1932,6 @@ describe('Obsidian Ink Mode action', () => {
     expect(privateManager.mounted.has(staleView)).toBe(false);
     expect(privateManager.mounted.has(ownerView)).toBe(true);
     manager.dispose();
-  });
-
-  it('does not claim or restore a live same-file editor checkpoint while mounting a preview', async () => {
-    const getContext = vi
-      .spyOn(HTMLCanvasElement.prototype, 'getContext')
-      .mockReturnValue(canvasContext());
-    const activeView = markdownView('Ink.md');
-    const previewView = markdownView('Ink.md');
-    const canonical = inkSurface('Ink.md');
-    const claim = vi.fn();
-    const clear = vi.fn();
-    const load = vi.fn(() => null);
-    const updateSurface = vi.fn(() => Promise.resolve());
-    const manager = new ObsidianInkModeManager({
-      app: {
-        vault: { cachedRead: () => Promise.resolve('# Ink') },
-        workspace: { getLeavesOfType: () => [] },
-      } as never,
-      deviceId: 'device-a',
-      document,
-      inkRepository: {
-        listSurfaces: () => Promise.resolve({ conflicts: [], records: [canonical] }),
-        updateSurface,
-      } as never,
-      preferenceStore: {
-        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
-        save: () => undefined,
-      } as never,
-      recoveryStore: { claim, clear, load, save: vi.fn() },
-      textRepository: {
-        getOrCreateNote: () => Promise.resolve({ noteId: canonical.noteId }),
-      } as never,
-    });
-    const privateManager = manager as unknown as {
-      activeView: MarkdownView | null;
-      ensureMounted: (view: MarkdownView, createIfMissing: boolean) => Promise<unknown>;
-      mounted: Map<MarkdownView, unknown>;
-    };
-    privateManager.activeView = activeView;
-    privateManager.mounted.set(activeView, {
-      complete: true,
-      controller: { dispose: vi.fn() },
-      filePath: 'Ink.md',
-      session: {},
-    });
-
-    await expect(privateManager.ensureMounted(previewView, false)).resolves.not.toBeNull();
-
-    expect(claim).not.toHaveBeenCalled();
-    expect(load).not.toHaveBeenCalled();
-    expect(clear).not.toHaveBeenCalled();
-    expect(updateSurface).not.toHaveBeenCalled();
-    privateManager.activeView = null;
-    manager.dispose();
-    getContext.mockRestore();
   });
 
   it('serializes mounts for separate views of the same file', async () => {
@@ -2017,7 +2012,7 @@ describe('Obsidian Ink Mode action', () => {
         exit: vi.fn(() => Promise.resolve()),
       },
       filePath: 'A.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     };
     const mountedB = {
       controller: {
@@ -2099,7 +2094,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose: vi.fn(), exit: exitA },
       filePath: 'A.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     });
     const mountedB = {
       complete: true,
@@ -2127,6 +2122,383 @@ describe('Obsidian Ink Mode action', () => {
     expect(exitA).toHaveBeenCalledTimes(1);
     expect(enterB).toHaveBeenCalledTimes(1);
     expect(privateManager.activeView).toBe(viewB);
+    manager.dispose();
+  });
+
+  it('keeps a dirty session mounted when passive-leave confirmation returns Cancel', async () => {
+    const leafA = {};
+    const viewA = {
+      contentEl: document.createElement('div'),
+      leaf: leafA,
+    } as unknown as MarkdownView;
+    const viewB = { contentEl: document.createElement('div') } as unknown as MarkdownView;
+    const setActiveLeaf = vi.fn();
+    const requestUnsavedExitDecision = vi.fn(() => Promise.resolve('cancel' as const));
+    const exit = vi.fn(() => Promise.resolve());
+    const controller = {
+      background: () => Promise.resolve(),
+      dispose: vi.fn(),
+      exit,
+    };
+    const manager = new ObsidianInkModeManager({
+      app: {
+        workspace: {
+          getActiveViewOfType: () => viewB,
+          getLeavesOfType: () => [],
+          setActiveLeaf,
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      requestUnsavedExitDecision,
+      textRepository: {} as never,
+    });
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = viewA;
+    privateManager.mounted.set(viewA, {
+      complete: true,
+      controller,
+      filePath: 'A.md',
+      session: {
+        read: () => ({ state: { dirty: true, kind: 'ink-mode', saveError: null } }),
+      },
+    });
+
+    manager.handleActiveLeafChange();
+    await vi.waitFor(() => expect(requestUnsavedExitDecision).toHaveBeenCalledOnce());
+
+    expect(exit).not.toHaveBeenCalled();
+    expect(privateManager.activeView).toBe(viewA);
+    expect(setActiveLeaf).toHaveBeenCalledWith(leafA, { focus: true });
+    manager.dispose();
+  });
+
+  it('persists a dirty session before passive leave when Save is chosen', async () => {
+    const leafA = {};
+    const viewA = {
+      contentEl: document.createElement('div'),
+      leaf: leafA,
+    } as unknown as MarkdownView;
+    const viewB = { contentEl: document.createElement('div') } as unknown as MarkdownView;
+    const exit = vi.fn(() => Promise.resolve());
+    const dispose = vi.fn();
+    const requestUnsavedExitDecision = vi.fn(() => Promise.resolve('save' as const));
+    const manager = new ObsidianInkModeManager({
+      app: {
+        workspace: {
+          getActiveViewOfType: () => viewB,
+          getLeavesOfType: () => [],
+          setActiveLeaf: vi.fn(),
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { reclaimEmptySurfaces: () => Promise.resolve([]) } as never,
+      preferenceStore: {} as never,
+      requestUnsavedExitDecision,
+      textRepository: {} as never,
+    });
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = viewA;
+    privateManager.mounted.set(viewA, {
+      complete: true,
+      controller: { background: vi.fn(), dispose, exit },
+      filePath: 'A.md',
+      session: {
+        read: () => ({
+          state: { dirty: true, kind: 'ink-mode', saveError: null },
+          strokeCount: 1,
+        }),
+      },
+    });
+
+    manager.handleActiveLeafChange();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith('raw'));
+
+    expect(requestUnsavedExitDecision).toHaveBeenCalledWith({
+      filePath: 'A.md',
+      reason: 'view-close',
+    });
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(privateManager.activeView).toBeNull();
+    manager.dispose();
+  });
+
+  it('drops only the in-memory dirty session on passive leave when Discard is chosen', async () => {
+    const viewA = {
+      contentEl: document.createElement('div'),
+      leaf: {},
+    } as unknown as MarkdownView;
+    const viewB = { contentEl: document.createElement('div') } as unknown as MarkdownView;
+    const exit = vi.fn(() => Promise.resolve());
+    const dispose = vi.fn();
+    const reclaimEmptySurfaces = vi.fn(() => Promise.resolve([]));
+    const manager = new ObsidianInkModeManager({
+      app: {
+        workspace: {
+          getActiveViewOfType: () => viewB,
+          getLeavesOfType: () => [],
+          setActiveLeaf: vi.fn(),
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { reclaimEmptySurfaces } as never,
+      preferenceStore: {} as never,
+      requestUnsavedExitDecision: () => Promise.resolve('discard'),
+      textRepository: {} as never,
+    });
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = viewA;
+    privateManager.mounted.set(viewA, {
+      complete: true,
+      controller: { background: vi.fn(), dispose, exit },
+      filePath: 'A.md',
+      session: {
+        read: () => ({
+          state: { dirty: true, kind: 'ink-mode', saveError: null },
+          strokeCount: 1,
+        }),
+      },
+    });
+
+    manager.handleActiveLeafChange();
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+
+    expect(exit).not.toHaveBeenCalled();
+    expect(reclaimEmptySurfaces).toHaveBeenCalledOnce();
+    expect(privateManager.activeView).toBeNull();
+    manager.dispose();
+  });
+
+  it('keeps a dirty session mounted when its Markdown view leaves Reading View and Cancel is chosen', async () => {
+    let mode = 'preview';
+    const leaf = {};
+    const view = {
+      addAction: () => document.createElement('button'),
+      contentEl: document.createElement('div'),
+      file: { path: 'Ink.md' },
+      getMode: () => mode,
+      leaf,
+    } as unknown as MarkdownView;
+    const requestUnsavedExitDecision = vi.fn(() => Promise.resolve('cancel' as const));
+    const exit = vi.fn(() => Promise.resolve());
+    const setActiveLeaf = vi.fn();
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getLeavesOfType: () => [], setActiveLeaf } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      requestUnsavedExitDecision,
+      textRepository: {} as never,
+    });
+    manager.registerView(view);
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = view;
+    privateManager.mounted.set(view, {
+      complete: true,
+      controller: { background: vi.fn(), dispose: vi.fn(), exit },
+      filePath: 'Ink.md',
+      session: {
+        read: () => ({
+          state: { dirty: true, kind: 'ink-mode', saveError: null },
+          strokeCount: 1,
+        }),
+      },
+    });
+
+    mode = 'source';
+    manager.registerView(view);
+    await vi.waitFor(() =>
+      expect(requestUnsavedExitDecision).toHaveBeenCalledWith({
+        filePath: 'Ink.md',
+        reason: 'view-mode-change',
+      }),
+    );
+
+    expect(exit).not.toHaveBeenCalled();
+    expect(privateManager.activeView).toBe(view);
+    expect(setActiveLeaf).toHaveBeenCalledWith(leaf, { focus: true });
+    privateManager.activeView = null;
+    manager.dispose();
+  });
+
+  it('asks before detaching a dirty session when the same Markdown view switches notes', async () => {
+    const leaf = {};
+    const file = { path: 'A.md' };
+    const view = {
+      addAction: () => document.createElement('button'),
+      contentEl: document.createElement('div'),
+      file,
+      getMode: () => 'preview',
+      leaf,
+    } as unknown as MarkdownView;
+    const requestUnsavedExitDecision = vi.fn(() => Promise.resolve('cancel' as const));
+    const exit = vi.fn(() => Promise.resolve());
+    const manager = new ObsidianInkModeManager({
+      app: {
+        workspace: { getLeavesOfType: () => [], setActiveLeaf: vi.fn() },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      requestUnsavedExitDecision,
+      textRepository: {} as never,
+    });
+    manager.registerView(view);
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = view;
+    privateManager.mounted.set(view, {
+      complete: true,
+      controller: { background: vi.fn(), dispose: vi.fn(), exit },
+      filePath: 'A.md',
+      session: {
+        read: () => ({
+          state: { dirty: true, kind: 'ink-mode', saveError: null },
+          strokeCount: 1,
+        }),
+      },
+    });
+
+    file.path = 'B.md';
+    manager.registerView(view);
+    await vi.waitFor(() =>
+      expect(requestUnsavedExitDecision).toHaveBeenCalledWith({
+        filePath: 'A.md',
+        reason: 'note-switch',
+      }),
+    );
+
+    expect(exit).not.toHaveBeenCalled();
+    expect(privateManager.activeView).toBe(view);
+    privateManager.activeView = null;
+    manager.dispose();
+  });
+
+  it('asks before detaching a dirty session when layout change closes its Markdown view', async () => {
+    const leaf = {};
+    const view = { contentEl: document.createElement('div'), leaf } as unknown as MarkdownView;
+    const requestUnsavedExitDecision = vi.fn(() => Promise.resolve('cancel' as const));
+    const exit = vi.fn(() => Promise.resolve());
+    const setActiveLeaf = vi.fn();
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getLeavesOfType: () => [], setActiveLeaf } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      requestUnsavedExitDecision,
+      textRepository: {} as never,
+    });
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = view;
+    privateManager.mounted.set(view, {
+      complete: true,
+      controller: { background: vi.fn(), dispose: vi.fn(), exit },
+      filePath: 'A.md',
+      session: {
+        read: () => ({
+          state: { dirty: true, kind: 'ink-mode', saveError: null },
+          strokeCount: 1,
+        }),
+      },
+    });
+
+    manager.registerAllMarkdownViews();
+    await vi.waitFor(() =>
+      expect(requestUnsavedExitDecision).toHaveBeenCalledWith({
+        filePath: 'A.md',
+        reason: 'view-close',
+      }),
+    );
+
+    expect(exit).not.toHaveBeenCalled();
+    expect(privateManager.activeView).toBe(view);
+    expect(setActiveLeaf).toHaveBeenCalledWith(leaf, { focus: true });
+    privateManager.activeView = null;
+    manager.dispose();
+  });
+
+  it('does not enter another Ink view when the dirty owner rejects the note switch', async () => {
+    const leafA = {};
+    const viewA = {
+      contentEl: document.createElement('div'),
+      leaf: leafA,
+    } as unknown as MarkdownView;
+    const viewB = {
+      addAction: () => document.createElement('button'),
+      contentEl: document.createElement('div'),
+    } as unknown as MarkdownView;
+    const requestUnsavedExitDecision = vi.fn(() => Promise.resolve('cancel' as const));
+    const exitA = vi.fn(() => Promise.resolve());
+    const ensureMounted = vi.fn();
+    const manager = new ObsidianInkModeManager({
+      app: {
+        workspace: {
+          getActiveViewOfType: () => viewB,
+          getLeavesOfType: () => [],
+          setActiveLeaf: vi.fn(),
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      requestUnsavedExitDecision,
+      textRepository: {} as never,
+    });
+    manager.registerView(viewB);
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      ensureMounted: typeof ensureMounted;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = viewA;
+    privateManager.mounted.set(viewA, {
+      complete: true,
+      controller: { background: vi.fn(), dispose: vi.fn(), exit: exitA },
+      filePath: 'A.md',
+      session: {
+        read: () => ({
+          state: { dirty: true, kind: 'ink-mode', saveError: null },
+          strokeCount: 1,
+        }),
+      },
+    });
+    privateManager.ensureMounted = ensureMounted;
+
+    await manager.toggle(viewB);
+
+    expect(requestUnsavedExitDecision).toHaveBeenCalledWith({
+      filePath: 'A.md',
+      reason: 'note-switch',
+    });
+    expect(exitA).not.toHaveBeenCalled();
+    expect(ensureMounted).not.toHaveBeenCalled();
+    expect(privateManager.activeView).toBe(viewA);
+    privateManager.activeView = null;
     manager.dispose();
   });
 
@@ -2171,7 +2543,7 @@ describe('Obsidian Ink Mode action', () => {
         exit: exitA,
       },
       filePath: 'A.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     });
     privateManager.ensureMounted = ensureMounted;
 
@@ -2221,7 +2593,7 @@ describe('Obsidian Ink Mode action', () => {
         hidePreview,
       },
       filePath: 'Ink.md',
-      session: { snapshot: () => ({ surface: { strokes: [{ id: 'saved' }] } }) },
+      session: { read: () => ({ strokeCount: 1 }) },
     });
 
     const exiting = manager.exit();
@@ -2361,7 +2733,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Ink.md',
-      session: { snapshot: () => ({ surface: { strokes: [] } }) },
+      session: { read: () => ({ strokeCount: 0 }) },
     });
     privateManager.ensureMounted = vi.fn(() => Promise.resolve(null));
 
@@ -2425,11 +2797,8 @@ describe('Obsidian Ink Mode action', () => {
         load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
         save: () => undefined,
       } as never,
-      recoveryStore: {
-        claim: () => undefined,
-        clear: () => undefined,
-        load: () => null,
-        save: () => 'generation-a',
+      liveFirstPersistence: {
+        legacyRecoveryReader: { load: () => null },
       },
       textRepository: {
         getOrCreateNote: () => Promise.resolve({ noteId: persisted.noteId }),
@@ -2481,6 +2850,251 @@ describe('Obsidian Ink Mode action', () => {
     expect(action.getAttribute('aria-label')).toBe('完成涂鸦并预览');
     manager.dispose();
     getContext.mockRestore();
+  });
+
+  it('migrates an unacknowledged v4 journal after restart without rewriting the legacy store', async () => {
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const view = markdownView('Ink.md');
+    const original = inkSurface('Ink.md');
+    let persisted = original;
+    const recovered = {
+      ...original,
+      strokes: [...original.strokes, inkStroke('recovered-after-quota')],
+    };
+    const loadLegacy = vi.fn(() => ({
+      acknowledgedRecords: [original],
+      acknowledgedSequence: 0,
+      baseRecords: [original],
+      capturedAt: '2026-07-19T00:00:00.000Z',
+      filePath: 'Ink.md',
+      generation: 'legacy-v4',
+      lastSequence: 1,
+      records: [recovered],
+      version: 4 as const,
+    }));
+    const onIssue = vi.fn();
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () => Promise.resolve({ conflicts: [], issues: [], records: [persisted] }),
+        updateSurface: (record: InkSurfaceRecord) => {
+          persisted = record;
+          return Promise.resolve(record);
+        },
+      } as never,
+      onIssue,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      liveFirstPersistence: { legacyRecoveryReader: { load: loadLegacy } },
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: original.noteId }),
+      } as never,
+    });
+
+    await manager.toggle(view);
+
+    expect(persisted.strokes.map(({ id }) => id)).toEqual(['stroke-a', 'recovered-after-quota']);
+    expect(onIssue).not.toHaveBeenCalled();
+    expect(loadLegacy).toHaveBeenCalledWith('Ink.md');
+    manager.dispose();
+    getContext.mockRestore();
+  });
+
+  it('re-enters Ink Mode after a flushed whole-surface deletion without replaying its stale v4 base', async () => {
+    globalThis.localStorage.clear();
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_200));
+    const view = {
+      addAction: () => document.createElement('button'),
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    let persisted = inkSurface('Ink.md');
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: {
+          getActiveViewOfType: () => view,
+          getLeavesOfType: () => [],
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () => Promise.resolve({ conflicts: [], issues: [], records: [persisted] }),
+        reclaimEmptySurfaces: () => Promise.resolve([]),
+        updateSurface: (record: InkSurfaceRecord) => {
+          persisted = record;
+          return Promise.resolve(record);
+        },
+        writeSurface: (record: InkSurfaceRecord) => {
+          persisted = record;
+          return Promise.resolve();
+        },
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: persisted.noteId }),
+      } as never,
+    });
+
+    await manager.toggle(view);
+    await manager.prepareFileMutation('Ink.md');
+    persisted = {
+      ...persisted,
+      deletedAt: '2026-07-18T06:00:00.000Z',
+      revision: persisted.revision + 1,
+      updatedAt: '2026-07-18T06:00:00.000Z',
+    };
+
+    await expect(manager.toggle(view)).resolves.toBeUndefined();
+
+    manager.dispose();
+    getContext.mockRestore();
+    globalThis.localStorage.clear();
+  });
+
+  it('opens Ink Mode after a pre-fix acknowledged v4 base outlives a canonical whole-surface deletion', async () => {
+    globalThis.localStorage.clear();
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext());
+    const contentEl = document.createElement('div');
+    contentEl.append(readingHost(1_200));
+    const view = {
+      addAction: () => document.createElement('button'),
+      contentEl,
+      file: { path: 'Ink.md' },
+      getMode: () => 'preview',
+    } as unknown as MarkdownView;
+    const original = inkSurface('Ink.md');
+    let persisted: InkSurfaceRecord = {
+      ...original,
+      deletedAt: '2026-07-18T06:00:00.000Z',
+      revision: original.revision + 1,
+      updatedAt: '2026-07-18T06:00:00.000Z',
+    };
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: {
+          getActiveViewOfType: () => view,
+          getLeavesOfType: () => [],
+        },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        listSurfaces: () => Promise.resolve({ conflicts: [], issues: [], records: [persisted] }),
+        reclaimEmptySurfaces: () => Promise.resolve([]),
+        updateSurface: (record: InkSurfaceRecord) => {
+          persisted = record;
+          return Promise.resolve(record);
+        },
+        writeSurface: (record: InkSurfaceRecord) => {
+          persisted = record;
+          return Promise.resolve();
+        },
+      } as never,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      liveFirstPersistence: {
+        legacyRecoveryReader: {
+          load: () => ({
+            acknowledgedRecords: [original],
+            acknowledgedSequence: 0,
+            baseRecords: [original],
+            capturedAt: original.updatedAt,
+            filePath: 'Ink.md',
+            generation: 'pre-fix-generation',
+            lastSequence: 0,
+            records: [original],
+            version: 4,
+          }),
+        },
+      },
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: persisted.noteId }),
+      } as never,
+    });
+
+    await expect(manager.toggle(view)).resolves.toBeUndefined();
+
+    manager.dispose();
+    getContext.mockRestore();
+    globalThis.localStorage.clear();
+  });
+
+  it('ignores a stale mismatched v4 checkpoint without blocking the canonical document', async () => {
+    const original = inkSurface('Ink.md');
+    const recovered = { ...original, strokes: [...original.strokes, inkStroke('local')] };
+    const updateSurface = vi.fn(() => Promise.resolve());
+    const onIssue = vi.fn();
+    const manager = new ObsidianInkModeManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Ink') },
+        workspace: { getActiveViewOfType: () => null, getLeavesOfType: () => [] },
+      } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {
+        updateSurface,
+      } as never,
+      onIssue,
+      preferenceStore: {
+        load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
+        save: () => undefined,
+      } as never,
+      liveFirstPersistence: {
+        legacyRecoveryReader: {
+          load: () => ({
+            acknowledgedRecords: [original],
+            acknowledgedSequence: 0,
+            baseRecords: [original],
+            capturedAt: '2026-07-18T05:59:00.000Z',
+            filePath: 'Ink.md',
+            generation: 'pre-fix-generation',
+            lastSequence: 1,
+            records: [recovered],
+            version: 4 as const,
+          }),
+        },
+      },
+      textRepository: {
+        getOrCreateNote: () => Promise.resolve({ noteId: original.noteId }),
+      } as never,
+    });
+    const restoreLocalRecovery = (
+      manager as unknown as {
+        restoreLocalRecovery: (
+          filePath: string,
+          canonical: readonly InkSurfaceRecord[],
+        ) => Promise<readonly InkSurfaceRecord[]>;
+      }
+    ).restoreLocalRecovery.bind(manager);
+
+    await expect(restoreLocalRecovery('Ink.md', [])).resolves.toEqual([]);
+    expect(onIssue).not.toHaveBeenCalled();
+    expect(updateSurface).not.toHaveBeenCalled();
+    manager.dispose();
   });
 
   it('propagates final-stroke removal to another tab before its stale discovery lands', async () => {
@@ -2543,11 +3157,8 @@ describe('Obsidian Ink Mode action', () => {
         load: () => ({ color: '#d97777', hintShown: true, tool: 'pen', width: 4 }),
         save: () => undefined,
       } as never,
-      recoveryStore: {
-        claim: () => undefined,
-        clear: () => undefined,
-        load: () => null,
-        save: () => 'generation-a',
+      liveFirstPersistence: {
+        legacyRecoveryReader: { load: () => null },
       },
       textRepository: {
         getOrCreateNote: () => Promise.resolve({ noteId: persisted.noteId }),
@@ -2617,7 +3228,7 @@ describe('Obsidian Ink Mode action', () => {
       complete: true,
       controller: { dispose, exit },
       filePath: 'Ink.md',
-      session: { snapshot: () => ({ surface: { strokes: [{ id: 'saved' }] } }) },
+      session: { read: () => ({ strokeCount: 1 }) },
     });
 
     await manager.exit();

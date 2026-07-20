@@ -46,6 +46,8 @@ export class LocalInkToolPreferenceStore {
   });
 
   readonly key: string;
+  private persistentWritesAvailable = true;
+  private volatilePreference: InkToolPreference | null = null;
 
   constructor(
     private readonly storage: Storage,
@@ -56,6 +58,7 @@ export class LocalInkToolPreferenceStore {
   }
 
   load(): InkToolPreference {
+    if (this.volatilePreference !== null) return this.volatilePreference;
     const contents = this.storage.getItem(this.key);
     if (contents === null) return LocalInkToolPreferenceStore.DEFAULT;
     try {
@@ -68,7 +71,15 @@ export class LocalInkToolPreferenceStore {
 
   save(preference: InkToolPreference): void {
     if (!isPreference(preference)) throw new Error('Ink tool preference is invalid.');
-    this.storage.setItem(this.key, JSON.stringify(preference));
+    this.volatilePreference = preference;
+    if (!this.persistentWritesAvailable) return;
+    try {
+      this.storage.setItem(this.key, JSON.stringify(preference));
+    } catch {
+      // Tool preferences are non-canonical. A full legacy Recovery keyspace must not turn a
+      // harmless color/width update into a repeating quota Notice or block Ink input.
+      this.persistentWritesAvailable = false;
+    }
   }
 }
 

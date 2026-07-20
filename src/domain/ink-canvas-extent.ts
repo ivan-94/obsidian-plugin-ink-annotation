@@ -1,6 +1,8 @@
 import type { InkSurfaceRecord } from './ink-surface';
+import { SharedInkStrokeGeometry } from './ink-shared-stroke-geometry';
 
 export const INK_SAFE_EDITING_MARGIN = 512;
+const SHARED_INK_GEOMETRY = new SharedInkStrokeGeometry();
 
 export function measureInkCanvasExtent(records: readonly InkSurfaceRecord[]): number {
   return inspectInkCanvasExtent(records).currentExtent;
@@ -55,17 +57,16 @@ function inspectInkCanvasExtent(records: readonly InkSurfaceRecord[]): {
   let farthestInkBound = 0;
   records.forEach((record, index) => {
     const originY =
-      record.schemaVersion === 2 ? (record.layout.originY as number) : cumulativeOrigin;
+      record.schemaVersion >= 2 ? (record.layout.originY as number) : cumulativeOrigin;
     const endY = originY + record.layout.logicalHeight;
     if (endY > currentExtent) {
       currentExtent = endY;
       finalChunkIndex = index;
     }
     for (const stroke of record.strokes) {
-      const radius = stroke.width / 2;
-      for (const point of stroke.points) {
-        farthestInkBound = Math.max(farthestInkBound, originY + point.y + radius);
-      }
+      if (stroke.tool === 'eraser') continue;
+      const bounds = SHARED_INK_GEOMETRY.bounds(stroke);
+      farthestInkBound = Math.max(farthestInkBound, originY + bounds.y + bounds.height);
     }
     cumulativeOrigin = endY;
   });

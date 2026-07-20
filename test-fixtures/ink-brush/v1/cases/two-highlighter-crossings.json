@@ -1,0 +1,86 @@
+{
+  "cases": [
+    {
+      "id": "self-overlap-and-distinct-crossing",
+      "kind": "logical-scene",
+      "strokes": [
+        {
+          "brush": {
+            "color": "#ffd54f",
+            "inputProfile": { "pressure": "measured", "tilt": "unavailable" },
+            "tool": "highlighter",
+            "version": "highlighter-chisel-v1"
+          },
+          "id": "highlighter-a",
+          "points": [
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.5 },
+              "time": 0,
+              "x": 10,
+              "y": 50
+            },
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.5 },
+              "time": 10,
+              "x": 90,
+              "y": 50
+            },
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.5 },
+              "time": 20,
+              "x": 10,
+              "y": 50
+            }
+          ]
+        },
+        {
+          "brush": {
+            "color": "#ffd54f",
+            "inputProfile": { "pressure": "measured", "tilt": "unavailable" },
+            "tool": "highlighter",
+            "version": "highlighter-chisel-v1"
+          },
+          "id": "highlighter-b",
+          "points": [
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.5 },
+              "time": 30,
+              "x": 50,
+              "y": 10
+            },
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.5 },
+              "time": 40,
+              "x": 50,
+              "y": 90
+            }
+          ]
+        }
+      ],
+      "surfaces": [{ "id": "surface-a", "maximumY": 100, "minimumY": 0 }]
+    }
+  ],
+  "fixtureSchemaVersion": 1,
+  "id": "two-highlighter-crossings",
+  "kind": "synthetic"
+}

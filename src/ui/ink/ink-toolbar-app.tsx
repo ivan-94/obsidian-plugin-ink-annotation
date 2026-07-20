@@ -10,6 +10,7 @@ export interface InkToolbarAppProps {
   readonly onDone: () => void;
   readonly onDragKeyDown: (event: KeyboardEvent) => void;
   readonly onDragStart: (event: PointerEvent) => void;
+  readonly onExportUnsaved: () => void;
   readonly onRedo: () => void;
   readonly onRetry: () => void;
   readonly onSelectMove: () => void;
@@ -196,8 +197,17 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         onClick={props.onRetry}
         text="Retry"
       />
+      <ToolbarButton
+        data={{ inkstoneInkExportUnsaved: 'true' }}
+        hidden={state.saveError === null}
+        icon="download"
+        label="Export retained unsaved Ink as SVG"
+        onClick={props.onExportUnsaved}
+        text="Export"
+      />
       <span
         aria-live="polite"
+        data-inkstone-ink-error={state.saveError ?? undefined}
         data-inkstone-ink-status="true"
         hidden={state.saveError === null}
         role="status"

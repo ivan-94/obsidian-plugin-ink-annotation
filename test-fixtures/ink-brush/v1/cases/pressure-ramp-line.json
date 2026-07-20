@@ -1,0 +1,69 @@
+{
+  "cases": [
+    {
+      "batchings": [
+        {
+          "batches": [
+            { "phase": "down", "sampleIndexes": [0] },
+            { "phase": "move", "sampleIndexes": [1, 2] },
+            { "phase": "up", "sampleIndexes": [3] }
+          ],
+          "id": "ordered-ramp"
+        }
+      ],
+      "brush": {
+        "color": "#111111",
+        "inputProfile": { "pressure": "measured", "tilt": "unavailable" },
+        "tool": "pen",
+        "version": "pen-physical-v1"
+      },
+      "id": "monotonic-pressure-ramp",
+      "kind": "normalized-contact",
+      "samples": [
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "measured", "value": 0.2 },
+          "time": 0,
+          "x": 0,
+          "y": 0
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "measured", "value": 0.4 },
+          "time": 8,
+          "x": 10,
+          "y": 0
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "measured", "value": 0.7 },
+          "time": 16,
+          "x": 20,
+          "y": 0
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "unavailable" },
+            "azimuth": { "kind": "unavailable" }
+          },
+          "pressure": { "kind": "measured", "value": 0.9 },
+          "time": 24,
+          "x": 30,
+          "y": 0
+        }
+      ]
+    }
+  ],
+  "fixtureSchemaVersion": 1,
+  "id": "pressure-ramp-line",
+  "kind": "synthetic"
+}

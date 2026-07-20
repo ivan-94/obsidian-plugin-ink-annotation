@@ -1,23 +1,76 @@
 import { describe, expect, it } from 'vitest';
 
-import { encodeInkSurfaceRecord, type InkSurfaceRecord } from '../domain/ink-surface';
+import { digestInkBrushGolden } from '../domain/ink-brush-contract';
+import { SharedInkStrokeGeometry } from '../domain/ink-shared-stroke-geometry';
+import {
+  decodeInkSurfaceRecord,
+  encodeInkSurfaceRecord,
+  type InkStroke,
+  type InkSurfaceRecord,
+} from '../domain/ink-surface';
+import { joinInkStrokeSurfaceFragments } from '../domain/ink-surface-layout';
+import { upgradeInkSurfaceRecordsToV3 } from '../domain/ink-surface-migration';
 import { normalizeVaultPath, SidecarRepository, type TextFileStore } from './sidecar-repository';
-import { InkSurfaceConflictError, InkSurfaceRepository } from './ink-surface-repository';
+import {
+  affectedInkSummarySurfaceIds,
+  InkSurfaceCorruptError,
+  InkSurfaceConflictError,
+  InkSurfaceRepository,
+  InkSurfaceUnsupportedError,
+} from './ink-surface-repository';
 
 describe('ink surface repository contract', () => {
   it('creates, reads and updates one canonical surface file under the note identity', async () => {
     const { repository, surface, store } = await createFixture();
 
     await repository.writeSurface(surface);
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(surface);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(surface),
+    );
 
     const updated = revision(surface, 2, [stroke('stroke-1')]);
     await repository.updateSurface(updated);
 
     await expect(
       new InkSurfaceRepository(store).readSurface(surface.filePath, surface.id),
-    ).resolves.toEqual(updated);
+    ).resolves.toEqual(persisted(updated));
     expect(store.readBySuffix(`/surfaces/${surface.id}.json`)).toContain('"stroke-1"');
+  });
+
+  it('rechecks the cold-lane checkpoint after an in-flight canonical write resolves', async () => {
+    const { repository, surface, store } = await createFixture();
+    await repository.writeSurface(surface);
+    const heldWrite = store.holdNextSurfaceWrite();
+    let interactionActive = false;
+    let releaseCheckpoint = (): void => undefined;
+    const checkpoint = (): Promise<void> =>
+      interactionActive
+        ? new Promise<void>((resolve) => {
+            releaseCheckpoint = resolve;
+          })
+        : Promise.resolve();
+    let completed = false;
+
+    const update = repository
+      .updateSurface(revision(surface, 2, [stroke('checkpointed')]), surface, checkpoint)
+      .then(() => {
+        completed = true;
+      });
+    await heldWrite.entered;
+    interactionActive = true;
+    heldWrite.release();
+    const beforeRelease = await Promise.race([
+      update.then(() => 'completed' as const),
+      new Promise<'blocked'>((resolve) => setTimeout(() => resolve('blocked'), 10)),
+    ]);
+
+    expect(beforeRelease).toBe('blocked');
+    expect(completed).toBe(false);
+
+    interactionActive = false;
+    releaseCheckpoint();
+    await update;
+    expect(completed).toBe(true);
   });
 
   it('serializes writes per surface and rejects a concurrent stale branch', async () => {
@@ -44,7 +97,110 @@ describe('ink surface repository contract', () => {
     await expect(
       repository.updateSurface(revision(surface, 3, [stroke('leapfrog')])),
     ).rejects.toThrow(/exactly one revision/u);
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(surface);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(surface),
+    );
+  });
+
+  it('rejects a single-surface v2-to-v3 update without changing a multi-surface legacy note', async () => {
+    const { repository, surface, store } = await createFixture();
+    const first = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2,
+    } as const;
+    const second = {
+      ...first,
+      id: 'surface-2',
+      layout: { ...first.layout, originY: first.layout.logicalHeight },
+    };
+    await repository.writeSurface(first);
+    await repository.writeSurface(second);
+    const before = [
+      store.readBySuffix(`/surfaces/${first.id}.json`),
+      store.readBySuffix(`/surfaces/${second.id}.json`),
+    ];
+
+    await expect(
+      repository.updateSurface({ ...revision(first, 2, []), schemaVersion: 3 }),
+    ).rejects.toThrow(/cold whole-document upgrade/u);
+
+    expect([
+      store.readBySuffix(`/surfaces/${first.id}.json`),
+      store.readBySuffix(`/surfaces/${second.id}.json`),
+    ]).toEqual(before);
+    expect(store.readBySuffix('/ink-batch-journal.json')).toBeNull();
+  });
+
+  it('atomically accepts only the exact cold schema-v3 normalization of every active surface', async () => {
+    const { repository, surface } = await createFixture();
+    const first = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2,
+      strokes: [stroke('legacy-a')],
+    } as const;
+    const second = {
+      ...first,
+      id: 'surface-2',
+      layout: { ...first.layout, originY: first.layout.logicalHeight },
+      strokes: [stroke('legacy-b')],
+    };
+    await repository.writeSurface(first);
+    await repository.writeSurface(second);
+    const upgraded = upgradeInkSurfaceRecordsToV3([first, second], '2026-07-19T10:00:00.000Z');
+
+    await repository.upgradeSurfacesToSchemaV3(upgraded, [first, second]);
+
+    await expect(repository.listSurfaces(surface.filePath)).resolves.toMatchObject({
+      records: [
+        {
+          revision: 2,
+          schemaVersion: 3,
+          strokes: [{ brushRenderVersion: 'legacy-round-v1', id: 'legacy-a' }],
+        },
+        {
+          revision: 2,
+          schemaVersion: 3,
+          strokes: [{ brushRenderVersion: 'legacy-round-v1', id: 'legacy-b' }],
+        },
+      ],
+    });
+  });
+
+  it('rejects creating one v3 surface beside active legacy surfaces without changing canonical bytes', async () => {
+    const { repository, surface, store } = await createFixture();
+    const first = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2,
+    } as const;
+    const second = {
+      ...first,
+      id: 'surface-2',
+      layout: { ...first.layout, originY: first.layout.logicalHeight },
+    };
+    await repository.writeSurface(first);
+    await repository.writeSurface(second);
+    const before = [
+      store.readBySuffix(`/surfaces/${first.id}.json`),
+      store.readBySuffix(`/surfaces/${second.id}.json`),
+    ];
+
+    await expect(
+      repository.writeSurface({
+        ...second,
+        id: 'surface-3',
+        layout: { ...second.layout, originY: second.layout.originY + second.layout.logicalHeight },
+        schemaVersion: 3,
+      }),
+    ).rejects.toThrow(/mixed legacy and schema v3/u);
+
+    expect([
+      store.readBySuffix(`/surfaces/${first.id}.json`),
+      store.readBySuffix(`/surfaces/${second.id}.json`),
+    ]).toEqual(before);
+    expect(store.readBySuffix('/surfaces/surface-3.json')).toBeNull();
   });
 
   it('treats an identical single-surface retry as idempotent', async () => {
@@ -54,7 +210,9 @@ describe('ink surface repository contract', () => {
     await repository.updateSurface(next);
 
     await expect(repository.updateSurface(next)).resolves.toBeUndefined();
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(next);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(next),
+    );
   });
 
   it('does not report a canonical write as failed when a projection event throws', async () => {
@@ -81,7 +239,9 @@ describe('ink surface repository contract', () => {
 
     expect(changed).toEqual([surface, next, next]);
     expect(issues).toEqual([expect.objectContaining({ message: 'subscriber unavailable' })]);
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(next);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(next),
+    );
   });
 
   it('advances a single surface only from the exact expected base record', async () => {
@@ -94,7 +254,9 @@ describe('ink surface repository contract', () => {
 
     await expect(repository.updateSurface(third, divergentBase)).rejects.toThrow(/expected base/u);
     await expect(repository.updateSurface(third, second)).resolves.toBeUndefined();
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(third);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(third),
+    );
   });
 
   it('serializes canonical revisions across repository instances that share one vault', async () => {
@@ -217,7 +379,7 @@ describe('ink surface repository contract', () => {
       repository.updateSurface(revision(surface, 2, [stroke('local-stale')])),
     ).rejects.toThrow(/advance exactly one revision/u);
     await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
-      visibleNewer,
+      persisted(visibleNewer),
     );
   });
 
@@ -242,6 +404,137 @@ describe('ink surface repository contract', () => {
     await expect(repository.readSurface(surface.filePath, surface.id)).rejects.toBeInstanceOf(
       InkSurfaceConflictError,
     );
+  });
+
+  it.each([
+    [2, 3],
+    [3, 2],
+  ] as const)(
+    'fails closed on a higher-revision schema-v%s artifact paired with a lower-revision schema-v%s sibling',
+    async (higherSchema, lowerSchema) => {
+      const { repository, surface, store } = await createFixture();
+      const higher: InkSurfaceRecord = {
+        ...surface,
+        layout: { ...surface.layout, originY: 0 },
+        revision: 2,
+        schemaVersion: higherSchema,
+      };
+      await repository.writeSurface(higher);
+      const lower: InkSurfaceRecord = {
+        ...persisted(higher),
+        revision: 1,
+        schemaVersion: lowerSchema,
+      };
+      store.addSurfaceArtifact(`${surface.id} mixed-schema.json`, encodeInkSurfaceRecord(lower));
+      const before = store.readBySuffix(`/surfaces/${surface.id}.json`);
+
+      const loaded = await repository.listSurfaces(surface.filePath);
+
+      expect(loaded.records).toEqual([]);
+      expect(loaded.conflicts).toMatchObject([
+        { kind: 'schema-version-mismatch', surfaceId: surface.id },
+      ]);
+      expect(loaded.issues).toMatchObject([{ kind: 'conflict' }]);
+      expect(loaded.issues[0]?.message).toMatch(/schema-version-mismatch/u);
+      await expect(repository.readSurface(surface.filePath, surface.id)).rejects.toBeInstanceOf(
+        InkSurfaceConflictError,
+      );
+      await expect(repository.updateSurface(revision(higher, 3, []))).rejects.toBeInstanceOf(
+        InkSurfaceConflictError,
+      );
+      expect(store.readBySuffix(`/surfaces/${surface.id}.json`)).toBe(before);
+    },
+  );
+
+  it('blocks creating another surface while the note has a schema-version conflict', async () => {
+    const { repository, surface, store } = await createFixture();
+    const conflictedV2 = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2 as const,
+    };
+    await repository.writeSurface(conflictedV2);
+    store.addSurfaceArtifact(
+      `${surface.id} mixed-schema.json`,
+      encodeInkSurfaceRecord({ ...persisted(conflictedV2), schemaVersion: 3 }),
+    );
+    const newSurface = { ...conflictedV2, id: 'surface-new' };
+
+    await expect(repository.writeSurface(newSurface)).rejects.toBeInstanceOf(
+      InkSurfaceConflictError,
+    );
+
+    expect(store.readBySuffix(`/surfaces/${newSurface.id}.json`)).toBeNull();
+  });
+
+  it('blocks updating an unaffected surface while another surface has a schema-version conflict', async () => {
+    const { repository, surface, store } = await createFixture();
+    const conflictedV2 = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2 as const,
+    };
+    const unaffected = {
+      ...conflictedV2,
+      id: 'surface-unaffected',
+      layout: { ...conflictedV2.layout, originY: conflictedV2.layout.logicalHeight },
+    };
+    await repository.writeSurface(conflictedV2);
+    await repository.writeSurface(unaffected);
+    store.addSurfaceArtifact(
+      `${surface.id} mixed-schema.json`,
+      encodeInkSurfaceRecord({ ...persisted(conflictedV2), schemaVersion: 3 }),
+    );
+    const before = store.readBySuffix(`/surfaces/${unaffected.id}.json`);
+
+    await expect(
+      repository.updateSurface(revision(unaffected, 2, [stroke('must-not-land')])),
+    ).rejects.toBeInstanceOf(InkSurfaceConflictError);
+
+    expect(store.readBySuffix(`/surfaces/${unaffected.id}.json`)).toBe(before);
+  });
+
+  it('blocks an atomic batch while another surface has a schema-version conflict', async () => {
+    const { repository, surface, store } = await createFixture();
+    const conflictedV2 = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2 as const,
+    };
+    const first = {
+      ...conflictedV2,
+      id: 'surface-batch-a',
+      layout: { ...conflictedV2.layout, originY: conflictedV2.layout.logicalHeight },
+    };
+    const second = {
+      ...conflictedV2,
+      id: 'surface-batch-b',
+      layout: { ...conflictedV2.layout, originY: conflictedV2.layout.logicalHeight * 2 },
+    };
+    await repository.writeSurface(conflictedV2);
+    await repository.writeSurface(first);
+    await repository.writeSurface(second);
+    store.addSurfaceArtifact(
+      `${surface.id} mixed-schema.json`,
+      encodeInkSurfaceRecord({ ...persisted(conflictedV2), schemaVersion: 3 }),
+    );
+    const before = [
+      store.readBySuffix(`/surfaces/${first.id}.json`),
+      store.readBySuffix(`/surfaces/${second.id}.json`),
+    ];
+
+    await expect(
+      repository.updateSurfacesAtomically([
+        revision(first, 2, [stroke('must-not-land-a')]),
+        revision(second, 2, [stroke('must-not-land-b')]),
+      ]),
+    ).rejects.toBeInstanceOf(InkSurfaceConflictError);
+
+    expect([
+      store.readBySuffix(`/surfaces/${first.id}.json`),
+      store.readBySuffix(`/surfaces/${second.id}.json`),
+    ]).toEqual(before);
+    expect(store.readBySuffix('/ink-batch-journal.json')).toBeNull();
   });
 
   it('resolves an explicitly reviewed Ink candidate to a higher canonical revision', async () => {
@@ -317,7 +610,24 @@ describe('ink surface repository contract', () => {
       repository.reclaimEmptySurfaces(structural.filePath, '2026-07-15T12:00:00.000Z', 'device-a'),
     ).resolves.toEqual([]);
     await expect(repository.readSurface(structural.filePath, structural.id)).resolves.toEqual(
-      structural,
+      persisted(structural),
+    );
+  });
+
+  it('retains empty v3 chunks because they define the continuous canvas extent', async () => {
+    const { repository, surface } = await createFixture();
+    const structural: InkSurfaceRecord = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    await repository.writeSurface(structural);
+
+    await expect(
+      repository.reclaimEmptySurfaces(structural.filePath, '2026-07-15T12:00:00.000Z', 'device-a'),
+    ).resolves.toEqual([]);
+    await expect(repository.readSurface(structural.filePath, structural.id)).resolves.toEqual(
+      persisted(structural),
     );
   });
 
@@ -342,7 +652,9 @@ describe('ink surface repository contract', () => {
       'Injected partial write',
     );
 
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(surface);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(surface),
+    );
     expect(changes).toEqual([`${surface.id}:1`]);
   });
 
@@ -360,8 +672,12 @@ describe('ink surface repository contract', () => {
       ]),
     ).rejects.toThrow('Injected partial write');
 
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(surface);
-    await expect(repository.readSurface(second.filePath, second.id)).resolves.toEqual(second);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(surface),
+    );
+    await expect(repository.readSurface(second.filePath, second.id)).resolves.toEqual(
+      persisted(second),
+    );
   });
 
   it('rejects an atomic batch that leapfrogs canonical revisions', async () => {
@@ -379,6 +695,85 @@ describe('ink surface repository contract', () => {
     await expect(repository.listSurfaces(surface.filePath)).resolves.toMatchObject({
       records: [surface, second],
     });
+  });
+
+  it('rejects an ordinary all-surface v2-to-v3 atomic update outside the cold upgrade API', async () => {
+    const { repository, surface, store } = await createFixture();
+    const first = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2,
+    } as const;
+    const second = {
+      ...first,
+      id: 'surface-2',
+      layout: { ...first.layout, originY: first.layout.logicalHeight },
+    };
+    await repository.writeSurface(first);
+    await repository.writeSurface(second);
+    const before = [
+      store.readBySuffix(`/surfaces/${first.id}.json`),
+      store.readBySuffix(`/surfaces/${second.id}.json`),
+    ];
+
+    await expect(
+      repository.updateSurfacesAtomically(
+        [
+          { ...revision(first, 2, []), schemaVersion: 3 },
+          { ...revision(second, 2, []), schemaVersion: 3 },
+        ],
+        [first, second],
+      ),
+    ).rejects.toThrow(/cold whole-document upgrade/u);
+
+    expect([
+      store.readBySuffix(`/surfaces/${first.id}.json`),
+      store.readBySuffix(`/surfaces/${second.id}.json`),
+    ]).toEqual(before);
+  });
+
+  it('reuses one note snapshot across conflict validation and a single-surface update', async () => {
+    const { repository, surface, store } = await createFixture();
+    const second = { ...surface, id: 'surface-2' };
+    const third = { ...surface, id: 'surface-3' };
+    await repository.writeSurface(surface);
+    await repository.writeSurface(second);
+    await repository.writeSurface(third);
+    store.resetReadCounts();
+
+    await repository.updateSurface(revision(surface, 2, [stroke('updated')]));
+
+    expect(store.readCountBySuffix('/surface-2.json')).toBe(1);
+    expect(store.readCountBySuffix('/surface-3.json')).toBe(1);
+  });
+
+  it('rebuilds linked summaries only for surfaces sharing a changed logical stroke', () => {
+    const first = { ...surfaceFixture(), id: 'surface-1', schemaVersion: 3 as const };
+    const second = { ...first, id: 'surface-2' };
+    const third = { ...first, id: 'surface-3' };
+    const changed = {
+      ...first,
+      strokes: [{ ...physicalPenStroke('changed'), linkedStrokeId: 'logical-changed' }],
+    };
+    const linkedNeighbor = {
+      ...second,
+      strokes: [{ ...physicalPenStroke('neighbor'), linkedStrokeId: 'logical-changed' }],
+    };
+
+    expect(
+      affectedInkSummarySurfaceIds({
+        current: [changed, second, third],
+        previous: [first, second, third],
+        replacements: [changed],
+      }),
+    ).toEqual(['surface-1']);
+    expect(
+      affectedInkSummarySurfaceIds({
+        current: [changed, linkedNeighbor, third],
+        previous: [first, linkedNeighbor, third],
+        replacements: [changed],
+      }),
+    ).toEqual(['surface-1', 'surface-2']);
   });
 
   it('treats an entirely identical atomic retry as idempotent', async () => {
@@ -475,8 +870,12 @@ describe('ink surface repository contract', () => {
       ]),
     ).rejects.toThrow('Injected journal promotion failure');
 
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(surface);
-    await expect(repository.readSurface(second.filePath, second.id)).resolves.toEqual(second);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(surface),
+    );
+    await expect(repository.readSurface(second.filePath, second.id)).resolves.toEqual(
+      persisted(second),
+    );
     expect(store.readBySuffix('/ink-batch-journal.json')).toBeNull();
   });
 
@@ -695,6 +1094,90 @@ describe('ink surface repository contract', () => {
     await expect(repository.listSurfaces(surface.filePath)).rejects.toThrow(/journal is invalid/u);
   });
 
+  it('rejects recovery of a v2-to-v3 batch journal that has no prepared plan identity', async () => {
+    const { repository, surface, store } = await createFixture();
+    const base = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2,
+    } as const;
+    await repository.writeSurface(base);
+    const surfacePath = store.pathBySuffix(`/surfaces/${surface.id}.json`);
+    if (surfacePath === null) throw new Error('Missing canonical surface fixture path.');
+    const journalPath = `${surfacePath.slice(0, surfacePath.lastIndexOf('/surfaces/'))}/ink-batch-journal.json`;
+    const candidate = upgradeInkSurfaceRecordsToV3(
+      [base],
+      '2026-07-19T10:00:00.000Z',
+    )[0] as InkSurfaceRecord;
+    await store.write(
+      journalPath,
+      JSON.stringify({
+        entries: [
+          {
+            nextContents: encodeInkSurfaceRecord(revision(candidate, 2, candidate.strokes)),
+            path: surfacePath,
+            previousContents: encodeInkSurfaceRecord(base),
+          },
+        ],
+        filePath: surface.filePath,
+        phase: 'committed',
+        schemaVersion: 1,
+      }),
+    );
+
+    await expect(repository.listSurfaces(surface.filePath)).rejects.toThrow(/journal is invalid/u);
+    expect(store.readBySuffix(`/surfaces/${surface.id}.json`)).toBe(encodeInkSurfaceRecord(base));
+  });
+
+  it('recovers an interrupted schema activation only under its validated prepared plan identity', async () => {
+    const { repository, surface, store } = await createFixture();
+    const base = {
+      ...surface,
+      layout: { ...surface.layout, originY: 0 },
+      schemaVersion: 2,
+    } as const;
+    await repository.writeSurface(base);
+    const surfacePath = store.pathBySuffix(`/surfaces/${surface.id}.json`);
+    if (surfacePath === null) throw new Error('Missing canonical surface fixture path.');
+    const journalPath = `${surfacePath.slice(0, surfacePath.lastIndexOf('/surfaces/'))}/ink-batch-journal.json`;
+    const candidate = upgradeInkSurfaceRecordsToV3(
+      [base],
+      '2026-07-19T10:00:00.000Z',
+    )[0] as InkSurfaceRecord;
+    const next = {
+      ...revision(candidate, 2, [physicalPenStroke('physical-recovery')]),
+      schemaVersion: 3 as const,
+    };
+    await store.write(
+      journalPath,
+      JSON.stringify({
+        entries: [
+          {
+            nextContents: encodeInkSurfaceRecord(next),
+            path: surfacePath,
+            previousContents: encodeInkSurfaceRecord(base),
+          },
+        ],
+        filePath: surface.filePath,
+        phase: 'committed',
+        schemaActivation: {
+          planDigest: 'deadbeef',
+          planReference: 'ink-schema-v3-plan:deadbeef',
+          sourceBaseDigest: digestInkBrushGolden({
+            sourceSurfaceBytes: [encodeInkSurfaceRecord(base)],
+          }),
+        },
+        schemaVersion: 1,
+      }),
+    );
+
+    await expect(repository.listSurfaces(surface.filePath)).resolves.toMatchObject({
+      records: [{ id: surface.id, revision: 2, schemaVersion: 3 }],
+    });
+    expect(store.readBySuffix(`/surfaces/${surface.id}.json`)).toBe(encodeInkSurfaceRecord(next));
+    expect(store.readBySuffix('/ink-batch-journal.json')).toBeNull();
+  });
+
   it('rejects a journal whose records do not match canonical note identity metadata', async () => {
     const { repository, surface, store } = await createFixture();
     await repository.writeSurface(surface);
@@ -792,6 +1275,50 @@ describe('ink surface repository contract', () => {
     ).rejects.toThrow(/note identity/u);
   });
 
+  it('preserves corrupt canonical bytes and blocks creating a partial editable projection', async () => {
+    const { repository, surface, store } = await createFixture();
+    await repository.writeSurface(surface);
+    store.addSurfaceArtifact('corrupt.json', '{');
+    const newSurface = { ...surface, id: 'surface-new' };
+
+    await expect(repository.writeSurface(newSurface)).rejects.toBeInstanceOf(
+      InkSurfaceCorruptError,
+    );
+
+    expect(store.readBySuffix('/surfaces/corrupt.json')).toBe('{');
+    expect(store.readBySuffix(`/surfaces/${newSurface.id}.json`)).toBeNull();
+  });
+
+  it('preserves unsupported canonical bytes and blocks note reads, writes, and path reconciliation', async () => {
+    const { repository, surface, store } = await createFixture();
+    await repository.writeSurface(surface);
+    const unsupported = JSON.stringify({
+      ...JSON.parse(encodeInkSurfaceRecord(surface)),
+      schemaVersion: 99,
+    });
+    store.replaceBySuffix(`/surfaces/${surface.id}.json`, unsupported);
+
+    const loaded = await repository.listSurfaces(surface.filePath);
+
+    expect(loaded.records).toEqual([]);
+    expect(loaded.issues).toMatchObject([
+      {
+        kind: 'unsupported-record',
+        reason: 'unsupported-schema-version',
+      },
+    ]);
+    await expect(repository.readSurface(surface.filePath, surface.id)).rejects.toBeInstanceOf(
+      InkSurfaceUnsupportedError,
+    );
+    await expect(repository.writeSurface({ ...surface, id: 'new-surface' })).rejects.toBeInstanceOf(
+      InkSurfaceUnsupportedError,
+    );
+    await expect(
+      repository.reconcileNotePath(surface.filePath, '2026-07-14T09:00:00.000Z'),
+    ).rejects.toBeInstanceOf(InkSurfaceUnsupportedError);
+    expect(store.readBySuffix(`/surfaces/${surface.id}.json`)).toBe(unsupported);
+  });
+
   it('maintains compact thumbnail summaries without loading canonical point arrays on the hot path', async () => {
     const { repository, surface, store } = await createFixture();
     await repository.writeSurface({
@@ -821,6 +1348,117 @@ describe('ink surface repository contract', () => {
     expect(summaries[0]?.thumbnailSvg).toContain('<svg');
     expect(summaries[0]?.thumbnailSvg).not.toContain('points');
     expect(store.readCountBySuffix(`/surfaces/${surface.id}.json`)).toBe(0);
+  });
+
+  it('stores joined physical geometry in every cross-surface thumbnail summary', async () => {
+    const { repository, surface } = await createFixture();
+    const top: InkSurfaceRecord = {
+      ...surface,
+      layout: { ...surface.layout, logicalHeight: 600, originY: 0 },
+      schemaVersion: 3,
+      strokes: [physicalActivationStroke('joined-top', 'joined-physical', 590, 1, 'top', 600)],
+    };
+    const bottom: InkSurfaceRecord = {
+      ...surface,
+      id: 'surface-2',
+      layout: { ...surface.layout, logicalHeight: 600, originY: 600 },
+      schemaVersion: 3,
+      strokes: [
+        physicalActivationStroke('joined-bottom', 'joined-physical', 10, 2, 'bottom', 0, 600),
+      ],
+    };
+    const joined = joinInkStrokeSurfaceFragments([
+      {
+        endY: 600,
+        logicalHeight: 600,
+        schemaVersion: 3,
+        startY: 0,
+        stroke: top.strokes[0] as (typeof top.strokes)[number],
+        surfaceId: top.id,
+      },
+      {
+        endY: 1200,
+        logicalHeight: 600,
+        schemaVersion: 3,
+        startY: 600,
+        stroke: bottom.strokes[0] as (typeof bottom.strokes)[number],
+        surfaceId: bottom.id,
+      },
+    ])[0];
+    if (joined === undefined) throw new Error('Missing joined physical summary fixture.');
+    const compiled = new SharedInkStrokeGeometry().compile(joined);
+    if (!('geometry' in compiled)) throw new Error('Expected joined physical summary geometry.');
+
+    await repository.writeSurface(top);
+    await repository.writeSurface(bottom);
+    const summaries = await repository.listSurfaceSummaries(surface.filePath);
+
+    expect(summaries).toHaveLength(2);
+    expect(
+      summaries.every(({ thumbnailSvg }) =>
+        thumbnailSvg.includes(`data-ink-geometry-digest="${compiled.geometry.geometryDigest}"`),
+      ),
+    ).toBe(true);
+  });
+
+  it('omits joined geometry from a thumbnail whose surface does not intersect the logical stroke', async () => {
+    const { repository, store, surface } = await createFixture();
+    const top: InkSurfaceRecord = {
+      ...surface,
+      layout: { ...surface.layout, logicalHeight: 600, originY: 0 },
+      schemaVersion: 3,
+      strokes: [physicalActivationStroke('joined-top', 'joined-physical', 590, 1, 'top', 600)],
+    };
+    const middle: InkSurfaceRecord = {
+      ...surface,
+      id: 'surface-2',
+      layout: { ...surface.layout, logicalHeight: 600, originY: 600 },
+      schemaVersion: 3,
+      strokes: [
+        physicalActivationStroke('joined-bottom', 'joined-physical', 10, 2, 'bottom', 0, 600),
+      ],
+    };
+    const bottom: InkSurfaceRecord = {
+      ...surface,
+      id: 'surface-3',
+      layout: { ...surface.layout, logicalHeight: 600, originY: 1_200 },
+      schemaVersion: 3,
+      strokes: [],
+    };
+    const joined = joinInkStrokeSurfaceFragments([
+      {
+        endY: 600,
+        logicalHeight: 600,
+        schemaVersion: 3,
+        startY: 0,
+        stroke: top.strokes[0] as (typeof top.strokes)[number],
+        surfaceId: top.id,
+      },
+      {
+        endY: 1_200,
+        logicalHeight: 600,
+        schemaVersion: 3,
+        startY: 600,
+        stroke: middle.strokes[0] as (typeof middle.strokes)[number],
+        surfaceId: middle.id,
+      },
+    ])[0];
+    if (joined === undefined) throw new Error('Missing joined physical summary fixture.');
+    const compiled = new SharedInkStrokeGeometry().compile(joined);
+    if (!('geometry' in compiled)) throw new Error('Expected joined physical summary geometry.');
+
+    await repository.writeSurface(top);
+    await repository.writeSurface(middle);
+    await repository.writeSurface(bottom);
+    const topPath = store.pathBySuffix(`/surfaces/${top.id}.json`);
+    if (topPath === null) throw new Error('Missing top summary fixture path.');
+    await repository.rebuildSummariesForSidecarPath(topPath);
+    const summaries = await repository.listSurfaceSummaries(surface.filePath);
+    const digest = `data-ink-geometry-digest="${compiled.geometry.geometryDigest}"`;
+
+    expect(summaries.find(({ id }) => id === top.id)?.thumbnailSvg).toContain(digest);
+    expect(summaries.find(({ id }) => id === middle.id)?.thumbnailSvg).toContain(digest);
+    expect(summaries.find(({ id }) => id === bottom.id)?.thumbnailSvg).not.toContain(digest);
   });
 
   it('rebuilds a stale derived summary after an external canonical sidecar change', async () => {
@@ -924,7 +1562,9 @@ describe('ink surface repository contract', () => {
         surface.revision,
       ),
     ).rejects.toThrow('changed since it was selected');
-    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(updated);
+    await expect(repository.readSurface(surface.filePath, surface.id)).resolves.toEqual(
+      persisted(updated),
+    );
   });
 
   it('reclaims active zero-stroke surfaces as tombstones without touching visible Ink', async () => {
@@ -950,7 +1590,9 @@ describe('ink surface repository contract', () => {
       revision: 2,
       strokes: [],
     });
-    await expect(repository.readSurface(visible.filePath, visible.id)).resolves.toEqual(visible);
+    await expect(repository.readSurface(visible.filePath, visible.id)).resolves.toEqual(
+      persisted(visible),
+    );
   });
 });
 
@@ -1006,6 +1648,10 @@ function revision(
   };
 }
 
+function persisted(surface: InkSurfaceRecord): InkSurfaceRecord {
+  return decodeInkSurfaceRecord(encodeInkSurfaceRecord(surface));
+}
+
 function stroke(id: string): InkSurfaceRecord['strokes'][number] {
   return {
     color: '#111111',
@@ -1019,10 +1665,77 @@ function stroke(id: string): InkSurfaceRecord['strokes'][number] {
   };
 }
 
+function physicalPenStroke(id: string): InkSurfaceRecord['strokes'][number] {
+  return {
+    brushRenderVersion: 'pen-physical-v1',
+    color: '#111111',
+    id,
+    inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+    points: [
+      {
+        orientation: { kind: 'unavailable' },
+        pressure: 0.5,
+        pressureKind: 'measured',
+        time: 32,
+        x: 30,
+        y: 30,
+      },
+    ],
+    tool: 'pen',
+    width: 2,
+  };
+}
+
+function physicalActivationStroke(
+  id: string,
+  linkedStrokeId: string,
+  y: number,
+  time: number,
+  side: 'bottom' | 'top',
+  boundaryY: number,
+  globalBoundaryY = side === 'top' ? boundaryY : 0,
+): InkStroke {
+  const authored = {
+    fragmentGlobalY: side === 'top' ? y : globalBoundaryY + y,
+    fragmentTraceOrder: side === 'top' ? 0 : 1,
+    orientation: { kind: 'unavailable' } as const,
+    pressure: 0.5,
+    pressureKind: 'measured' as const,
+    time,
+    x: 30,
+    y,
+  };
+  const boundary = {
+    fragmentBoundary: 'synthetic-clip' as const,
+    fragmentBoundaryEdge: side === 'top' ? ('end' as const) : ('start' as const),
+    fragmentBoundaryId: `${linkedStrokeId}:boundary:0.5`,
+    fragmentGlobalY: globalBoundaryY,
+    fragmentTraceOrder: 0.5,
+    orientation: { kind: 'unavailable' } as const,
+    pressure: 0.5,
+    pressureKind: 'measured' as const,
+    time: 1.5,
+    x: 30,
+    y: boundaryY,
+  };
+  return {
+    brushRenderVersion: 'pen-physical-v1',
+    color: '#111111',
+    id,
+    inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+    linkedStrokeId,
+    points: side === 'top' ? [authored, boundary] : [boundary, authored],
+    tool: 'pen',
+    width: 2,
+  };
+}
+
 class MemoryTextFileStore implements TextFileStore {
   private readonly files = new Map<string, string>();
   private readonly activeWrites = new Map<string, number>();
   private readonly maximumWrites = new Map<string, number>();
+  private activeSurfaceWrites = 0;
+  private maximumSurfaceWrites = 0;
   private failNextSurfaceWrite = false;
   private failJournalPromotion = false;
   private failSurfaceWriteCountdown: number | null = null;
@@ -1040,6 +1753,7 @@ class MemoryTextFileStore implements TextFileStore {
       }
     | undefined;
   private readonly readCounts = new Map<string, number>();
+  private readonly writeCounts = new Map<string, number>();
 
   constructor(private readonly writeDelayMs = 0) {}
 
@@ -1076,9 +1790,15 @@ class MemoryTextFileStore implements TextFileStore {
   }
 
   async write(path: string, contents: string): Promise<void> {
+    this.writeCounts.set(path, (this.writeCounts.get(path) ?? 0) + 1);
     const active = (this.activeWrites.get(path) ?? 0) + 1;
     this.activeWrites.set(path, active);
     this.maximumWrites.set(path, Math.max(active, this.maximumWrites.get(path) ?? 0));
+    const surfaceWrite = path.includes('/surfaces/');
+    if (surfaceWrite) {
+      this.activeSurfaceWrites += 1;
+      this.maximumSurfaceWrites = Math.max(this.maximumSurfaceWrites, this.activeSurfaceWrites);
+    }
     if (path.includes('/surfaces/') && this.heldSurfaceWrite !== undefined) {
       const held = this.heldSurfaceWrite;
       held.remaining -= 1;
@@ -1106,6 +1826,7 @@ class MemoryTextFileStore implements TextFileStore {
       this.failSurfaceWriteCountdown = null;
       this.files.set(path, '{');
       this.activeWrites.set(path, active - 1);
+      if (surfaceWrite) this.activeSurfaceWrites -= 1;
       throw new Error('Injected partial write');
     }
     if (
@@ -1119,6 +1840,7 @@ class MemoryTextFileStore implements TextFileStore {
     }
     this.files.set(path, contents);
     this.activeWrites.set(path, active - 1);
+    if (surfaceWrite) this.activeSurfaceWrites -= 1;
   }
 
   readBySuffix(suffix: string): string | null {
@@ -1133,6 +1855,25 @@ class MemoryTextFileStore implements TextFileStore {
 
   resetReadCounts(): void {
     this.readCounts.clear();
+  }
+
+  resetWriteCounts(): void {
+    this.writeCounts.clear();
+  }
+
+  resetSurfaceWriteConcurrency(): void {
+    this.activeSurfaceWrites = 0;
+    this.maximumSurfaceWrites = 0;
+  }
+
+  maximumConcurrentSurfaceWrites(): number {
+    return this.maximumSurfaceWrites;
+  }
+
+  writeCountBySuffix(suffix: string): number {
+    return [...this.writeCounts.entries()]
+      .filter(([path]) => path.endsWith(suffix))
+      .reduce((total, [, count]) => total + count, 0);
   }
 
   addSurfaceArtifact(filename: string, contents: string): void {

@@ -1,10 +1,11 @@
-import type { InkStroke, InkSurfaceRecord } from './ink-surface';
+import type { InkPhysicalPoint, InkStroke, InkSurfaceRecord } from './ink-surface';
 
 export type InkConcurrentAppendConflictReason =
   | 'existing-strokes-changed'
   | 'identity-or-layout-changed'
   | 'not-independent-appends'
   | 'revision-chain-changed'
+  | 'schema-version-mismatch'
   | 'stroke-id-collision'
   | 'surface-is-not-active';
 
@@ -51,6 +52,9 @@ export function planConcurrentInkAppendMerge(input: {
   ) {
     return { kind: 'conflict', reason: 'revision-chain-changed' };
   }
+  if (local.schemaVersion !== base.schemaVersion || remote.schemaVersion !== base.schemaVersion) {
+    return { kind: 'conflict', reason: 'schema-version-mismatch' };
+  }
   if (
     mergeInvariant(base) !== mergeInvariant(local) ||
     mergeInvariant(base) !== mergeInvariant(remote) ||
@@ -60,8 +64,8 @@ export function planConcurrentInkAppendMerge(input: {
     return { kind: 'conflict', reason: 'identity-or-layout-changed' };
   }
   if (
-    !preservesBaseStrokes(base.strokes, local.strokes) ||
-    !preservesBaseStrokes(base.strokes, remote.strokes)
+    !preservesBaseStrokes(base.strokes, local.strokes, base.schemaVersion, local.schemaVersion) ||
+    !preservesBaseStrokes(base.strokes, remote.strokes, base.schemaVersion, remote.schemaVersion)
   ) {
     return { kind: 'conflict', reason: 'existing-strokes-changed' };
   }
@@ -75,7 +79,10 @@ export function planConcurrentInkAppendMerge(input: {
   const additions = new Map<string, InkStroke>();
   for (const stroke of [...remoteAppends, ...localAppends]) {
     const existing = additions.get(stroke.id);
-    if (existing !== undefined && !sameStroke(existing, stroke)) {
+    if (
+      existing !== undefined &&
+      !sameStroke(existing, stroke, remote.schemaVersion, local.schemaVersion)
+    ) {
       return { kind: 'conflict', reason: 'stroke-id-collision' };
     }
     additions.set(stroke.id, stroke);
@@ -83,7 +90,10 @@ export function planConcurrentInkAppendMerge(input: {
   const remoteById = new Map(remote.strokes.map((stroke) => [stroke.id, stroke]));
   const alreadyMerged = localAppends.every((stroke) => {
     const remoteStroke = remoteById.get(stroke.id);
-    return remoteStroke !== undefined && sameStroke(remoteStroke, stroke);
+    return (
+      remoteStroke !== undefined &&
+      sameStroke(remoteStroke, stroke, remote.schemaVersion, local.schemaVersion)
+    );
   });
   if (alreadyMerged && remote.layout.logicalHeight >= local.layout.logicalHeight) {
     return { kind: 'already-merged', record: remote };
@@ -114,52 +124,113 @@ export function planConcurrentInkAppendMerge(input: {
 }
 
 function mergeInvariant(record: InkSurfaceRecord): string {
-  const {
-    deviceId: _deviceId,
-    layout,
-    revision: _revision,
-    strokes: _strokes,
-    updatedAt: _updatedAt,
-    ...identity
-  } = record;
-  const { logicalHeight: _logicalHeight, ...fixedLayout } = layout;
-  void _deviceId;
-  void _revision;
-  void _strokes;
-  void _updatedAt;
-  void _logicalHeight;
-  return JSON.stringify({ ...identity, layout: fixedLayout });
+  return JSON.stringify({
+    binding:
+      record.binding === undefined
+        ? null
+        : {
+            blockFingerprints: record.binding.blockFingerprints,
+            headingPath: record.binding.headingPath,
+            sectionFingerprint: record.binding.sectionFingerprint,
+            sourceEnd: record.binding.sourceEnd,
+            sourceStart: record.binding.sourceStart,
+          },
+    createdAt: record.createdAt,
+    filePath: record.filePath,
+    id: record.id,
+    layout: {
+      blockFingerprints: record.layout.blockFingerprints,
+      fontFamily: record.layout.fontFamily,
+      fontSize: record.layout.fontSize,
+      lineHeight: record.layout.lineHeight,
+      logicalWidth: record.layout.logicalWidth,
+      originY: record.layout.originY ?? null,
+      sourceRevision: record.layout.sourceRevision,
+      themeMode: record.layout.themeMode,
+    },
+    noteId: record.noteId,
+    schemaVersion: record.schemaVersion,
+    status: record.status,
+  });
 }
 
 function preservesBaseStrokes(
   base: readonly InkStroke[],
   candidate: readonly InkStroke[],
+  baseSchemaVersion: InkSurfaceRecord['schemaVersion'],
+  candidateSchemaVersion: InkSurfaceRecord['schemaVersion'],
 ): boolean {
   if (candidate.length < base.length) return false;
   const byId = new Map(candidate.map((stroke) => [stroke.id, stroke]));
   return base.every((stroke) => {
     const other = byId.get(stroke.id);
-    return other !== undefined && sameStroke(stroke, other);
+    return (
+      other !== undefined && sameStroke(stroke, other, baseSchemaVersion, candidateSchemaVersion)
+    );
   });
 }
 
-function sameStroke(left: InkStroke, right: InkStroke): boolean {
-  return encodeStrokeForMerge(left) === encodeStrokeForMerge(right);
+function sameStroke(
+  left: InkStroke,
+  right: InkStroke,
+  leftSchemaVersion: InkSurfaceRecord['schemaVersion'],
+  rightSchemaVersion: InkSurfaceRecord['schemaVersion'],
+): boolean {
+  return (
+    encodeStrokeForMerge(left, leftSchemaVersion) ===
+    encodeStrokeForMerge(right, rightSchemaVersion)
+  );
 }
 
-function encodeStrokeForMerge(stroke: InkStroke): string {
+function encodeStrokeForMerge(
+  stroke: InkStroke,
+  schemaVersion: InkSurfaceRecord['schemaVersion'],
+): string {
+  const visible = stroke.tool === 'pen' || stroke.tool === 'highlighter';
+  const version =
+    stroke.brushRenderVersion ?? (schemaVersion < 3 && visible ? 'legacy-round-v1' : null);
+  const profile =
+    stroke.inputProfile ??
+    (schemaVersion < 3 && visible
+      ? { pressure: 'legacy-unknown' as const, tilt: 'legacy-unknown' as const }
+      : null);
   return JSON.stringify({
+    brushRenderVersion: version,
     color: stroke.color,
     id: stroke.id,
+    inputProfile: profile === null ? null : { pressure: profile.pressure, tilt: profile.tilt },
     linkedStrokeId: stroke.linkedStrokeId ?? null,
-    points: stroke.points.map((point) => ({
-      pressure: point.pressure,
-      tiltX: point.tiltX ?? null,
-      tiltY: point.tiltY ?? null,
-      time: point.time,
-      x: point.x,
-      y: point.y,
-    })),
+    points: stroke.points.map((point) =>
+      point.pressureKind === undefined || point.orientation === undefined
+        ? {
+            pressure: point.pressure,
+            tiltX: point.tiltX ?? null,
+            tiltY: point.tiltY ?? null,
+            time: point.time,
+            x: point.x,
+            y: point.y,
+          }
+        : {
+            fragmentBoundary: (point as InkPhysicalPoint).fragmentBoundary ?? null,
+            fragmentBoundaryEdge: (point as InkPhysicalPoint).fragmentBoundaryEdge ?? null,
+            fragmentBoundaryId: (point as InkPhysicalPoint).fragmentBoundaryId ?? null,
+            fragmentGlobalY: (point as InkPhysicalPoint).fragmentGlobalY ?? null,
+            fragmentTraceOrder: (point as InkPhysicalPoint).fragmentTraceOrder ?? null,
+            orientation:
+              point.orientation.kind === 'unavailable'
+                ? { kind: 'unavailable' }
+                : {
+                    altitude: point.orientation.altitude,
+                    azimuth: point.orientation.azimuth,
+                    kind: 'measured',
+                    reliable: point.orientation.reliable,
+                  },
+            pressure: { kind: point.pressureKind, value: point.pressure },
+            time: point.time,
+            x: point.x,
+            y: point.y,
+          },
+    ),
     tool: stroke.tool,
     width: stroke.width,
   });

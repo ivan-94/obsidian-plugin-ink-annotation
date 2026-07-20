@@ -187,7 +187,7 @@ describe('release candidate integrated recovery flow', () => {
     expect(inkAfterReload).toMatchObject({
       revision: 2,
       status: 'active',
-      strokes: [{ linkedStrokeId: 'stroke-rc' }],
+      strokes: [{ id: 'stroke-rc' }],
     });
     if (inkAfterReload === null) throw new Error('Ink fixture disappeared after reload.');
 
@@ -249,7 +249,7 @@ describe('release candidate integrated recovery flow', () => {
     expect(restoredSurface).toMatchObject({
       revision: tombstonedSurface.revision + 1,
       status: 'active',
-      strokes: [{ linkedStrokeId: 'stroke-rc' }],
+      strokes: [{ id: 'stroke-rc' }],
     });
     await expect(inkRepository.listSurfaceSummaries(filePath)).resolves.toMatchObject([
       { id: surface.id, revision: restoredSurface.revision, strokeCount: 1 },

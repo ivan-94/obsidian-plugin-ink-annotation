@@ -31,6 +31,74 @@ describe('continuous Ink canvas extent', () => {
     expect(ensureInkCanvasExtent(records, 1_500)).toEqual(records);
     expect(ensureInkCanvasExtent(records, 1_500)[0]).toBe(records[0]);
   });
+
+  it('uses explicit origins for reordered schema-v3 chunks separated by a gap', () => {
+    const records: readonly InkSurfaceRecord[] = [
+      { ...surface('bottom', 1_000, 100), schemaVersion: 3 },
+      { ...surface('top', 0, 100), schemaVersion: 3 },
+    ];
+
+    const extended = ensureInkCanvasExtent(records, 1_200, 0);
+
+    expect(extended[0]?.layout.logicalHeight).toBe(200);
+    expect(extended[1]).toBe(records[1]);
+  });
+
+  it('extends from the shared physical nib bound instead of a legacy line width', () => {
+    const base = surface('physical', 0, 100);
+    const records: readonly InkSurfaceRecord[] = [
+      {
+        ...base,
+        schemaVersion: 3,
+        strokes: [
+          {
+            brushRenderVersion: 'pen-physical-v1',
+            color: '#111111',
+            id: 'pressure-tap',
+            inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+            points: [
+              {
+                orientation: { kind: 'unavailable' },
+                pressure: 1,
+                pressureKind: 'measured',
+                time: 0,
+                x: 10,
+                y: 99,
+              },
+            ],
+            tool: 'pen',
+            width: 4,
+          },
+        ],
+      },
+    ];
+
+    expect(ensureInkCanvasExtent(records, 0, 0)[0]?.layout.logicalHeight).toBe(102);
+  });
+
+  it('does not extend the visible canvas for a preserved historical Eraser record', () => {
+    const base = surface('historical-eraser', 0, 100);
+    const records: readonly InkSurfaceRecord[] = [
+      {
+        ...base,
+        schemaVersion: 3,
+        strokes: [
+          {
+            color: '#ffffff',
+            id: 'historical-eraser',
+            points: [
+              { pressure: 0.5, time: 0, x: 10, y: 10_000 },
+              { pressure: 0.5, time: 1, x: 20, y: 10_010 },
+            ],
+            tool: 'eraser',
+            width: 20,
+          },
+        ],
+      },
+    ];
+
+    expect(ensureInkCanvasExtent(records, 0, 0)).toBe(records);
+  });
 });
 
 function surface(

@@ -1,0 +1,20 @@
+{
+  "expectedDigest": "917b495f",
+  "expectedSerialized": "{\"a\":{\"x\":1,\"y\":2},\"list\":[{\"a\":1,\"b\":2},0],\"z\":3}\n",
+  "goldenSchemaVersion": 1,
+  "input": {
+    "z": 3,
+    "a": {
+      "y": 2,
+      "x": 1
+    },
+    "list": [
+      {
+        "b": 2,
+        "a": 1
+      },
+      0
+    ]
+  },
+  "kind": "canonical-serializer"
+}

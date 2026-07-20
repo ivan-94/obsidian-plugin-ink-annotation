@@ -1,0 +1,76 @@
+{
+  "cases": [
+    {
+      "id": "legacy-and-reserved-physical-coexistence",
+      "kind": "logical-scene",
+      "strokes": [
+        {
+          "brush": {
+            "color": "#111111",
+            "inputProfile": { "pressure": "legacy-unknown", "tilt": "legacy-unknown" },
+            "tool": "pen",
+            "version": "legacy-round-v1"
+          },
+          "id": "legacy-stroke",
+          "points": [
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "unavailable" },
+              "time": 0,
+              "x": 10,
+              "y": 20
+            },
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "unavailable" },
+              "time": 10,
+              "x": 40,
+              "y": 20
+            }
+          ]
+        },
+        {
+          "brush": {
+            "color": "#111111",
+            "inputProfile": { "pressure": "measured", "tilt": "unavailable" },
+            "tool": "pen",
+            "version": "pen-physical-v1"
+          },
+          "id": "physical-candidate-stroke",
+          "points": [
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.4 },
+              "time": 20,
+              "x": 10,
+              "y": 40
+            },
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.6 },
+              "time": 30,
+              "x": 40,
+              "y": 40
+            }
+          ]
+        }
+      ],
+      "surfaces": [{ "id": "surface-a", "maximumY": 100, "minimumY": 0 }]
+    }
+  ],
+  "fixtureSchemaVersion": 1,
+  "id": "mixed-legacy-physical",
+  "kind": "synthetic"
+}

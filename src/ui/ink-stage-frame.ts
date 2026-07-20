@@ -3,6 +3,11 @@ export interface CssPoint {
   readonly y: number;
 }
 
+export interface MutableCssPoint {
+  x: number;
+  y: number;
+}
+
 export interface CssRect {
   readonly height: number;
   readonly left: number;
@@ -46,8 +51,54 @@ export interface InkStageFrame {
   readonly canvasBackingTransform: (devicePixelRatio: number) => CanvasBackingTransform;
   readonly canvasCssToLogical: (point: CssPoint) => CssPoint;
   readonly clientToLogical: (point: CssPoint) => CssPoint;
+  readonly clientToLogicalInto: (point: CssPoint, target: MutableCssPoint) => MutableCssPoint;
   readonly logicalToCanvasCss: (point: CssPoint) => CssPoint;
   readonly logicalToClient: (point: CssPoint) => CssPoint;
+}
+
+const INK_STAGE_FRAME_CSS_EPSILON = 1 / 64;
+const INK_STAGE_FRAME_SCALE_EPSILON = 1e-6;
+
+/**
+ * Treats browser layout quantization noise as the same presentation frame. WebKit can report
+ * equivalent CSS-zoom geometry a few hundredths of a pixel apart across ResizeObserver turns;
+ * rebuilding every Canvas for that noise turns an idle observer callback into O(visible strokes).
+ */
+export function sameInkStageFrame(left: InkStageFrame | null, right: InkStageFrame): boolean {
+  return (
+    left !== null &&
+    approximately(left.actualScale, right.actualScale, INK_STAGE_FRAME_SCALE_EPSILON) &&
+    approximately(
+      left.canvasClientRect.left,
+      right.canvasClientRect.left,
+      INK_STAGE_FRAME_CSS_EPSILON,
+    ) &&
+    approximately(
+      left.canvasClientRect.top,
+      right.canvasClientRect.top,
+      INK_STAGE_FRAME_CSS_EPSILON,
+    ) &&
+    approximately(
+      left.canvasClientRect.width,
+      right.canvasClientRect.width,
+      INK_STAGE_FRAME_CSS_EPSILON,
+    ) &&
+    approximately(
+      left.canvasClientRect.height,
+      right.canvasClientRect.height,
+      INK_STAGE_FRAME_CSS_EPSILON,
+    ) &&
+    approximately(
+      left.documentClientOrigin.x,
+      right.documentClientOrigin.x,
+      INK_STAGE_FRAME_CSS_EPSILON,
+    ) &&
+    approximately(
+      left.documentClientOrigin.y,
+      right.documentClientOrigin.y,
+      INK_STAGE_FRAME_CSS_EPSILON,
+    )
+  );
 }
 
 export function createInkStageFrame(input: InkStageFrameInput): InkStageFrame {
@@ -99,6 +150,12 @@ export function createInkStageFrame(input: InkStageFrameInput): InkStageFrame {
         y: (point.y - documentClientOrigin.y) / actualScale,
       });
     },
+    clientToLogicalInto(point: CssPoint, target: MutableCssPoint): MutableCssPoint {
+      assertPoint(point, 'Ink Stage Frame client point');
+      target.x = (point.x - documentClientOrigin.x) / actualScale;
+      target.y = (point.y - documentClientOrigin.y) / actualScale;
+      return target;
+    },
     logicalToCanvasCss(point: CssPoint): CssPoint {
       assertPoint(point, 'Ink Stage Frame logical point');
       return freezePoint({
@@ -135,4 +192,8 @@ function assertFinite(value: number, label: string): void {
 
 function assertPositive(value: number, label: string): void {
   if (!Number.isFinite(value) || value <= 0) throw new Error(`${label} must be positive.`);
+}
+
+function approximately(left: number, right: number, epsilon: number): boolean {
+  return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) <= epsilon;
 }

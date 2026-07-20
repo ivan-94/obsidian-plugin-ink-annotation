@@ -4,11 +4,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InkPoint, InkStroke, InkSurfaceRecord } from '../domain/ink-surface';
 import type { InkSurfaceSessionSnapshot } from '../application/ink-surface-session';
+import type {
+  InkDocumentApplyResult,
+  InkDocumentChange,
+  InkDocumentCommand,
+  InkLogicalRect,
+} from '../application/ink-document-session';
+import { InkLiveDocument } from '../application/ink-document-session';
+import { UNPUBLISHED_INK_HIGHLIGHTER_CHISEL_PROFILE } from '../domain/ink-highlighter-physical-geometry';
+import { InkPerformanceDiagnostics } from '../runtime/ink-performance-diagnostics';
 import {
-  committedStrokeRenderDelta,
-  InkCanvasController,
-  nextActivePaintSegment,
-} from './ink-canvas-controller';
+  createTestInkReadView,
+  queryTestInkReadView,
+} from '../test-support/ink-live-document-fixture';
+import { InkCanvasController } from './ink-canvas-controller';
+import {
+  InkRenderRuntime,
+  type InkWorkerPresentationPreparationFactory,
+} from './ink-render-runtime';
+import { createInkStageFrame } from './ink-stage-frame';
 import {
   type InkToolPreference,
   LocalInkToolPreferenceStore,
@@ -33,44 +47,440 @@ describe('Ink canvas controller', () => {
     });
   });
 
-  it('paints only the new tail of a long active stroke after the first frame', () => {
-    const points = [
-      { pressure: 0.5, time: 0, x: 0, y: 0 },
-      { pressure: 0.5, time: 1, x: 1, y: 1 },
-      { pressure: 0.5, time: 2, x: 2, y: 2 },
-      { pressure: 0.5, time: 3, x: 3, y: 3 },
-    ];
+  it('forwards an explicit experimental Worker presentation selection to the render runtime', async () => {
+    const prepare: InkWorkerPresentationPreparationFactory = vi.fn(() =>
+      Promise.resolve({ failureCategory: 'api-unavailable', kind: 'unavailable' } as const),
+    );
+    const root = document.createElement('div');
+    document.body.append(root);
 
-    expect(nextActivePaintSegment(points.slice(0, 2), 0)).toEqual({
-      nextPaintedPointCount: 2,
-      points: points.slice(0, 2),
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+      workerPresentation: { enabled: true, prepare },
     });
-    expect(nextActivePaintSegment(points, 2)).toEqual({
-      nextPaintedPointCount: 4,
-      points: points.slice(1),
+
+    expect(controller.activePresentationAdapterState).toEqual({
+      adapter: 'main-canvas-2d',
+      epoch: 1,
+      requestedAdapter: 'worker-offscreen-2d',
     });
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    expect(controller.activePresentationAdapterState).toEqual({
+      adapter: 'main-canvas-2d',
+      epoch: 1,
+      requestedAdapter: 'worker-offscreen-2d',
+    });
+    controller.dispose();
   });
 
-  it('appends a committed stroke without replaying an unchanged large prefix', () => {
-    const first = stroke('first');
-    const second = stroke('second');
+  it('resets sustained inactivity for navigation, toolbar, and keyboard interaction', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
 
-    expect(committedStrokeRenderDelta([first], [first, second])).toEqual({
-      kind: 'append',
-      strokes: [second],
+    root.dispatchEvent(new WheelEvent('wheel', { bubbles: true }));
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-in]')?.click();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="highlighter"]')?.click();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Shift' }));
+
+    expect(session.userInteractionCalls).toBe(4);
+    controller.dispose();
+  });
+
+  it('routes physical Highlighter input through live-first S32 coverage with no Recovery call', () => {
+    const fill = vi.fn();
+    const canvasStroke = vi.fn();
+    const canvasContext = contextFixture(canvasStroke);
+    canvasContext.fill = fill;
+    canvasContext.closePath = vi.fn();
+    canvasContext.globalAlpha = 1;
+    canvasContext.globalCompositeOperation = 'source-over';
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+    const updateSurface = vi.fn((record: InkSurfaceRecord) => Promise.resolve(record));
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('v3-history')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      surfaces: [source],
+      writer: { updateSurface },
     });
-    expect(committedStrokeRenderDelta([first, second], [first, second])).toEqual({
-      kind: 'none',
-      strokes: [],
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      preference: { color: '#f4c542', hintShown: true, tool: 'highlighter', width: 12 },
+      root,
+      session,
+      unpublishedPhysicalInkHat: {
+        session,
+      },
     });
-    expect(committedStrokeRenderDelta([first, second], [first])).toEqual({
-      kind: 'full',
-      strokes: [first],
+    controller.enter();
+    canvasStroke.mockClear();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 30, 35, 'pen'));
+    expect(root.querySelector<HTMLElement>('.inkstone-ink-active-stack')?.style.opacity).toBe(
+      String(UNPUBLISHED_INK_HIGHLIGHTER_CHISEL_PROFILE.opticalDensity),
+    );
+    expect(canvasStroke).not.toHaveBeenCalled();
+    root.dispatchEvent(pointer('pointerup', 50, 40, 'pen'));
+
+    const persisted = session
+      .read()
+      .strokes.find(({ stroke: candidate }) => candidate.id !== 'v3-history')?.stroke;
+    expect(persisted).toMatchObject({
+      brushRenderVersion: 'highlighter-chisel-v1',
+      color: '#f4c542',
+      inputProfile: { pressure: 'measured', tilt: 'measured' },
+      tool: 'highlighter',
     });
-    expect(committedStrokeRenderDelta([first], [{ ...first, color: '#ffffff' }])).toEqual({
-      kind: 'full',
-      strokes: [{ ...first, color: '#ffffff' }],
+    expect(updateSurface).not.toHaveBeenCalled();
+    expect(fill).toHaveBeenCalledWith('nonzero');
+    controller.dispose();
+  });
+
+  it('cancels a physical contact poisoned by invalid coalesced input instead of bridging to pen-up', () => {
+    const canvasContext = contextFixture();
+    canvasContext.fill = vi.fn();
+    canvasContext.closePath = vi.fn();
+    canvasContext.globalAlpha = 1;
+    canvasContext.globalCompositeOperation = 'source-over';
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+    const source: InkSurfaceRecord = {
+      ...surface([]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
     });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      preference: { color: '#112233', hintShown: true, tool: 'pen', width: 4 },
+      root,
+      session,
+      unpublishedPhysicalInkHat: { session },
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 20, 25, 'pen'));
+    const invalidMove = pointer('pointermove', 500, 500, 'pen');
+    Object.defineProperty(invalidMove, 'getCoalescedEvents', {
+      configurable: true,
+      value: () => [
+        {
+          altitudeAngle: undefined,
+          azimuthAngle: undefined,
+          clientX: Number.NaN,
+          clientY: 500,
+          pointerId: 1,
+          pointerType: 'pen',
+          pressure: 0.7,
+          tiltX: 0,
+          tiltY: 0,
+          timeStamp: invalidMove.timeStamp,
+        },
+      ],
+    });
+    root.dispatchEvent(invalidMove);
+    root.dispatchEvent(pointer('pointerup', 500, 500, 'pen'));
+
+    expect(session.read().strokes).toHaveLength(0);
+
+    root.dispatchEvent(pointer('pointerdown', 30, 30, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 40, 35, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 50, 40, 'pen'));
+    expect(session.read().strokes).toHaveLength(1);
+    controller.dispose();
+  });
+
+  it('reports a front-loaded parent repair on the real controller input span', () => {
+    const canvasContext = contextFixture();
+    canvasContext.fill = vi.fn();
+    canvasContext.closePath = vi.fn();
+    canvasContext.globalAlpha = 1;
+    canvasContext.globalCompositeOperation = 'source-over';
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+    const source: InkSurfaceRecord = {
+      ...surface([]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      preference: { color: '#112233', hintShown: true, tool: 'pen', width: 4 },
+      root,
+      session,
+      unpublishedPhysicalInkHat: { session },
+    });
+    controller.enter();
+
+    const down = pointer('pointerdown', 10, 20, 'pen');
+    Object.defineProperty(down, 'timeStamp', { configurable: true, value: 0 });
+    root.dispatchEvent(down);
+    const move = pointer('pointermove', 40, 20, 'pen');
+    const rawFirst = pointer('pointermove', 20, 30, 'pen');
+    const rawSecond = pointer('pointermove', 30, 32, 'pen');
+    Object.defineProperty(move, 'timeStamp', { configurable: true, value: 30 });
+    Object.defineProperty(rawFirst, 'timeStamp', { configurable: true, value: 10 });
+    Object.defineProperty(rawSecond, 'timeStamp', { configurable: true, value: 20 });
+    Object.defineProperty(move, 'getCoalescedEvents', {
+      configurable: true,
+      value: () => [move, rawFirst, rawSecond],
+    });
+    root.dispatchEvent(move);
+
+    expect(diagnostics.snapshot().recentSpans).toContainEqual(
+      expect.objectContaining({
+        causalRepair: 'front-loaded-parent',
+        inputPhase: 'move',
+        name: 'ink-input-handler',
+      }),
+    );
+    const up = pointer('pointerup', 45, 20, 'pen');
+    Object.defineProperty(up, 'timeStamp', { configurable: true, value: 40 });
+    root.dispatchEvent(up);
+    const stored = session.read().strokes[0]?.stroke;
+    expect(stored).toMatchObject({ brushRenderVersion: 'pen-physical-v1' });
+    if (stored?.brushRenderVersion !== 'pen-physical-v1') {
+      throw new Error('Expected the physical stringing canary stroke.');
+    }
+    const first = stored.points[0];
+    const second = stored.points[1];
+    if (first === undefined || second === undefined) {
+      throw new Error('Expected a multi-point physical stringing canary trace.');
+    }
+    expect(Math.hypot(second.x - first.x, second.y - first.y)).toBeLessThan(20);
+    controller.dispose();
+  });
+
+  it('seals the confirmed prefix and rejects stale samples across a forced Stage Frame epoch', () => {
+    const canvasContext = contextFixture();
+    canvasContext.fill = vi.fn();
+    canvasContext.closePath = vi.fn();
+    canvasContext.globalAlpha = 1;
+    canvasContext.globalCompositeOperation = 'source-over';
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      surfaces: [surface()],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      preference: { color: '#112233', hintShown: true, tool: 'pen', width: 4 },
+      root,
+      session,
+      unpublishedPhysicalInkHat: { session },
+    });
+    controller.enter();
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 30, 32, 'pen'));
+    const internal = controller as unknown as {
+      publishStageFrame(frame: ReturnType<typeof createInkStageFrame>): void;
+      sealActiveContactForForcedStageFrame(): void;
+    };
+    internal.publishStageFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 300, left: 0, top: 0, width: 300 },
+        documentClientOrigin: { x: 0, y: 0 },
+      }),
+    );
+
+    internal.sealActiveContactForForcedStageFrame();
+    root.dispatchEvent(pointer('pointermove', 250, 250, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 260, 260, 'pen'));
+
+    const stored = session.read().strokes[0]?.stroke;
+    expect(stored).toMatchObject({ brushRenderVersion: 'pen-physical-v1' });
+    expect(stored?.points.at(-1)).toMatchObject({ x: 30, y: 32 });
+    expect(stored?.points.some(({ x, y }) => x >= 250 || y >= 250)).toBe(false);
+    controller.dispose();
+  });
+
+  it('promotes a completed physical stroke without reinstalling the full committed document', () => {
+    const flushNow = vi.spyOn(InkRenderRuntime.prototype, 'flushNow');
+    const canvasContext = contextFixture();
+    canvasContext.fill = vi.fn();
+    canvasContext.closePath = vi.fn();
+    canvasContext.globalAlpha = 1;
+    canvasContext.globalCompositeOperation = 'source-over';
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([v3LegacyStroke('history-a'), v3LegacyStroke('history-b')]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      preference: { color: '#112233', hintShown: true, tool: 'pen', width: 4 },
+      root,
+      session,
+      unpublishedPhysicalInkHat: {
+        session,
+      },
+    });
+    controller.enter();
+    diagnostics.reset();
+    flushNow.mockClear();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 20, 25, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 30, 30, 'pen'));
+
+    const viewportCounts = diagnostics
+      .snapshot()
+      .recentSpans.filter(({ name }) => name === 'ink-viewport-redraw')
+      .map(({ viewportResultCount }) => viewportResultCount);
+    expect(viewportCounts).not.toContain(3);
+    expect(viewportCounts.at(-1)).toBe(1);
+    expect(flushNow).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+
+  it('commits the logical physical stroke even when final active rendering fails', () => {
+    const canvasContext = contextFixture();
+    canvasContext.closePath = vi.fn();
+    canvasContext.fill = vi.fn();
+    canvasContext.globalAlpha = 1;
+    canvasContext.globalCompositeOperation = 'source-over';
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+    const finalizeActive = vi
+      .spyOn(InkRenderRuntime.prototype, 'finalizeActive')
+      .mockImplementationOnce(() => {
+        throw new Error('synthetic final active render failure');
+      });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session,
+      unpublishedPhysicalInkHat: { session },
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 20, 25, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 30, 30, 'pen'));
+
+    expect(finalizeActive).toHaveBeenCalledOnce();
+    expect(session.read().strokes).toHaveLength(1);
+    expect(
+      root.querySelector<HTMLElement>('[data-inkstone-ink-toolbar-host]')?.dataset
+        .inkstonePhysicalCandidate,
+    ).toBe('ready');
+    controller.dispose();
+  });
+
+  it('returns immediately when the session callback and commit path deliver the same change', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    const read = session.read();
+    const change: InkDocumentChange = {
+      addedIds: ['deduplicated'],
+      bounds: [],
+      commandId: 'deduplicated-change',
+      generation: read.generation,
+      persistenceDelta: null,
+      removedIds: [],
+      selectionDelta: null,
+      updatedIds: [],
+    };
+    const canUndo = vi.spyOn(session, 'canUndo');
+
+    controller.sync(read, change);
+    canUndo.mockClear();
+    controller.sync(read, change);
+
+    expect(canUndo).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+
+  it('keeps a degraded physical trace canonical while only its Active presentation falls back locally', () => {
+    const canvasStroke = vi.fn();
+    const canvasContext = contextFixture(canvasStroke);
+    canvasContext.fill = vi.fn();
+    canvasContext.closePath = vi.fn();
+    canvasContext.globalAlpha = 1;
+    canvasContext.globalCompositeOperation = 'source-over';
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+    const updateSurface = vi.fn((record: InkSurfaceRecord) => Promise.resolve(record));
+    const source: InkSurfaceRecord = {
+      ...surface([]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      surfaces: [source],
+      writer: { updateSurface },
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      preference: { color: '#112233', hintShown: true, tool: 'pen', width: 4 },
+      root,
+      session,
+      unpublishedPhysicalInkHat: {
+        session,
+      },
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 1e15, 22, 'pen'));
+    expect(root.querySelector('[data-inkstone-ink-status]')?.textContent).toContain(
+      'using local legacy presentation',
+    );
+    expect(canvasStroke).toHaveBeenCalled();
+    root.dispatchEvent(pointer('pointerup', 1e15, 24, 'pen'));
+
+    expect(updateSurface).not.toHaveBeenCalled();
+    expect(session.read().strokes[0]?.stroke).toMatchObject({
+      brushRenderVersion: 'pen-physical-v1',
+      tool: 'pen',
+    });
+    controller.dispose();
   });
 
   it('moves explicitly between raw, Ink preview, and Ink edit without preview input capture', () => {
@@ -84,8 +494,15 @@ describe('Ink canvas controller', () => {
     const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
     const committed = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]');
     const overlay = root.querySelector<HTMLElement>('[data-inkstone-ink-surface]');
+    const toolbar = root.querySelector<HTMLElement>('[data-inkstone-ink-toolbar-host]');
 
     expect(overlay?.hidden).toBe(true);
+    expect(overlay?.dataset.inkstoneInkController).toMatch(/^\d+$/u);
+    expect(toolbar?.dataset).toMatchObject({
+      inkstoneControllerActive: 'false',
+      inkstoneInkController: overlay?.dataset.inkstoneInkController,
+      inkstonePhysicalCandidate: 'unavailable',
+    });
     expect(layoutRoot.classList.contains('inkstone-ink-workspace')).toBe(false);
     controller.showPreview();
     expect(overlay?.hidden).toBe(false);
@@ -101,6 +518,7 @@ describe('Ink canvas controller', () => {
     expect(root.classList.contains('is-ink-mode')).toBe(false);
 
     controller.enter();
+    expect(toolbar?.dataset.inkstoneControllerActive).toBe('true');
     expect(active?.style.pointerEvents).toBe('none');
     expect(root.classList.contains('is-ink-preview')).toBe(false);
     expect(root.classList.contains('is-ink-mode')).toBe(true);
@@ -181,6 +599,8 @@ describe('Ink canvas controller', () => {
     expect(session.strokes[0]?.tool).toBe('pen');
     expect(Array.isArray(session.strokes[0]?.points)).toBe(true);
     expect(session.strokes[0]?.points.length).toBeGreaterThanOrEqual(2);
+    expect(session.applyCalls).toBe(1);
+    expect(session.interactionCalls).toEqual([true, false]);
     expect(wheel.defaultPrevented).toBe(false);
 
     await controller.exit();
@@ -188,6 +608,76 @@ describe('Ink canvas controller', () => {
     expect(active.style.pointerEvents).toBe('none');
     expect(root.querySelector<HTMLElement>('.inkstone-ink-controls')?.style.display).toBe('none');
     expect(root.classList.contains('is-ink-mode')).toBe(false);
+  });
+
+  it('preserves measured Pencil pressure zero through the completed document command', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen', 'all', undefined, 0));
+    root.dispatchEvent(pointer('pointerup', 20, 30, 'pen', 'all', undefined, 0));
+
+    expect(session.strokes[0]?.points.map(({ pressure }) => pressure)).toEqual([0, 0]);
+    controller.dispose();
+  });
+
+  it('uses Pencil predictions only for an active visual tail and never persists them', () => {
+    const predictionReads = vi.fn();
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+
+    root.dispatchEvent(
+      pointerWithPredictions('pointerdown', 10, 20, [[510, 520]], predictionReads),
+    );
+    root.dispatchEvent(
+      pointerWithPredictions(
+        'pointermove',
+        20,
+        30,
+        [
+          [610, 620],
+          [710, 720],
+        ],
+        predictionReads,
+      ),
+    );
+    root.dispatchEvent(pointerWithPredictions('pointerup', 30, 40, [[810, 820]], predictionReads));
+
+    expect(predictionReads).toHaveBeenCalledTimes(2);
+    expect(session.strokes).toHaveLength(1);
+    expect(session.strokes[0]?.points).toHaveLength(3);
+    expect(session.strokes[0]?.points.every(({ x, y }) => x <= 30 && y <= 40)).toBe(true);
+    controller.dispose();
+  });
+
+  it('does not request provisional predictions for the stroke eraser', () => {
+    const predictionReads = vi.fn();
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(
+      pointerWithPredictions('pointerdown', 10, 20, [[510, 520]], predictionReads),
+    );
+    root.dispatchEvent(
+      pointerWithPredictions('pointermove', 20, 30, [[610, 620]], predictionReads),
+    );
+    root.dispatchEvent(pointer('pointerup', 30, 40, 'pen'));
+
+    expect(predictionReads).not.toHaveBeenCalled();
+    controller.dispose();
   });
 
   it('applies the fixed logical width only while Ink Mode is active', async () => {
@@ -325,6 +815,59 @@ describe('Ink canvas controller', () => {
     controller.dispose();
   });
 
+  it('shows the selected tool style after switching tools while options are hidden', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      preference: {
+        ...LocalInkToolPreferenceStore.DEFAULT,
+        hintShown: true,
+        toolStyles: {
+          ...LocalInkToolPreferenceStore.DEFAULT_TOOL_STYLES,
+          highlighter: { color: '#aabbcc', width: 12 },
+          pen: { color: '#112233', width: 4 },
+        },
+      },
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+    const pen = root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="pen"]');
+    const highlighter = root.querySelector<HTMLButtonElement>(
+      '[data-inkstone-ink-tool="highlighter"]',
+    );
+    const options = root.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show or hide Ink options"]',
+    );
+    const color = root.querySelector<HTMLInputElement>('[data-inkstone-ink-color]');
+    const width = root.querySelector<HTMLSelectElement>('[data-inkstone-ink-width-select]');
+    if (
+      pen === null ||
+      highlighter === null ||
+      options === null ||
+      color === null ||
+      width === null
+    ) {
+      throw new Error('Missing Ink style controls.');
+    }
+
+    expect(color.hidden).toBe(true);
+    highlighter.click();
+    expect(pen.getAttribute('aria-pressed')).toBe('false');
+    expect(highlighter.getAttribute('aria-pressed')).toBe('true');
+    expect(color.hidden).toBe(true);
+
+    options.click();
+
+    expect(color.hidden).toBe(false);
+    expect(color.value).toBe('#aabbcc');
+    expect(width.value).toBe('12');
+    expect(pen.getAttribute('aria-pressed')).toBe('false');
+    expect(highlighter.getAttribute('aria-pressed')).toBe('true');
+    controller.dispose();
+  });
+
   it('applies the brush width selected from the dropdown to the next stroke', () => {
     const root = document.createElement('div');
     document.body.append(root);
@@ -449,7 +992,8 @@ describe('Ink canvas controller', () => {
     second.dispose();
   });
 
-  it('replaces the complete Canvas transform when actual rendered scale changes', () => {
+  it('replaces the complete Canvas transform after a zoom gesture settles', async () => {
+    vi.useFakeTimers();
     const contexts = new WeakMap<HTMLCanvasElement, CanvasRenderingContext2D>();
     const transformSpies = new WeakMap<HTMLCanvasElement, ReturnType<typeof vi.fn>>();
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
@@ -494,13 +1038,16 @@ describe('Ink canvas controller', () => {
 
     controller.enter();
     root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-out]')?.click();
+    await vi.runAllTimersAsync();
 
     expect(committedTransformSpy).toHaveBeenCalledWith(0.9, 0, 0, 0.9, 183.2, 0);
     expect(activeTransformSpy).toHaveBeenCalledWith(0.9, 0, 0, 0.9, 183.2, 0);
     controller.dispose();
+    vi.useRealTimers();
   });
 
-  it('keeps Ink aligned when iPad WebKit reports an unzoomed layout rect after CSS zoom', () => {
+  it('keeps Ink aligned when iPad WebKit reports an unzoomed layout rect after CSS zoom', async () => {
+    vi.useFakeTimers();
     const contexts = new WeakMap<HTMLCanvasElement, CanvasRenderingContext2D>();
     const transformSpies = new WeakMap<HTMLCanvasElement, ReturnType<typeof vi.fn>>();
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
@@ -553,11 +1100,13 @@ describe('Ink canvas controller', () => {
     const visualDocumentLeft = (1_280 - 704 * 0.6) / 2;
     root.dispatchEvent(pointer('pointerdown', visualDocumentLeft + 60, 180));
     root.dispatchEvent(pointer('pointerup', visualDocumentLeft + 60, 180));
+    await vi.runAllTimersAsync();
 
     expect(transformSpy).toHaveBeenLastCalledWith(0.6, 0, 0, 0.6, visualDocumentLeft, 120);
     expect(session.strokes.at(-1)?.points[0]?.x).toBeCloseTo(100);
     expect(session.strokes.at(-1)?.points[0]?.y).toBeCloseTo(100);
     controller.dispose();
+    vi.useRealTimers();
   });
 
   it('measures actual scale even when no explicit scroll container is available', () => {
@@ -644,7 +1193,8 @@ describe('Ink canvas controller', () => {
     controller.dispose();
   });
 
-  it('scales the accepted 100% document-origin inset instead of keeping it in client pixels', () => {
+  it('scales the accepted 100% document-origin inset instead of keeping it in client pixels', async () => {
+    vi.useFakeTimers();
     const contexts = new WeakMap<HTMLCanvasElement, CanvasRenderingContext2D>();
     const transformSpies = new WeakMap<HTMLCanvasElement, ReturnType<typeof vi.fn>>();
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
@@ -700,14 +1250,17 @@ describe('Ink canvas controller', () => {
     for (let index = 0; index < 5; index += 1) {
       root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-out]')?.click();
     }
+    await vi.runAllTimersAsync();
 
     expect(layoutRoot.style.getPropertyValue('--inkstone-ink-scale')).toBe('0.5');
     expect(transformSpy).toHaveBeenCalledWith(0.5, 0, 0, 0.5, 196, 12);
     expect(root.querySelector<HTMLElement>('.inkstone-ink-surface')?.style.top).toBe('40px');
     controller.dispose();
+    vi.useRealTimers();
   });
 
-  it('normalizes a compatibility inset recaptured after a 50% Reading View host replacement', () => {
+  it('normalizes a compatibility inset recaptured after a 50% Reading View host replacement', async () => {
+    vi.useFakeTimers();
     const contexts = new WeakMap<HTMLCanvasElement, CanvasRenderingContext2D>();
     const transformSpies = new WeakMap<HTMLCanvasElement, ReturnType<typeof vi.fn>>();
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
@@ -774,6 +1327,7 @@ describe('Ink canvas controller', () => {
     for (let index = 0; index < 5; index += 1) {
       firstHost.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-out]')?.click();
     }
+    await vi.runAllTimersAsync();
     expect(transformSpy.mock.calls.filter(([scale]) => scale === 0.5).at(-1)).toEqual([
       0.5, 0, 0, 0.5, 196, 12,
     ]);
@@ -784,6 +1338,7 @@ describe('Ink canvas controller', () => {
       0.5, 0, 0, 0.5, 196, 12,
     ]);
     controller.dispose();
+    vi.useRealTimers();
   });
 
   it('calibrates a hidden narrow pane against the overlay containing-block scale', () => {
@@ -1134,6 +1689,52 @@ describe('Ink canvas controller', () => {
     controller.dispose();
   });
 
+  it('coalesces equivalent ResizeObserver callbacks without redrawing visible history', () => {
+    let resize: ResizeObserverCallback | undefined;
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          resize = callback;
+        }
+        disconnect() {}
+        observe() {}
+      },
+    );
+    const root = document.createElement('div');
+    const layoutRoot = document.createElement('div');
+    root.append(layoutRoot);
+    document.body.append(root);
+    Object.defineProperties(root, {
+      clientHeight: { configurable: true, value: 600 },
+      clientWidth: { configurable: true, value: 744 },
+    });
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 744, 600));
+    vi.spyOn(layoutRoot, 'getBoundingClientRect').mockReturnValue(rect(20, 32, 704, 1_200));
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      layoutRoot,
+      root,
+      scrollContainer: root,
+      session: new FakeSession(
+        surface(Array.from({ length: 176 }, (_value, index) => stroke(`history-${String(index)}`))),
+      ),
+    });
+    controller.enter();
+    diagnostics.reset();
+
+    for (let index = 0; index < 7; index += 1) {
+      resize?.([], {} as ResizeObserver);
+    }
+
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ name }) => name === 'ink-viewport-redraw'),
+    ).toEqual([]);
+    controller.dispose();
+  });
+
   it('publishes one resized frame whose pointer inverse stays locked to the Markdown landmark', () => {
     let resize: ResizeObserverCallback | undefined;
     vi.stubGlobal(
@@ -1182,6 +1783,137 @@ describe('Ink canvas controller', () => {
     expect(Number(layoutRoot.style.getPropertyValue('--inkstone-ink-scale'))).toBeCloseTo(scale);
     expect(session.strokes.at(-1)?.points[0]?.x).toBeCloseTo(100);
     controller.dispose();
+  });
+
+  it('freezes the contact coordinate frame when native scrolling changes the viewport mid-stroke', () => {
+    const root = document.createElement('div');
+    const layoutRoot = document.createElement('div');
+    root.append(layoutRoot);
+    document.body.append(root);
+    Object.defineProperties(root, {
+      clientHeight: { configurable: true, value: 600 },
+      clientWidth: { configurable: true, value: 704 },
+    });
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 600));
+    let documentTop = 0;
+    vi.spyOn(layoutRoot, 'getBoundingClientRect').mockImplementation(() =>
+      rect(0, documentTop, 704, 1_200),
+    );
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({
+      document,
+      layoutRoot,
+      root,
+      scrollContainer: root,
+      session,
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    documentTop = -100;
+    root.dispatchEvent(new Event('scroll'));
+    root.dispatchEvent(pointer('pointermove', 20, 30, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 30, 40, 'pen'));
+
+    const points = session.strokes.at(-1)?.points ?? [];
+    expect(
+      Math.max(...points.map(({ y }) => y)) - Math.min(...points.map(({ y }) => y)),
+    ).toBeLessThan(30);
+    controller.dispose();
+  });
+
+  it('uses compositor projection during scroll and rebuilds the viewport once after settling', async () => {
+    vi.useFakeTimers();
+    try {
+      const root = document.createElement('div');
+      const layoutRoot = document.createElement('div');
+      root.append(layoutRoot);
+      document.body.append(root);
+      Object.defineProperties(root, {
+        clientHeight: { configurable: true, value: 600 },
+        clientWidth: { configurable: true, value: 704 },
+      });
+      vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 600));
+      let documentTop = 0;
+      vi.spyOn(layoutRoot, 'getBoundingClientRect').mockImplementation(() =>
+        rect(0, documentTop, 704, 1_200),
+      );
+      const session = new FakeSession(surface([stroke('scroll-history')]));
+      const query = vi.spyOn(session, 'query');
+      const controller = new InkCanvasController({
+        document,
+        layoutRoot,
+        root,
+        scrollContainer: root,
+        session,
+      });
+      controller.enter();
+      await vi.runAllTimersAsync();
+      query.mockClear();
+      const committed = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]');
+      if (committed === null) throw new Error('Missing committed Canvas.');
+
+      documentTop = -80;
+      root.dispatchEvent(new Event('scroll'));
+
+      expect(query).not.toHaveBeenCalled();
+      expect(committed.style.transform).toContain('matrix');
+
+      await vi.runAllTimersAsync();
+
+      expect(query).toHaveBeenCalled();
+      expect(committed.style.transform).toBe('');
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('coalesces scroll and repeated zoom previews into one settled viewport rebuild', async () => {
+    vi.useFakeTimers();
+    try {
+      const root = document.createElement('div');
+      const layoutRoot = document.createElement('div');
+      root.append(layoutRoot);
+      document.body.append(root);
+      Object.defineProperties(root, {
+        clientHeight: { configurable: true, value: 600 },
+        clientWidth: { configurable: true, value: 704 },
+      });
+      vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 600));
+      let documentTop = 0;
+      vi.spyOn(layoutRoot, 'getBoundingClientRect').mockImplementation(() =>
+        rect(0, documentTop, 704, 1_200),
+      );
+      const session = new FakeSession(surface([stroke('viewport-history')]));
+      const query = vi.spyOn(session, 'query');
+      const controller = new InkCanvasController({
+        document,
+        layoutRoot,
+        root,
+        scrollContainer: root,
+        session,
+      });
+      controller.enter();
+      await vi.runAllTimersAsync();
+      query.mockClear();
+
+      documentTop = -80;
+      root.dispatchEvent(new Event('scroll'));
+      await vi.advanceTimersByTimeAsync(100);
+      for (let count = 0; count < 4; count += 1) {
+        root.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-in]')?.click();
+      }
+
+      expect(query).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(query).not.toHaveBeenCalled();
+      await vi.runAllTimersAsync();
+      expect(query).toHaveBeenCalledTimes(1);
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('fits inside the pane content box without creating horizontal overflow', () => {
@@ -1250,7 +1982,7 @@ describe('Ink canvas controller', () => {
     controller.enter();
 
     session.setLogicalHeight(1_600);
-    controller.sync(session.snapshot());
+    controller.sync(session.read());
 
     expect(overlay.style.height).toBe('1600px');
     expect(committed.style.height).toBe('100%');
@@ -1322,7 +2054,7 @@ describe('Ink canvas controller', () => {
     controller.dispose();
   });
 
-  it('reports pointer-to-presented-frame latency without exposing stroke points', () => {
+  it('reports pointer-to-Canvas-submission latency without exposing stroke points', () => {
     const frames: FrameRequestCallback[] = [];
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
       frames.push(callback);
@@ -1348,11 +2080,560 @@ describe('Ink canvas controller', () => {
     expect(frames).toHaveLength(1);
     now = 108;
     frames.shift()?.(now);
-    expect(samples).toEqual([]);
-    now = 116;
-    frames.shift()?.(now);
+    expect(samples).toEqual([8]);
+    expect(frames).toHaveLength(0);
+  });
 
-    expect(samples).toEqual([16]);
+  it('measures accepted input from the first listener line', () => {
+    let now = 100;
+    const diagnostics = new InkPerformanceDiagnostics(true, () => now);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session,
+    });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 960, 1200));
+    controller.enter();
+
+    const down = pointer('pointerdown', 10, 20, 'pen', 'all', () => {
+      now += 3;
+    });
+    root.dispatchEvent(down);
+
+    expect(diagnostics.snapshot().recentSpans).toContainEqual({
+      accepted: true,
+      adapter: 'pointer',
+      contactSequence: 1,
+      durationMs: 3,
+      inputPhase: 'down',
+      name: 'ink-input-handler',
+      sampleCountBucket: '1',
+      workPhase: 'input',
+    });
+    controller.dispose();
+  });
+
+  it('does not allocate a diagnostics contact while Ink diagnostics are disabled', () => {
+    const diagnostics = new InkPerformanceDiagnostics(false);
+    const beginSpan = vi.spyOn(diagnostics, 'beginSpan');
+    const openContact = vi.spyOn(diagnostics, 'openContact');
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 20, 30, 'pen'));
+
+    expect(beginSpan).not.toHaveBeenCalled();
+    expect(openContact).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+
+  it('does not resume diagnostics inside a contact whose recorder epoch was reset', () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    frames.shift()?.(16.7);
+    diagnostics.setEnabled(false);
+    diagnostics.setEnabled(true);
+    root.dispatchEvent(pointer('pointermove', 20, 30, 'pen'));
+    frames.shift()?.(33.4);
+    root.dispatchEvent(pointer('pointerup', 30, 40, 'pen'));
+
+    expect(diagnostics.snapshot()).toMatchObject({
+      frameIntervalsMs: { activeWriting: [], idle: [] },
+      hangingSpanCount: 0,
+      openContactCount: 0,
+      recentSpans: [],
+    });
+    controller.dispose();
+  });
+
+  it('correlates input, frame, Canvas submission, and commit for one contact', () => {
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      nextFrame += 1;
+      frames.set(nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal('cancelAnimationFrame', (frame: number) => frames.delete(frame));
+    let now = 100;
+    const diagnostics = new InkPerformanceDiagnostics(true, () => now);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface()),
+    });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 960, 1200));
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    now = 108;
+    frames.get(1)?.(now);
+    now = 112;
+    root.dispatchEvent(pointer('pointerup', 20, 30, 'pen'));
+    controller.dispose();
+
+    const snapshot = diagnostics.snapshot();
+    expect(
+      snapshot.recentSpans
+        .filter(({ contactSequence }) => contactSequence === 1)
+        .map(({ name }) => name),
+    ).toEqual([
+      'ink-input-handler',
+      'ink-frame-work',
+      'ink-input-to-submit',
+      'ink-stroke-commit',
+      'ink-input-handler',
+    ]);
+    expect(snapshot.hangingSpanCount).toBe(0);
+    expect(snapshot.openContactCount).toBe(0);
+    expect(snapshot.recentSpans.find(({ name }) => name === 'ink-stroke-commit')).toMatchObject({
+      documentCommandProduced: true,
+    });
+  });
+
+  it('keeps a physical down span owned when optional pointer capture throws', () => {
+    const canvasContext = contextFixture();
+    canvasContext.closePath = vi.fn();
+    canvasContext.fill = vi.fn();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const source: InkSurfaceRecord = {
+      ...surface([]),
+      layout: { ...surface().layout, originY: 0 },
+      schemaVersion: 3,
+    };
+    const session = new InkLiveDocument({
+      debounceMs: 60_000,
+      surfaces: [source],
+      writer: { updateSurface: (record) => Promise.resolve(record) },
+    });
+    const root = document.createElement('div');
+    Object.defineProperty(root, 'setPointerCapture', {
+      configurable: true,
+      value: vi.fn(() => {
+        throw new DOMException('No active pointer.', 'NotFoundError');
+      }),
+    });
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      preference: { color: '#112233', hintShown: true, tool: 'pen', width: 4 },
+      root,
+      session,
+      unpublishedPhysicalInkHat: { session },
+    });
+    controller.enter();
+    for (let remaining = 8; frames.length > 0 && remaining > 0; remaining -= 1) {
+      frames.shift()?.(16.7);
+    }
+    diagnostics.reset();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    frames.shift()?.(33.4);
+
+    const snapshot = diagnostics.snapshot();
+    expect(snapshot.recentSpans).toContainEqual(
+      expect.objectContaining({
+        adapter: 'pointer',
+        inputPhase: 'down',
+        name: 'ink-input-to-submit',
+        presentationOutcome: 'submitted',
+        sampleCountBucket: '1',
+      }),
+    );
+    expect(snapshot.hangingSpanCount).toBe(0);
+    controller.dispose();
+  });
+
+  it('settles multiple accepted batches in one presentation frame exactly once', () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface()),
+    });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing active canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 960, 1200));
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 20, 30, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 30, 40, 'pen'));
+    expect(frames).toHaveLength(1);
+    const submittedFrame = frames.shift();
+    submittedFrame?.(16.7);
+    submittedFrame?.(33.4);
+
+    expect(
+      diagnostics
+        .snapshot()
+        .recentSpans.filter(({ accepted, name }) => accepted && name === 'ink-input-to-submit'),
+    ).toEqual([
+      expect.objectContaining({
+        batchSequence: 1,
+        requestedGeneration: 1,
+        submittedGeneration: 1,
+      }),
+      expect.objectContaining({
+        batchSequence: 2,
+        requestedGeneration: 1,
+        submittedGeneration: 1,
+      }),
+      expect.objectContaining({
+        batchSequence: 3,
+        requestedGeneration: 1,
+        submittedGeneration: 1,
+      }),
+    ]);
+    controller.dispose();
+  });
+
+  it('marks an eraser contact that changes no stroke as not producing a document command', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 12, 12, 'pen'));
+
+    expect(
+      diagnostics.snapshot().recentSpans.find(({ name }) => name === 'ink-stroke-commit'),
+    ).toMatchObject({ documentCommandProduced: false });
+    controller.dispose();
+  });
+
+  it('does not attribute an ended contact to the active render generation of the next contact', () => {
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      nextFrame += 1;
+      frames.set(nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal('cancelAnimationFrame', (frame: number) => frames.delete(frame));
+    let now = 100;
+    const diagnostics = new InkPerformanceDiagnostics(true, () => now);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface([stroke('saved')])),
+    });
+    controller.enter();
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="eraser"]')?.click();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 12, 12, 'pen'));
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-tool="pen"]')?.click();
+    root.dispatchEvent(pointer('pointerdown', 20, 20, 'pen'));
+    now = 108;
+    frames.values().next().value?.(now);
+
+    expect(
+      diagnostics
+        .snapshot()
+        .recentSpans.filter(({ name }) => name === 'ink-input-to-submit')
+        .map(
+          ({
+            accepted,
+            batchSequence,
+            contactSequence,
+            presentationOutcome,
+            requestedGeneration,
+            submittedGeneration,
+          }) => ({
+            accepted,
+            batchSequence,
+            contactSequence,
+            presentationOutcome,
+            requestedGeneration,
+            submittedGeneration,
+          }),
+        ),
+    ).toEqual([
+      {
+        accepted: false,
+        batchSequence: 1,
+        contactSequence: 1,
+        presentationOutcome: 'cancelled',
+        requestedGeneration: 1,
+        submittedGeneration: null,
+      },
+      {
+        accepted: true,
+        batchSequence: 1,
+        contactSequence: 2,
+        presentationOutcome: 'submitted',
+        requestedGeneration: 2,
+        submittedGeneration: 2,
+      },
+    ]);
+    controller.dispose();
+  });
+
+  it('classifies a context-lost Presentation Frame Generation as unpresented', () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root
+      .querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]')
+      ?.dispatchEvent(new Event('contextlost', { cancelable: true }));
+    frames.shift()?.(16.7);
+
+    expect(
+      diagnostics.snapshot().recentSpans.filter(({ name }) => name === 'ink-input-to-submit'),
+    ).toEqual([
+      expect.objectContaining({
+        accepted: false,
+        batchSequence: 1,
+        presentationOutcome: 'unpresented',
+        requestedGeneration: 1,
+        submittedGeneration: null,
+      }),
+    ]);
+    controller.dispose();
+  });
+
+  it('classifies pending ownership as unpresented when the controller unloads', () => {
+    vi.stubGlobal('requestAnimationFrame', () => 1);
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    controller.dispose();
+
+    expect(
+      diagnostics.snapshot().recentSpans.find(({ name }) => name === 'ink-input-to-submit'),
+    ).toEqual(
+      expect.objectContaining({
+        accepted: false,
+        presentationOutcome: 'unpresented',
+        submittedGeneration: null,
+      }),
+    );
+  });
+
+  it('classifies pending ownership as unpresented when Obsidian replaces the host', () => {
+    vi.stubGlobal('requestAnimationFrame', () => 1);
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    const replacement = document.createElement('div');
+    document.body.append(root, replacement);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      layoutRoot: root,
+      root,
+      scrollContainer: root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    controller.reattach(replacement, replacement, replacement);
+
+    expect(
+      diagnostics.snapshot().recentSpans.find(({ name }) => name === 'ink-input-to-submit'),
+    ).toEqual(
+      expect.objectContaining({
+        accepted: false,
+        presentationOutcome: 'unpresented',
+        submittedGeneration: null,
+      }),
+    );
+    controller.dispose();
+  });
+
+  it('uses the same listener-first spans for the stylus Touch adapter', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface()),
+    });
+    controller.enter();
+
+    root.dispatchEvent(touch('touchstart', 10, 20, 'stylus'));
+    root.dispatchEvent(touch('touchmove', 20, 30, 'stylus'));
+    root.dispatchEvent(touch('touchend', 30, 40, 'stylus'));
+    controller.dispose();
+
+    const snapshot = diagnostics.snapshot();
+    expect(
+      snapshot.recentSpans
+        .filter(
+          ({ accepted, adapter, name }) =>
+            accepted && adapter === 'stylus-touch' && name === 'ink-input-handler',
+        )
+        .map(({ inputPhase }) => inputPhase),
+    ).toEqual(['down', 'move', 'up']);
+    expect(snapshot.recentSpans).toContainEqual(
+      expect.objectContaining({
+        adapter: 'stylus-touch',
+        contactSequence: 1,
+        name: 'ink-stroke-commit',
+      }),
+    );
+    expect(snapshot.hangingSpanCount).toBe(0);
+    expect(snapshot.openContactCount).toBe(0);
+  });
+
+  it('keeps the accepted input path free of cold document snapshots', () => {
+    const measurements = [0, 10_000].map((historyCount) => {
+      const diagnostics = new InkPerformanceDiagnostics(true);
+      const root = document.createElement('div');
+      document.body.append(root);
+      const session = new FakeSession(
+        surface(
+          Array.from({ length: historyCount }, (_value, index) => stroke(`history-${index}`)),
+        ),
+      );
+      const controller = new InkCanvasController({
+        document,
+        inkPerformance: diagnostics,
+        root,
+        session,
+      });
+      controller.enter();
+      const read = vi.spyOn(session, 'read');
+      const query = vi.spyOn(session, 'query');
+      const snapshot = vi.spyOn(session, 'snapshot');
+      const measure = vi.spyOn(root, 'getBoundingClientRect');
+
+      root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+      read.mockClear();
+      query.mockClear();
+      snapshot.mockClear();
+      measure.mockClear();
+      for (let index = 0; index < 100; index += 1) {
+        root.dispatchEvent(pointer('pointermove', 20 + index, 30 + index, 'pen'));
+      }
+
+      expect(diagnostics.snapshot().forbiddenWork).toEqual([]);
+      const measurement = {
+        apply: session.applyCalls,
+        domMeasurements: measure.mock.calls.length,
+        queries: query.mock.calls.length,
+        reads: read.mock.calls.length,
+        snapshots: snapshot.mock.calls.length,
+      };
+      controller.dispose();
+      return measurement;
+    });
+
+    expect(measurements).toEqual([
+      { apply: 0, domMeasurements: 0, queries: 0, reads: 0, snapshots: 0 },
+      { apply: 0, domMeasurements: 0, queries: 0, reads: 0, snapshots: 0 },
+    ]);
+  });
+
+  it('measures viewport redraws with only a result count', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const root = document.createElement('div');
+    document.body.append(root);
+
+    const controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session: new FakeSession(surface([stroke('visible')])),
+    });
+
+    expect(diagnostics.snapshot().recentSpans).toContainEqual(
+      expect.objectContaining({
+        name: 'ink-viewport-redraw',
+        viewportResultCount: 1,
+        workPhase: 'viewport',
+      }),
+    );
+    expect(JSON.stringify(diagnostics.snapshot())).not.toMatch(/points|pressure|tilt|color/);
+    expect(diagnostics.snapshot().memory.backingStoreBytes).toBeGreaterThan(0);
+    expect(diagnostics.snapshot().memory.disposableCacheBytes).toBeGreaterThan(0);
+    controller.dispose();
   });
 
   it('routes touch input to reading instead of starting a desktop stroke', () => {
@@ -1773,6 +3054,28 @@ describe('Ink canvas controller', () => {
 
     expect(session.erasePolygonCalls).toEqual([]);
     expect(session.eraseCalls).toBe(1);
+    controller.dispose();
+  });
+
+  it('cancels capture ownership on lostpointercapture and accepts the next clean contact', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 20, 20, 'pen'));
+    root.dispatchEvent(pointer('lostpointercapture', 20, 20, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 30, 30, 'pen'));
+    root.dispatchEvent(pointer('pointerdown', 40, 40, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 50, 50, 'pen'));
+
+    expect(session.strokes).toHaveLength(1);
+    expect(session.strokes[0]?.points).toMatchObject([
+      { x: 40, y: 40 },
+      { x: 50, y: 50 },
+    ]);
     controller.dispose();
   });
 
@@ -2357,6 +3660,7 @@ describe('Ink canvas controller', () => {
       'Redo Ink change',
       'Show or hide Ink options',
       'Retry local Ink save',
+      'Export retained unsaved Ink as SVG',
     ]);
     expect(
       buttons.every((button) => button.textContent?.trim() || button.getAttribute('aria-label')),
@@ -2614,6 +3918,32 @@ describe('Ink canvas controller', () => {
     await vi.waitFor(() => expect(session.retryCalls).toBe(1));
   });
 
+  it('rejects new drawing input while Done is saving the frozen revision', async () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    let finishSave = (): void => undefined;
+    const exit = vi.spyOn(session, 'exit').mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSave = resolve;
+        }),
+    );
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+
+    const exiting = controller.exit();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledOnce());
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 30, 40, 'pen'));
+
+    expect(session.applyCalls).toBe(0);
+
+    finishSave();
+    await exiting;
+    controller.dispose();
+  });
+
   it('delegates persistence Retry to the lifecycle owner without locally deactivating', async () => {
     const root = document.createElement('div');
     document.body.append(root);
@@ -2634,6 +3964,29 @@ describe('Ink canvas controller', () => {
 
     expect(session.retryCalls).toBe(0);
     expect(root.classList.contains('is-ink-mode')).toBe(true);
+    controller.dispose();
+  });
+
+  it('exports the retained in-memory revision after Done persistence fails', async () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const exportOwner = vi.fn(() => Promise.resolve());
+    const session = new FakeSession(surface());
+    session.failExit = true;
+    const controller = new InkCanvasController({
+      document,
+      onExportUnsavedRequested: exportOwner,
+      root,
+      session,
+    });
+    controller.enter();
+    await expect(controller.exit()).rejects.toThrow('disk unavailable');
+
+    root.querySelector<HTMLButtonElement>('[data-inkstone-ink-export-unsaved]')?.click();
+    await vi.waitFor(() => expect(exportOwner).toHaveBeenCalledTimes(1));
+
+    expect(root.classList.contains('is-ink-mode')).toBe(true);
+    expect(session.read().state).toMatchObject({ dirty: true, kind: 'ink-mode' });
     controller.dispose();
   });
 
@@ -2658,6 +4011,7 @@ describe('Ink canvas controller', () => {
 });
 
 class FakeSession {
+  applyCalls = 0;
   cancelCalls = 0;
   clearCalls = 0;
   commitCalls = 0;
@@ -2668,6 +4022,9 @@ class FakeSession {
   exitCalls = 0;
   failExit = false;
   hoverCalls: Array<{ x: number; y: number }> = [];
+  interactionCalls: boolean[] = [];
+  userInteractionCalls = 0;
+  private interactionActive = false;
   retryCalls = 0;
   redoCalls = 0;
   previewCalls: Array<{ dx: number; dy: number }> = [];
@@ -2704,6 +4061,24 @@ class FakeSession {
     };
   }
 
+  read() {
+    return createTestInkReadView(this.snapshot());
+  }
+
+  query(viewport: InkLogicalRect) {
+    return queryTestInkReadView(this.read(), viewport);
+  }
+
+  setInteractionActive(active: boolean): void {
+    if (active === this.interactionActive) return;
+    this.interactionActive = active;
+    this.interactionCalls.push(active);
+  }
+
+  noteUserInteraction(): void {
+    this.userInteractionCalls += 1;
+  }
+
   setLogicalHeight(logicalHeight: number): void {
     this.record = {
       ...this.record,
@@ -2715,6 +4090,14 @@ class FakeSession {
     if (this.state.kind === 'reading') throw new Error('Cannot add outside Ink Mode.');
     this.strokes.push(stroke);
     this.state = { dirty: true, kind: 'ink-mode', saveError: null };
+  }
+
+  apply(command: InkDocumentCommand): InkDocumentApplyResult {
+    if (command.kind !== 'add')
+      throw new Error(`Unexpected fake document command: ${command.kind}`);
+    this.applyCalls += 1;
+    this.addStroke(command.stroke);
+    return committedAddResult(command, this.strokes.length);
   }
 
   enter(): void {
@@ -2831,6 +4214,7 @@ class FakeSession {
     return Promise.resolve();
   }
 
+  retry(): Promise<void>;
   retry(): Promise<void> {
     this.retryCalls += 1;
     this.failExit = false;
@@ -2865,6 +4249,25 @@ class FakeSession {
     this.undoCalls += 1;
     return true;
   }
+}
+
+function committedAddResult(
+  command: Extract<InkDocumentCommand, { readonly kind: 'add' }>,
+  generation: number,
+): InkDocumentApplyResult {
+  return {
+    change: {
+      addedIds: [command.stroke.id],
+      bounds: [],
+      commandId: command.id,
+      generation,
+      persistenceDelta: null,
+      removedIds: [],
+      selectionDelta: null,
+      updatedIds: [],
+    },
+    kind: 'committed',
+  };
 }
 
 function surface(strokes: readonly InkStroke[] = []): InkSurfaceRecord {
@@ -2904,12 +4307,22 @@ function stroke(id: string): InkStroke {
   };
 }
 
+function v3LegacyStroke(id: string): InkStroke {
+  return {
+    ...stroke(id),
+    brushRenderVersion: 'legacy-round-v1',
+    inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+  };
+}
+
 function pointer(
   type: string,
   x: number,
   y: number,
   pointerType = 'mouse',
   coalescedEvents: 'all' | 'moves-only' = 'all',
+  onCoalesced?: () => void,
+  pressure = pointerType === 'pen' ? 0.7 : 0,
 ): Event {
   const event = new MouseEvent(type, {
     bubbles: true,
@@ -2920,13 +4333,43 @@ function pointer(
   });
   Object.defineProperties(event, {
     getCoalescedEvents: {
-      value: () => (coalescedEvents === 'moves-only' && type !== 'pointermove' ? [] : [event]),
+      configurable: true,
+      value: () => {
+        onCoalesced?.();
+        return coalescedEvents === 'moves-only' && type !== 'pointermove' ? [] : [event];
+      },
     },
     pointerId: { value: 1 },
     pointerType: { value: pointerType },
-    pressure: { value: pointerType === 'pen' ? 0.7 : 0 },
+    pressure: { value: pressure },
     tiltX: { value: 0 },
     tiltY: { value: 0 },
+  });
+  return event;
+}
+
+function pointerWithPredictions(
+  type: string,
+  x: number,
+  y: number,
+  predictions: readonly (readonly [number, number])[],
+  onPredictions?: () => void,
+): Event {
+  const event = pointer(type, x, y, 'pen');
+  const predictedEvents = predictions.map(([predictedX, predictedY], index) => {
+    const predicted = pointer('pointermove', predictedX, predictedY, 'pen');
+    Object.defineProperty(predicted, 'timeStamp', {
+      configurable: true,
+      value: event.timeStamp + index + 1,
+    });
+    return predicted;
+  });
+  Object.defineProperty(event, 'getPredictedEvents', {
+    configurable: true,
+    value: () => {
+      onPredictions?.();
+      return predictedEvents;
+    },
   });
   return event;
 }

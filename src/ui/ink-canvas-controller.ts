@@ -1,5 +1,23 @@
-import type { InkSurfaceSessionSnapshot } from '../application/ink-surface-session';
+import type {
+  InkDocumentApplyResult,
+  InkDocumentChange,
+  InkDocumentCommand,
+  InkDocumentReadView,
+  InkLogicalRect,
+  InkRenderableStrokeRef,
+} from '../application/ink-document-session';
 import type { InkPoint, InkStroke } from '../domain/ink-surface';
+import {
+  NOOP_INK_PERFORMANCE_RECORDER,
+  type InkInputAdapter,
+  type InkInputPhase,
+  type InkPerformanceContact,
+  type InkPerformanceRecorder,
+  type InkPerformanceSpan,
+  type InkPerformanceSpanName,
+  type InkPerformanceWorkPhase,
+} from '../runtime/ink-performance-diagnostics';
+import { InkPresentationGenerationLedger } from '../runtime/ink-presentation-generation-ledger';
 import {
   fitInkWorkspaceScale,
   INK_DOCUMENT_LOGICAL_WIDTH,
@@ -14,10 +32,31 @@ import {
 import { InkToolbarApp, type InkToolbarAppProps } from './ink/ink-toolbar-app';
 import {
   createInkStageFrame,
+  sameInkStageFrame,
   type CssPoint,
   type CssRect,
   type InkStageFrame,
 } from './ink-stage-frame';
+import {
+  InkCapturePipeline,
+  PointerEventInkAdapter,
+  WebKitStylusTouchAdapter,
+  type InkBorrowedProvisionalTail,
+  type InkCaptureBatchContext,
+  type InkCaptureResult,
+} from './ink-capture-pipeline';
+import {
+  InkRenderRuntime,
+  type InkActivePresentationAdapterState,
+  type InkRenderRuntimeStats,
+  type InkWorkerPresentationRuntimeOptions,
+} from './ink-render-runtime';
+import {
+  InkUnpublishedPhysicalInkCandidate,
+  type InkPhysicalCandidateDocumentPort,
+  type InkUnpublishedPhysicalCandidateCapture,
+  type InkUnpublishedPhysicalCandidateRead,
+} from './ink-physical-candidate-controller';
 import { createPreactIsland, type UiIsland } from './runtime/mount-preact-island';
 import { viewportBounds } from './runtime/anchored-layer-position';
 import {
@@ -27,7 +66,16 @@ import {
 } from './stores/ink-toolbar-store';
 
 interface InkSessionLike {
-  addStroke(stroke: InkStroke): void;
+  apply(
+    command: InkDocumentCommand,
+    preparedGeometry?: {
+      readonly bounds: InkLogicalRect;
+      readonly color: string;
+      readonly logicalStrokeId: string;
+      readonly tool: InkStroke['tool'];
+      readonly version: InkStroke['brushRenderVersion'];
+    },
+  ): InkDocumentApplyResult;
   background(): Promise<void>;
   cancelSelectionMove?(): boolean;
   canRedo(): boolean;
@@ -39,15 +87,21 @@ interface InkSessionLike {
   eraseStrokesInPolygon(polygon: readonly InkPoint[]): readonly string[];
   enter(): void;
   exit(): Promise<void>;
+  noteUserInteraction?(): void;
   redo(): boolean;
   previewSelectionMove?(dx: number, dy: number): { readonly dx: number; readonly dy: number };
+  query(viewport: InkLogicalRect): readonly InkRenderableStrokeRef[];
+  read(): InkDocumentReadView;
   retry(): Promise<void>;
   selectStrokeAt?(point: InkPoint, tolerance: number, additive?: boolean): readonly string[];
+  setInteractionActive?(active: boolean): void;
   selectedStrokeIds?(): readonly string[];
-  snapshot(): InkSurfaceSessionSnapshot;
   strokeIdAt?(point: InkPoint, tolerance: number): string | null;
   undo(): boolean;
 }
+
+let nextInkControllerInstance = 0;
+const VIEWPORT_SETTLE_DELAY_MS = 120;
 
 interface InkControlsDragState {
   readonly left: number;
@@ -63,13 +117,6 @@ interface InkSelectionDragState {
   readonly start: InkPoint;
   readonly startClient: CssPoint;
   readonly toggleOnClick: boolean;
-}
-
-interface InkDirtyRect {
-  readonly height: number;
-  readonly width: number;
-  readonly x: number;
-  readonly y: number;
 }
 
 interface InkClientInputSample {
@@ -89,66 +136,105 @@ interface InkToolStyle {
   readonly width: number;
 }
 
+export interface InkUnpublishedPhysicalInkHatControllerOptions {
+  readonly session: InkPhysicalCandidateDocumentPort;
+}
+
+type InkControllerCapture =
+  | {
+      readonly lane: 'legacy';
+      readonly provisionalTail: InkBorrowedProvisionalTail | null;
+      readonly result: InkCaptureResult;
+      readonly sampleCount: number;
+    }
+  | {
+      readonly lane: 'physical';
+      readonly provisionalTail: null;
+      readonly result: InkUnpublishedPhysicalCandidateCapture;
+      readonly sampleCount: number;
+    };
+
 type InkToolStyles = Record<InkStroke['tool'], InkToolStyle>;
+
+const DISABLED_POINTER_PERFORMANCE_CONTACT: InkPerformanceContact = Object.freeze({
+  adapter: 'pointer',
+  sequence: 0,
+});
+const DISABLED_STYLUS_PERFORMANCE_CONTACT: InkPerformanceContact = Object.freeze({
+  adapter: 'stylus-touch',
+  sequence: 0,
+});
 
 /** A single fixed logical surface. Rendering stays pointer-transparent in every view mode. */
 export class InkCanvasController {
   private active = false;
-  private readonly activeCanvas: HTMLCanvasElement;
-  private readonly activeContext: CanvasRenderingContext2D;
+  private activeContactDiagnosticsEnabled = false;
   private activePointerId: number | null = null;
   private activeStylusTouchId: number | null = null;
-  private activeClientPoints: CssPoint[] = [];
-  private activePoints: InkPoint[] = [];
-  private activePaintedPointCount = 0;
-  private readonly committedCanvas: HTMLCanvasElement;
-  private readonly committedContext: CanvasRenderingContext2D;
+  private activePerformanceContact: InkPerformanceContact | null = null;
+  private cachedCaptureBatchContext: InkCaptureBatchContext | null = null;
+  private readonly capturePipeline = new InkCapturePipeline();
   private readonly controls: HTMLElement;
+  private currentRead: InkDocumentReadView;
+  private lastSynchronizedChange: InkDocumentChange | null = null;
   private controlsDragState: InkControlsDragState | null = null;
   private disposed = false;
   private readonly document: Document;
   private documentOriginInset: CssPoint | null;
+  private contactStageFrameFrozen = false;
+  private deferredStageFrame: InkStageFrame | null = null;
   private readonly dragHandle: HTMLButtonElement;
   private readonly extentProbeTimeouts = new Set<number>();
   private eraserPreviewColor = '#dc2626';
-  private frame: number | null = null;
   private hintShown: boolean;
   private hoveredStrokeId: string | null = null;
   private inputTarget: HTMLElement;
   private layoutRoot: HTMLElement;
   private readonly onExitRequested: () => Promise<void>;
+  private readonly onExportUnsavedRequested: () => Promise<void>;
   private readonly onLayoutExtentChanged: (minimumHeight: number) => void;
   private readonly onPreferenceChanged: (preference: InkToolPreference) => void;
   private readonly onRetryRequested: () => Promise<void>;
-  private readonly now: () => number;
+  private readonly inkPerformance: InkPerformanceRecorder;
   private readonly overlay: HTMLElement;
-  private pendingInputStartedAt: number | null = null;
+  private readonly presentationLedger: InkPresentationGenerationLedger;
+  private readonly physicalCandidate: InkUnpublishedPhysicalInkCandidate | null;
   private pendingExitTarget: 'raw' | 'preview' = 'raw';
   private readingContextRestoreFrame: number | null = null;
   private previousPosition: string;
-  private readonly recordInputToPaint: (durationMs: number) => void;
   private reportedLayoutExtent = 0;
-  private renderedStrokes: readonly InkStroke[] = [];
+  private readonly renderRuntime: InkRenderRuntime;
   private resizeObserver: ResizeObserver | null = null;
   private root: HTMLElement;
   private scrollContainer: HTMLElement | null;
   private readonly session: InkSessionLike;
   private stageFrame: InkStageFrame;
   private stageFrameChanged = true;
+  private stageFrameEpoch = 0;
   private selectionDragState: InkSelectionDragState | null = null;
   private selectionCommittedStrokes: readonly InkStroke[] | null = null;
-  private selectionChromeBounds: InkDirtyRect | null = null;
   private selectionFrame: number | null = null;
   private pendingSelectionDelta: { readonly dx: number; readonly dy: number } | null = null;
+  private readonly pointerInkAdapter = new PointerEventInkAdapter();
   private readonly toolbarHost: HTMLElement;
   private readonly toolbarIsland: UiIsland<InkToolbarAppProps> = createPreactIsland(InkToolbarApp);
   private readonly toolbarStore: InkToolbarStore;
   private readonly toolStyles: InkToolStyles;
+  private readonly touchInkAdapter = new WebKitStylusTouchAdapter();
   private viewMode: 'raw' | 'preview' | 'edit' = 'raw';
+  private viewportSettleTimer: number | null = null;
   private readonly viewportHost: HTMLElement | null;
 
   private get viewportHeight(): number {
     return this.stageFrame.logicalViewport.height;
+  }
+
+  get activePresentationAdapterState(): InkActivePresentationAdapterState | null {
+    return this.renderRuntime.activePresentationAdapterState;
+  }
+
+  get renderRuntimeStats(): InkRenderRuntimeStats {
+    return this.renderRuntime.stats();
   }
 
   private get viewportLeft(): number {
@@ -178,9 +264,11 @@ export class InkCanvasController {
   constructor(input: {
     readonly controlsHost?: HTMLElement;
     readonly document: Document;
+    readonly inkPerformance?: InkPerformanceRecorder;
     readonly layoutRoot?: HTMLElement;
     readonly now?: () => number;
     readonly onExitRequested?: () => Promise<void>;
+    readonly onExportUnsavedRequested?: () => Promise<void>;
     readonly onLayoutExtentChanged?: (minimumHeight: number) => void;
     readonly onPreferenceChanged?: (preference: InkToolPreference) => void;
     readonly onRetryRequested?: () => Promise<void>;
@@ -190,7 +278,11 @@ export class InkCanvasController {
     readonly scrollContainer?: HTMLElement;
     readonly session: InkSessionLike;
     readonly viewportHost?: HTMLElement;
+    readonly workerPresentation?: InkWorkerPresentationRuntimeOptions;
+    readonly unpublishedPhysicalInkHat?: InkUnpublishedPhysicalInkHatControllerOptions;
   }) {
+    nextInkControllerInstance += 1;
+    const controllerInstance = String(nextInkControllerInstance);
     this.document = input.document;
     this.root = input.root;
     this.layoutRoot = input.layoutRoot ?? input.root;
@@ -198,10 +290,15 @@ export class InkCanvasController {
     this.viewportHost = input.viewportHost ?? null;
     this.inputTarget = this.scrollContainer ?? this.root;
     this.session = input.session;
-    this.now = input.now ?? (() => performance.now());
+    this.inkPerformance = input.inkPerformance ?? NOOP_INK_PERFORMANCE_RECORDER;
     this.onExitRequested = input.onExitRequested ?? (() => this.exit());
+    this.onExportUnsavedRequested = input.onExportUnsavedRequested ?? (() => Promise.resolve());
     this.onLayoutExtentChanged = input.onLayoutExtentChanged ?? (() => undefined);
-    this.recordInputToPaint = input.recordInputToPaint ?? (() => undefined);
+    this.presentationLedger = new InkPresentationGenerationLedger({
+      diagnostics: this.inkPerformance,
+      ...(input.now === undefined ? {} : { now: input.now }),
+      ...(input.recordInputToPaint === undefined ? {} : { onSubmitted: input.recordInputToPaint }),
+    });
     const preference = input.preference ?? LocalInkToolPreferenceStore.DEFAULT;
     this.hintShown = preference.hintShown;
     this.toolStyles = initialToolStyles(preference);
@@ -211,17 +308,25 @@ export class InkCanvasController {
     });
     this.onPreferenceChanged = input.onPreferenceChanged ?? (() => undefined);
     this.onRetryRequested = input.onRetryRequested ?? (() => this.retrySave());
+    this.physicalCandidate =
+      input.unpublishedPhysicalInkHat === undefined
+        ? null
+        : new InkUnpublishedPhysicalInkCandidate({
+            onStateChange: this.onPhysicalCandidateStateChange,
+            session: input.unpublishedPhysicalInkHat.session,
+          });
     this.previousPosition = input.root.style.position;
     if (getComputedStyle(input.root).position === 'static') {
       input.root.style.position = 'relative';
     }
     input.root.classList.add('inkstone-ink-host');
 
-    const snapshot = input.session.snapshot();
+    const read = input.session.read();
+    this.currentRead = read;
     this.stageFrame = createInkStageFrame({
       actualScale: 1,
       canvasClientRect: {
-        height: this.paneHeight(snapshot.surface.layout.logicalHeight),
+        height: this.paneHeight(read.logicalHeight),
         left: 0,
         top: 0,
         width: this.paneWidth(INK_DOCUMENT_LOGICAL_WIDTH),
@@ -230,21 +335,32 @@ export class InkCanvasController {
     });
     this.overlay = input.document.createElement('div');
     this.overlay.className = 'inkstone-ink-surface';
-    this.overlay.dataset.inkstoneInkSurface = snapshot.surface.id;
+    this.overlay.dataset.inkstoneInkController = controllerInstance;
+    this.overlay.dataset.inkstoneInkSurface = read.documentId;
     this.overlay.hidden = true;
     this.overlay.style.width = `${INK_DOCUMENT_LOGICAL_WIDTH}px`;
-    this.overlay.style.height = `${snapshot.surface.layout.logicalHeight}px`;
+    this.overlay.style.height = `${read.logicalHeight}px`;
 
-    this.committedCanvas = this.createCanvas('committed');
-    this.committedCanvas.dataset.inkstoneInkCommitted = 'true';
-    this.committedCanvas.style.pointerEvents = 'none';
-    this.activeCanvas = this.createCanvas('active');
-    this.activeCanvas.dataset.inkstoneInkActive = 'true';
-    this.activeCanvas.style.pointerEvents = 'none';
-    this.committedContext = requireContext(this.committedCanvas);
-    this.activeContext = requireContext(this.activeCanvas);
+    this.renderRuntime = new InkRenderRuntime({
+      document: input.document,
+      host: this.overlay,
+      inkPerformance: this.inkPerformance,
+      onActiveFrame: this.onRenderActiveFrame,
+      onActiveFrameUnpresented: (generation) =>
+        this.presentationLedger.cancel('unpresented', generation),
+      onDiagnostic: this.onRenderDiagnostic,
+      query: (viewport) => this.session.query(viewport),
+      read: () => this.session.read(),
+      ...(input.workerPresentation === undefined
+        ? {}
+        : { workerPresentation: input.workerPresentation }),
+    });
 
     this.toolbarHost = input.document.createElement('div');
+    this.toolbarHost.dataset.inkstoneControllerActive = 'false';
+    this.toolbarHost.dataset.inkstoneInkController = controllerInstance;
+    this.toolbarHost.dataset.inkstonePhysicalCandidate =
+      this.physicalCandidate === null ? 'unavailable' : this.physicalCandidate.read().kind;
     this.toolbarHost.dataset.inkstoneInkToolbarHost = '';
     (input.controlsHost ?? input.root).append(this.toolbarHost);
     this.toolbarIsland.mount(this.toolbarHost, this.toolbarProps());
@@ -255,7 +371,6 @@ export class InkCanvasController {
     if (controls === null || dragHandle === null) throw new Error('Ink toolbar failed to mount.');
     this.controls = controls;
     this.dragHandle = dragHandle;
-    this.overlay.append(this.committedCanvas, this.activeCanvas);
     input.root.append(this.overlay);
     this.documentOriginInset = this.captureDocumentOriginInset();
     this.positionOverlay();
@@ -264,7 +379,7 @@ export class InkCanvasController {
     this.document.defaultView?.addEventListener('resize', this.onRootResized);
     this.document.defaultView?.visualViewport?.addEventListener('resize', this.onRootResized);
     this.document.defaultView?.visualViewport?.addEventListener('scroll', this.onRootResized);
-    this.sync(snapshot);
+    this.sync(read, null);
     const ResizeObserverConstructor =
       input.document.defaultView?.ResizeObserver ??
       (typeof ResizeObserver === 'undefined' ? undefined : ResizeObserver);
@@ -283,6 +398,7 @@ export class InkCanvasController {
     }
     this.session.enter();
     this.active = true;
+    this.toolbarHost.dataset.inkstoneControllerActive = 'true';
     this.viewMode = 'edit';
     this.overlay.hidden = false;
     this.root.classList.remove('is-ink-preview');
@@ -291,11 +407,11 @@ export class InkCanvasController {
       this.activateWorkspace();
       this.positionOverlay();
     });
-    this.activeCanvas.style.pointerEvents = 'none';
     this.document.addEventListener('keydown', this.onDocumentKeyDown);
     this.updateToolbar({ active: true });
     this.positionControlsDefault();
-    this.sync(this.session.snapshot());
+    this.sync(this.session.read());
+    this.enterPhysicalCandidate();
     if (!this.hintShown) {
       this.hintShown = true;
       this.updateToolbar({
@@ -312,13 +428,12 @@ export class InkCanvasController {
     this.overlay.hidden = false;
     this.root.classList.remove('is-ink-mode');
     this.root.classList.add('is-ink-preview');
-    this.activeCanvas.style.pointerEvents = 'none';
     this.updateToolbar({ active: false });
     this.preserveReadingContext(() => {
       this.activateWorkspace();
       this.positionOverlay();
     });
-    this.sync(this.session.snapshot());
+    this.sync(this.session.read());
   }
 
   hidePreview(): void {
@@ -331,34 +446,44 @@ export class InkCanvasController {
 
   async exit(target: 'raw' | 'preview' = 'raw'): Promise<void> {
     this.finishStroke(false);
+    const resumeAfterFailure = this.active;
+    this.active = false;
+    this.updateToolbar({ statusText: 'Ink Mode · Saving…' });
     this.pendingExitTarget = target;
     try {
+      await this.physicalCandidate?.discardUnused();
       await this.session.exit();
-      this.sync(this.session.snapshot());
+      this.sync(this.session.read());
       this.deactivate(target);
       this.pendingExitTarget = 'raw';
     } catch (error) {
-      this.sync(this.session.snapshot());
-      this.enter();
+      this.sync(this.session.read());
+      if (resumeAfterFailure) this.enter();
       throw error;
     }
   }
 
   background(): Promise<void> {
     this.finishStroke(false);
-    return this.session.background().finally(() => this.sync(this.session.snapshot()));
+    return (async () => {
+      await this.physicalCandidate?.discardUnused();
+      await this.session.background();
+    })().finally(() => {
+      this.sync(this.session.read());
+      if (this.active) this.enterPhysicalCandidate();
+    });
   }
 
   async retrySave(): Promise<void> {
     try {
       await this.session.retry();
     } finally {
-      this.sync(this.session.snapshot());
+      this.sync(this.session.read());
     }
   }
 
   coversHeight(minimumHeight: number): boolean {
-    return this.session.snapshot().surface.layout.logicalHeight >= Math.ceil(minimumHeight);
+    return this.currentRead.logicalHeight >= Math.ceil(minimumHeight);
   }
 
   isAttachedTo(
@@ -391,6 +516,7 @@ export class InkCanvasController {
     const hostChanged = hostRoot !== this.root || scrollContainer !== this.scrollContainer;
     const logicalViewportTop = hostChanged ? this.viewportTop : null;
     if (hostChanged) {
+      this.presentationLedger.cancel('unpresented');
       this.finishStroke(false);
       this.finishSelectionMove(false);
       this.cancelReadingContextRestore();
@@ -411,30 +537,52 @@ export class InkCanvasController {
     this.scheduleExtentProbes();
   }
 
-  sync(snapshot: InkSurfaceSessionSnapshot): void {
+  sync(read: InkDocumentReadView, change: InkDocumentChange | null = null): void {
     if (this.disposed) {
       return;
     }
-    const logicalHeight = snapshot.surface.layout.logicalHeight;
+    if (change !== null && this.currentRead === read && this.lastSynchronizedChange === change) {
+      return;
+    }
+    this.currentRead = read;
+    this.lastSynchronizedChange = change;
+    if (this.active && this.physicalCandidate !== null) {
+      void this.physicalCandidate.synchronizePreparation().catch((error: unknown) => {
+        if (this.disposed) return;
+        this.updateToolbar({
+          saveError:
+            error instanceof Error ? error.message : 'Physical Ink preparation could not refresh.',
+          statusText: 'Ink Mode · Physical Ink unavailable',
+        });
+      });
+    }
+    const logicalHeight = read.logicalHeight;
     if (this.scrollContainer === null) this.overlay.style.height = `${logicalHeight}px`;
     if (this.viewMode !== 'raw') {
       this.layoutRoot.style.setProperty('--inkstone-ink-logical-height', `${logicalHeight}px`);
     }
     if (this.viewMode !== 'raw') this.positionOverlay();
     this.updateViewport(false);
-    this.renderCommitted(this.selectionCommittedStrokes ?? snapshot.surface.strokes);
-    this.renderSelectionChrome(snapshot.surface.strokes);
-    const error = snapshot.persistence.kind === 'error';
+    if (change === null) {
+      if (this.selectionCommittedStrokes === null) this.renderRuntime.installDocument(read);
+    } else this.renderRuntime.applyDocumentChange(change);
+    this.updateRenderOverlay();
+    this.syncToolbarFromRead(read);
+  }
+
+  private syncToolbarFromRead(read: InkDocumentReadView): void {
+    const error = read.persistence.kind === 'error';
+    const saveError = error ? read.persistence.message : null;
     this.updateToolbar({
       canRedo: this.session.canRedo(),
       canUndo: this.session.canUndo(),
-      saveError: error ? snapshot.persistence.message : null,
+      saveError,
       selectedCount: this.session.selectedStrokeIds?.().length ?? 0,
       statusText: error
-        ? `Ink Mode · ${snapshot.persistence.message}`
-        : snapshot.persistence.kind === 'saving'
+        ? `Ink Mode · ${read.persistence.message}`
+        : read.persistence.kind === 'saving'
           ? 'Ink Mode · Saving locally…'
-          : snapshot.persistence.kind === 'saved-locally'
+          : read.persistence.kind === 'saved-locally'
             ? 'Ink Mode · Saved locally'
             : 'Ink Mode',
     });
@@ -445,7 +593,15 @@ export class InkCanvasController {
       return;
     }
     this.disposed = true;
-    this.cancelFrame();
+    this.physicalCandidate?.cancelActive();
+    void this.physicalCandidate?.discardUnused().catch(() => undefined);
+    this.session.setInteractionActive?.(false);
+    this.presentationLedger.cancel('unpresented');
+    this.renderRuntime.dispose();
+    if (this.activePerformanceContact !== null) {
+      this.inkPerformance.closeContact(this.activePerformanceContact);
+      this.activePerformanceContact = null;
+    }
     this.cancelReadingContextRestore();
     this.detachHostListeners();
     this.document.removeEventListener('keydown', this.onDocumentKeyDown);
@@ -462,6 +618,10 @@ export class InkCanvasController {
       this.document.defaultView?.clearTimeout(timeout);
     }
     this.extentProbeTimeouts.clear();
+    if (this.viewportSettleTimer !== null) {
+      this.document.defaultView?.clearTimeout(this.viewportSettleTimer);
+      this.viewportSettleTimer = null;
+    }
     this.overlay.remove();
     this.toolbarIsland.unmount();
     this.toolbarHost.remove();
@@ -469,6 +629,41 @@ export class InkCanvasController {
     this.deactivateWorkspace();
     this.root.style.position = this.previousPosition;
   }
+
+  private enterPhysicalCandidate(): void {
+    const candidate = this.physicalCandidate;
+    if (candidate === null) return;
+    const state = candidate.read();
+    if (state.kind !== 'idle' && state.kind !== 'failed') return;
+    void candidate.enter().catch((error: unknown) => {
+      if (this.disposed) return;
+      this.updateToolbar({
+        saveError:
+          error instanceof Error ? error.message : 'Physical Ink preparation could not start.',
+        statusText: 'Ink Mode · Physical Ink unavailable',
+      });
+    });
+  }
+
+  private readonly onPhysicalCandidateStateChange = (
+    state: InkUnpublishedPhysicalCandidateRead,
+  ): void => {
+    if (this.disposed) return;
+    this.toolbarHost.dataset.inkstonePhysicalCandidate = state.kind;
+    if (state.kind === 'failed') {
+      this.updateToolbar({
+        saveError: state.message,
+        statusText: 'Ink Mode · Physical Ink failed',
+      });
+      return;
+    }
+    if (state.kind === 'ready') this.syncToolbarFromRead(this.session.read());
+  };
+
+  private readonly onRenderDiagnostic = (message: string): void => {
+    if (this.disposed) return;
+    this.updateToolbar({ statusText: `Ink Mode · ${message}` });
+  };
 
   private attachHostListeners(): void {
     this.inputTarget.addEventListener('click', this.onReadingViewActivation, true);
@@ -479,6 +674,7 @@ export class InkCanvasController {
     this.inputTarget.addEventListener('pointerleave', this.onPointerLeave, true);
     this.inputTarget.addEventListener('pointerup', this.onPointerEnd, true);
     this.inputTarget.addEventListener('pointercancel', this.onPointerCancel, true);
+    this.inputTarget.addEventListener('lostpointercapture', this.onLostPointerCapture, true);
     this.inputTarget.addEventListener('touchstart', this.onTouchStart, {
       capture: true,
       passive: false,
@@ -508,6 +704,7 @@ export class InkCanvasController {
     this.inputTarget.removeEventListener('pointerleave', this.onPointerLeave, true);
     this.inputTarget.removeEventListener('pointerup', this.onPointerEnd, true);
     this.inputTarget.removeEventListener('pointercancel', this.onPointerCancel, true);
+    this.inputTarget.removeEventListener('lostpointercapture', this.onLostPointerCapture, true);
     this.inputTarget.removeEventListener('touchstart', this.onTouchStart, true);
     this.inputTarget.removeEventListener('touchmove', this.onTouchMove, true);
     this.inputTarget.removeEventListener('touchend', this.onTouchEnd, true);
@@ -543,30 +740,66 @@ export class InkCanvasController {
   }
 
   private readonly onPointerDown = (event: PointerEvent): void => {
-    this.cancelReadingContextRestore();
-    if (event.target instanceof Node && this.toolbarHost.contains(event.target)) return;
-    if (this.preserveNativeTouchNavigation(event)) return;
-    if (!this.active || event.button !== 0 || !isDrawingPointer(event.pointerType)) {
-      return;
+    const measurement = this.beginPerformanceSpan('ink-input-handler', 'input', 'pointer', 'down');
+    const inputToSubmit = this.beginPerformanceSpan(
+      'ink-input-to-submit',
+      'input',
+      'pointer',
+      'down',
+    );
+    let accepted = false;
+    let sampleCount = 0;
+    try {
+      if (this.active) this.session.noteUserInteraction?.();
+      this.cancelReadingContextRestore();
+      if (event.target instanceof Node && this.toolbarHost.contains(event.target)) return;
+      if (this.preserveNativeTouchNavigation(event)) return;
+      if (!this.active || event.button !== 0 || !isDrawingPointer(event.pointerType)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      if (this.toolbarStore.state.value.interaction === 'select') {
+        const additive =
+          this.toolbarStore.state.value.multiple ||
+          event.shiftKey ||
+          event.metaKey ||
+          event.ctrlKey;
+        this.beginSelection(event, event.pointerId, additive, true);
+        return;
+      }
+      if (this.activePointerId !== null || this.activeStylusTouchId !== null) return;
+      if (this.tool === 'eraser') this.eraserPreviewColor = this.resolveEraserPreviewColor();
+      const captured = this.capturePointerEvent(event, 'down');
+      if (captured === null || captured.result.kind !== 'active') return;
+      accepted = true;
+      this.contactStageFrameFrozen = true;
+      this.session.setInteractionActive?.(true);
+      this.activePerformanceContact = this.beginPerformanceContact('pointer');
+      this.activePointerId = event.pointerId;
+      sampleCount = captured.sampleCount;
+      const presentationGeneration = this.presentationLedger.begin(
+        this.activePerformanceContact,
+        sampleCount,
+        inputToSubmit,
+      );
+      // Synthetic Gate input and some WebKit lifecycle edges can reject pointer capture even
+      // though the accepted contact remains routable by pointerId. Capture is an optional host
+      // aid: never let it abort presentation ownership or the drawing path.
+      try {
+        this.inputTarget.setPointerCapture?.(event.pointerId);
+      } catch {
+        // Continue with the controller's explicit pointerId ownership.
+      }
+      this.applyActiveCapture(captured, presentationGeneration);
+    } finally {
+      if (accepted) {
+        measurement?.finish({ contact: this.activePerformanceContact, sampleCount });
+      } else {
+        inputToSubmit?.cancel();
+        measurement?.cancel();
+      }
     }
-    event.preventDefault();
-    event.stopPropagation();
-    if (this.toolbarStore.state.value.interaction === 'select') {
-      const additive =
-        this.toolbarStore.state.value.multiple || event.shiftKey || event.metaKey || event.ctrlKey;
-      this.beginSelection(event, event.pointerId, additive, true);
-      return;
-    }
-    this.activePointerId = event.pointerId;
-    if (this.tool === 'eraser') this.eraserPreviewColor = this.resolveEraserPreviewColor();
-    this.activeClientPoints = [];
-    this.activePoints = [];
-    this.activePaintedPointCount = 0;
-    this.clearCanvas(this.activeCanvas, this.activeContext);
-    this.selectionChromeBounds = null;
-    this.inputTarget.setPointerCapture?.(event.pointerId);
-    this.appendEventPoints(event);
-    this.scheduleActivePaint();
   };
 
   private readonly onReadingViewActivation = (event: MouseEvent): void => {
@@ -585,164 +818,347 @@ export class InkCanvasController {
   };
 
   private readonly onPointerMove = (event: PointerEvent): void => {
-    if (this.preserveNativeTouchNavigation(event)) return;
-    if (event.pointerId === this.selectionDragState?.pointerId) {
+    const measurement = this.beginPerformanceSpan('ink-input-handler', 'input', 'pointer', 'move');
+    const inputToSubmit = this.beginPerformanceSpan(
+      'ink-input-to-submit',
+      'input',
+      'pointer',
+      'move',
+    );
+    const contact = this.activePerformanceContact;
+    let accepted = false;
+    let sampleCount = 0;
+    try {
+      if (this.preserveNativeTouchNavigation(event)) return;
+      if (event.pointerId === this.selectionDragState?.pointerId) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.updateSelectionDrag(event);
+        return;
+      }
+      if (
+        this.active &&
+        this.toolbarStore.state.value.interaction === 'select' &&
+        this.selectionDragState === null &&
+        this.activePointerId === null &&
+        isDrawingPointer(event.pointerType)
+      ) {
+        const point = this.eventPoint(event);
+        const hovered =
+          point === null
+            ? null
+            : (this.session.strokeIdAt?.(point, Math.max(8, this.width)) ?? null);
+        this.setHoveredStroke(hovered);
+        return;
+      }
+      if (event.pointerId !== this.activePointerId || contact === null) {
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
-      this.updateSelectionDrag(event);
-      return;
+      const captured = this.capturePointerEvent(event, 'move');
+      if (captured === null) {
+        if (this.pointerInkAdapter.lastAdmissionKind === 'invalid') this.finishStroke(false);
+        return;
+      }
+      if (captured.result.kind !== 'active') return;
+      accepted = true;
+      sampleCount = captured.sampleCount;
+      const presentationGeneration = this.presentationLedger.begin(
+        contact,
+        sampleCount,
+        inputToSubmit,
+      );
+      this.applyActiveCapture(captured, presentationGeneration);
+    } finally {
+      if (accepted) {
+        measurement?.finish({
+          ...(this.pointerInkAdapter.lastCausalRepairKind === null
+            ? {}
+            : { causalRepair: this.pointerInkAdapter.lastCausalRepairKind }),
+          contact,
+          sampleCount,
+        });
+      } else {
+        inputToSubmit?.cancel();
+        measurement?.cancel();
+      }
     }
-    if (
-      this.active &&
-      this.toolbarStore.state.value.interaction === 'select' &&
-      this.selectionDragState === null &&
-      this.activePointerId === null &&
-      isDrawingPointer(event.pointerType)
-    ) {
-      const point = this.eventPoint(event);
-      const hovered =
-        point === null ? null : (this.session.strokeIdAt?.(point, Math.max(8, this.width)) ?? null);
-      this.setHoveredStroke(hovered);
-      return;
-    }
-    if (event.pointerId !== this.activePointerId) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    this.appendEventPoints(event);
-    this.scheduleActivePaint();
   };
 
   private readonly onPointerLeave = (): void => {
     if (this.selectionDragState === null) this.setHoveredStroke(null);
   };
 
+  private readonly onLostPointerCapture = (event: PointerEvent): void => {
+    if (event.pointerId !== this.activePointerId) return;
+    this.finishStroke(false);
+  };
+
   private readonly onPointerEnd = (event: PointerEvent): void => {
-    if (this.preserveNativeTouchNavigation(event)) return;
-    if (event.pointerId === this.selectionDragState?.pointerId) {
+    const measurement = this.beginPerformanceSpan(
+      'ink-input-handler',
+      'completion',
+      'pointer',
+      'up',
+    );
+    const contact = this.activePerformanceContact;
+    let accepted = false;
+    let sampleCount = 0;
+    try {
+      if (this.preserveNativeTouchNavigation(event)) return;
+      if (event.pointerId === this.selectionDragState?.pointerId) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (this.selectionDragState.dragged === false) this.updateSelectionDrag(event);
+        this.finishSelectionMove(true);
+        return;
+      }
+      if (event.pointerId !== this.activePointerId || contact === null) {
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
-      if (this.selectionDragState.dragged === false) this.updateSelectionDrag(event);
-      this.finishSelectionMove(true);
-      return;
+      const captured = this.capturePointerEvent(event, 'up');
+      if (captured === null || captured.result.kind === 'ignored') {
+        this.finishStroke(false);
+        return;
+      }
+      accepted = true;
+      sampleCount = captured.sampleCount;
+      this.finishStroke(true, captured);
+    } finally {
+      if (accepted) measurement?.finish({ contact, sampleCount });
+      else measurement?.cancel();
     }
-    if (event.pointerId !== this.activePointerId) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    this.appendEventPoints(event);
-    this.finishStroke(true);
   };
 
   private readonly onPointerCancel = (event: PointerEvent): void => {
-    if (this.preserveNativeTouchNavigation(event)) return;
-    if (event.pointerId === this.selectionDragState?.pointerId) {
+    const measurement = this.beginPerformanceSpan(
+      'ink-input-handler',
+      'completion',
+      'pointer',
+      'cancel',
+    );
+    const contact = this.activePerformanceContact;
+    let accepted = false;
+    try {
+      if (this.preserveNativeTouchNavigation(event)) return;
+      if (event.pointerId === this.selectionDragState?.pointerId) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.finishSelectionMove(false);
+        return;
+      }
+      if (event.pointerId !== this.activePointerId || contact === null) {
+        return;
+      }
+      accepted = true;
       event.preventDefault();
       event.stopPropagation();
-      this.finishSelectionMove(false);
-      return;
+      this.capturePointerEvent(event, 'cancel');
+      this.finishStroke(false);
+    } finally {
+      if (accepted) measurement?.finish({ contact, sampleCount: 0 });
+      else measurement?.cancel();
     }
-    if (event.pointerId !== this.activePointerId) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    this.finishStroke(false);
   };
 
   private readonly onTouchStart = (event: TouchEvent): void => {
-    this.cancelReadingContextRestore();
-    if (!this.active) return;
-    if (event.target instanceof Node && this.toolbarHost.contains(event.target)) return;
-    const stylus = findStylusTouch(event.changedTouches);
-    if (stylus === null) {
-      event.stopPropagation();
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    if (this.activePointerId !== null || this.selectionDragState !== null) return;
-    this.activeStylusTouchId = stylus.identifier;
-    const pointerId = stylusPointerId(stylus.identifier);
-    const sample = touchInputSample(event, stylus);
-    if (this.toolbarStore.state.value.interaction === 'select') {
-      const additive =
-        this.toolbarStore.state.value.multiple || event.shiftKey || event.metaKey || event.ctrlKey;
-      if (!this.beginSelection(sample, pointerId, additive, false)) {
-        this.activeStylusTouchId = null;
+    const measurement = this.beginPerformanceSpan(
+      'ink-input-handler',
+      'input',
+      'stylus-touch',
+      'down',
+    );
+    const inputToSubmit = this.beginPerformanceSpan(
+      'ink-input-to-submit',
+      'input',
+      'stylus-touch',
+      'down',
+    );
+    let accepted = false;
+    let sampleCount = 0;
+    try {
+      this.cancelReadingContextRestore();
+      if (!this.active) return;
+      if (event.target instanceof Node && this.toolbarHost.contains(event.target)) return;
+      const stylus = findStylusTouch(event.changedTouches);
+      if (stylus === null) {
+        event.stopPropagation();
+        return;
       }
-      return;
+      event.preventDefault();
+      event.stopPropagation();
+      const pointerId = stylusPointerId(stylus.identifier);
+      const sample = touchInputSample(event, stylus);
+      if (this.toolbarStore.state.value.interaction === 'select') {
+        if (this.activePointerId !== null || this.selectionDragState !== null) return;
+        this.activeStylusTouchId = stylus.identifier;
+        const additive =
+          this.toolbarStore.state.value.multiple ||
+          event.shiftKey ||
+          event.metaKey ||
+          event.ctrlKey;
+        if (!this.beginSelection(sample, pointerId, additive, false)) {
+          this.activeStylusTouchId = null;
+        }
+        return;
+      }
+      if (this.activePointerId !== null || this.activeStylusTouchId !== null) return;
+      if (this.tool === 'eraser') this.eraserPreviewColor = this.resolveEraserPreviewColor();
+      const captured = this.captureTouchEvent(event, 'down');
+      if (captured === null || captured.result.kind !== 'active') return;
+      accepted = true;
+      this.contactStageFrameFrozen = true;
+      this.session.setInteractionActive?.(true);
+      this.activeStylusTouchId = stylus.identifier;
+      this.activePerformanceContact = this.beginPerformanceContact('stylus-touch');
+      this.activePointerId = pointerId;
+      sampleCount = captured.sampleCount;
+      const presentationGeneration = this.presentationLedger.begin(
+        this.activePerformanceContact,
+        sampleCount,
+        inputToSubmit,
+      );
+      this.applyActiveCapture(captured, presentationGeneration);
+    } finally {
+      if (accepted) {
+        measurement?.finish({ contact: this.activePerformanceContact, sampleCount });
+      } else {
+        inputToSubmit?.cancel();
+        measurement?.cancel();
+      }
     }
-    this.activePointerId = pointerId;
-    if (this.tool === 'eraser') this.eraserPreviewColor = this.resolveEraserPreviewColor();
-    this.activeClientPoints = [];
-    this.activePoints = [];
-    this.activePaintedPointCount = 0;
-    this.clearCanvas(this.activeCanvas, this.activeContext);
-    this.selectionChromeBounds = null;
-    this.appendInputPoint(sample);
-    this.scheduleActivePaint();
   };
 
   private readonly onTouchMove = (event: TouchEvent): void => {
-    if (!this.active) return;
-    const stylus = findStylusTouch(event.changedTouches);
-    if (stylus === null) {
+    const measurement = this.beginPerformanceSpan(
+      'ink-input-handler',
+      'input',
+      'stylus-touch',
+      'move',
+    );
+    const inputToSubmit = this.beginPerformanceSpan(
+      'ink-input-to-submit',
+      'input',
+      'stylus-touch',
+      'move',
+    );
+    const contact = this.activePerformanceContact;
+    let accepted = false;
+    let sampleCount = 0;
+    try {
+      if (!this.active) return;
+      const stylus = findStylusTouch(event.changedTouches);
+      if (stylus === null) {
+        event.stopPropagation();
+        return;
+      }
+      event.preventDefault();
       event.stopPropagation();
-      return;
+      if (stylus.identifier !== this.activeStylusTouchId) return;
+      const sample = touchInputSample(event, stylus);
+      if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
+        this.updateSelectionDrag(sample);
+        return;
+      }
+      if (contact === null) return;
+      const captured = this.captureTouchEvent(event, 'move');
+      if (captured === null || captured.result.kind !== 'active') return;
+      accepted = true;
+      sampleCount = captured.sampleCount;
+      const presentationGeneration = this.presentationLedger.begin(
+        contact,
+        sampleCount,
+        inputToSubmit,
+      );
+      this.applyActiveCapture(captured, presentationGeneration);
+    } finally {
+      if (accepted) {
+        measurement?.finish({ contact, sampleCount });
+      } else {
+        inputToSubmit?.cancel();
+        measurement?.cancel();
+      }
     }
-    event.preventDefault();
-    event.stopPropagation();
-    if (stylus.identifier !== this.activeStylusTouchId) return;
-    const sample = touchInputSample(event, stylus);
-    if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
-      this.updateSelectionDrag(sample);
-      return;
-    }
-    this.appendInputPoint(sample);
-    this.scheduleActivePaint();
   };
 
   private readonly onTouchEnd = (event: TouchEvent): void => {
-    if (!this.active) return;
-    const stylus = findStylusTouch(event.changedTouches);
-    if (stylus === null) {
+    const measurement = this.beginPerformanceSpan(
+      'ink-input-handler',
+      'completion',
+      'stylus-touch',
+      'up',
+    );
+    const contact = this.activePerformanceContact;
+    let accepted = false;
+    let sampleCount = 0;
+    try {
+      if (!this.active) return;
+      const stylus = findStylusTouch(event.changedTouches);
+      if (stylus === null) {
+        event.stopPropagation();
+        return;
+      }
+      event.preventDefault();
       event.stopPropagation();
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    if (stylus.identifier !== this.activeStylusTouchId) return;
-    const sample = touchInputSample(event, stylus);
-    if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
-      if (this.selectionDragState.dragged === false) this.updateSelectionDrag(sample);
+      if (stylus.identifier !== this.activeStylusTouchId) return;
+      const sample = touchInputSample(event, stylus);
+      if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
+        if (this.selectionDragState.dragged === false) this.updateSelectionDrag(sample);
+        this.activeStylusTouchId = null;
+        this.finishSelectionMove(true);
+        return;
+      }
+      if (contact === null) return;
+      const captured = this.captureTouchEvent(event, 'up');
+      if (captured === null || captured.result.kind === 'ignored') {
+        this.finishStroke(false);
+        return;
+      }
+      accepted = true;
+      sampleCount = captured.sampleCount;
       this.activeStylusTouchId = null;
-      this.finishSelectionMove(true);
-      return;
+      this.finishStroke(true, captured);
+    } finally {
+      if (accepted) measurement?.finish({ contact, sampleCount });
+      else measurement?.cancel();
     }
-    this.appendInputPoint(sample);
-    this.activeStylusTouchId = null;
-    this.finishStroke(true);
   };
 
   private readonly onTouchCancel = (event: TouchEvent): void => {
-    if (!this.active) return;
-    const stylus = findStylusTouch(event.changedTouches);
-    if (stylus === null) {
+    const measurement = this.beginPerformanceSpan(
+      'ink-input-handler',
+      'completion',
+      'stylus-touch',
+      'cancel',
+    );
+    const contact = this.activePerformanceContact;
+    let accepted = false;
+    try {
+      if (!this.active) return;
+      const stylus = findStylusTouch(event.changedTouches);
+      if (stylus === null) {
+        event.stopPropagation();
+        return;
+      }
+      event.preventDefault();
       event.stopPropagation();
-      return;
+      if (stylus.identifier !== this.activeStylusTouchId) return;
+      this.activeStylusTouchId = null;
+      if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
+        this.finishSelectionMove(false);
+        return;
+      }
+      if (contact === null) return;
+      accepted = true;
+      this.captureTouchEvent(event, 'cancel');
+      this.finishStroke(false);
+    } finally {
+      if (accepted) measurement?.finish({ contact, sampleCount: 0 });
+      else measurement?.cancel();
     }
-    event.preventDefault();
-    event.stopPropagation();
-    if (stylus.identifier !== this.activeStylusTouchId) return;
-    this.activeStylusTouchId = null;
-    if (stylusPointerId(stylus.identifier) === this.selectionDragState?.pointerId) {
-      this.finishSelectionMove(false);
-      return;
-    }
-    this.finishStroke(false);
   };
 
   private preserveNativeTouchNavigation(event: PointerEvent): boolean {
@@ -774,6 +1190,7 @@ export class InkCanvasController {
 
   private readonly onDocumentKeyDown = (event: KeyboardEvent): void => {
     this.cancelReadingContextRestore();
+    if (this.active) this.session.noteUserInteraction?.();
     if (!this.active || event.key !== 'Escape') return;
     if (this.selectionDragState !== null) {
       event.preventDefault();
@@ -784,7 +1201,7 @@ export class InkCanvasController {
     if (this.session.clearSelection?.() === true) {
       event.preventDefault();
       event.stopPropagation();
-      this.sync(this.session.snapshot());
+      this.sync(this.session.read());
       return;
     }
     event.preventDefault();
@@ -824,40 +1241,146 @@ export class InkCanvasController {
     this.persistPreference();
   };
 
-  private appendEventPoints(event: PointerEvent): void {
-    // Pointer Events exposes coalesced samples for moves, but down/up normally return an empty
-    // list. Preserve the parent event so WebKit does not lose the Pencil contact endpoints.
-    const coalesced = event.getCoalescedEvents?.() ?? [];
-    const samples = coalesced.length === 0 ? [event] : coalesced;
-    for (const sample of samples) {
-      this.appendInputPoint(sample, sample.tiltX, sample.tiltY);
+  private captureBatchContext(): InkCaptureBatchContext {
+    const style = this.toolStyles[this.tool];
+    const physicalVisibleTool =
+      this.physicalCandidate !== null && (this.tool === 'pen' || this.tool === 'highlighter');
+    const color =
+      this.tool === 'highlighter' && !physicalVisibleTool ? `${style.color}88` : style.color;
+    const cached = this.cachedCaptureBatchContext;
+    if (
+      cached !== null &&
+      cached.frame === this.stageFrame &&
+      cached.frameEpoch === this.stageFrameEpoch &&
+      cached.logicalBounds.height === this.currentRead.logicalHeight &&
+      cached.logicalBounds.width === this.currentRead.logicalWidth &&
+      cached.style.color === color &&
+      cached.style.tool === this.tool &&
+      cached.style.width === style.width
+    ) {
+      return cached;
     }
+    const next = Object.freeze({
+      frame: this.stageFrame,
+      frameEpoch: this.stageFrameEpoch,
+      logicalBounds: Object.freeze({
+        height: this.currentRead.logicalHeight,
+        width: this.currentRead.logicalWidth,
+        x: 0,
+        y: 0,
+      }),
+      style: Object.freeze({
+        color,
+        tool: this.tool,
+        width: style.width,
+      }),
+    });
+    this.cachedCaptureBatchContext = next;
+    return next;
   }
 
-  private appendInputPoint(sample: InkClientInputSample, tiltX = 0, tiltY = 0): void {
-    const layout = this.session.snapshot().surface.layout;
-    const previous = this.activePoints.at(-1);
-    const time = Math.max(sample.timeStamp, previous?.time ?? Number.NEGATIVE_INFINITY);
-    const point = this.stageFrame.clientToLogical({ x: sample.clientX, y: sample.clientY });
-    this.activeClientPoints.push({ x: sample.clientX, y: sample.clientY });
-    this.activePoints.push({
-      pressure: sample.pressure > 0 ? sample.pressure : 0.5,
-      time,
-      x: point.x,
-      y: clamp(point.y, 0, layout.logicalHeight),
-      ...(tiltX === 0 ? {} : { tiltX }),
-      ...(tiltY === 0 ? {} : { tiltY }),
+  private capturePointerEvent(
+    event: PointerEvent,
+    phase: 'cancel' | 'down' | 'move' | 'up',
+  ): InkControllerCapture | null {
+    const context = this.captureBatchContext();
+    const batch = this.pointerInkAdapter.createBatch(event, phase, context);
+    if (batch === null) return null;
+    if (
+      this.physicalCandidate !== null &&
+      (batch.style.tool === 'pen' || batch.style.tool === 'highlighter')
+    ) {
+      return {
+        lane: 'physical',
+        provisionalTail: null,
+        result: this.physicalCandidate.accept(batch),
+        sampleCount: batch.sampleCount,
+      };
+    }
+    const result = this.capturePipeline.accept(batch);
+    const provisionalTail =
+      result.kind === 'active' &&
+      (phase === 'down' || phase === 'move') &&
+      result.style.tool !== 'eraser'
+        ? this.pointerInkAdapter.createProvisionalTail(event, context)
+        : null;
+    return { lane: 'legacy', provisionalTail, result, sampleCount: batch.sampleCount };
+  }
+
+  private captureTouchEvent(
+    event: TouchEvent,
+    phase: 'cancel' | 'down' | 'move' | 'up',
+  ): InkControllerCapture | null {
+    const batch = this.touchInkAdapter.createBatch(event, phase, this.captureBatchContext());
+    if (batch === null) return null;
+    if (
+      this.physicalCandidate !== null &&
+      (batch.style.tool === 'pen' || batch.style.tool === 'highlighter')
+    ) {
+      return {
+        lane: 'physical',
+        provisionalTail: null,
+        result: this.physicalCandidate.accept(batch),
+        sampleCount: batch.sampleCount,
+      };
+    }
+    return {
+      lane: 'legacy',
+      provisionalTail: null,
+      result: this.capturePipeline.accept(batch),
+      sampleCount: batch.sampleCount,
+    };
+  }
+
+  private applyActiveCapture(captured: InkControllerCapture, presentationGeneration: number): void {
+    if (captured.lane === 'physical') {
+      const result = captured.result;
+      if (result.kind !== 'active') {
+        throw new Error('Ink controller cannot present a non-active physical capture.');
+      }
+      if (result.presentation === 'degraded-legacy') {
+        this.renderRuntime.applyDegradedPhysicalActiveDelta({
+          diagnostic: result.diagnostic,
+          presentationDelta: result.presentationDelta,
+          presentationGeneration,
+          strokeId: result.strokeId,
+          style: result.style,
+        });
+        return;
+      }
+      this.renderRuntime.applyPhysicalActiveDelta({
+        alpha: result.alpha,
+        color: result.style.color,
+        geometryUpdate: result.geometryUpdate,
+        presentationDelta: result.presentationDelta,
+        presentationGeneration,
+        strokeId: result.strokeId,
+        style: result.style,
+      });
+      return;
+    }
+    const result = captured.result;
+    if (result.kind !== 'active') {
+      throw new Error('Ink controller cannot present a non-active legacy capture.');
+    }
+    this.renderRuntime.applyActiveDelta({
+      ...(result.style.tool === 'eraser' ? { eraserColor: this.eraserPreviewColor } : {}),
+      presentationDelta: result.presentationDelta,
+      presentationGeneration,
+      ...(captured.provisionalTail === null ? {} : { provisionalTail: captured.provisionalTail }),
+      strokeId: result.strokeId,
+      style: result.style,
     });
   }
 
   private eventPoint(event: InkClientInputSample): InkPoint | null {
-    const layout = this.session.snapshot().surface.layout;
+    const logicalHeight = this.currentRead.logicalHeight;
     const point = this.stageFrame.clientToLogical({ x: event.clientX, y: event.clientY });
     return {
-      pressure: event.pressure > 0 ? event.pressure : 0.5,
+      pressure: event.pressure,
       time: event.timeStamp,
       x: point.x,
-      y: clamp(point.y, 0, layout.logicalHeight),
+      y: clamp(point.y, 0, logicalHeight),
     };
   }
 
@@ -887,12 +1410,13 @@ export class InkCanvasController {
             startClient: { x: sample.clientX, y: sample.clientY },
             toggleOnClick,
           };
+    if (this.selectionDragState !== null) this.session.setInteractionActive?.(true);
     this.hoveredStrokeId = hitStrokeId;
     this.inputTarget.style.cursor = this.selectionDragState === null ? '' : 'grabbing';
     if (capturePointer && this.selectionDragState !== null) {
       this.inputTarget.setPointerCapture?.(pointerId);
     }
-    this.sync(this.session.snapshot());
+    this.sync(this.session.read());
     return this.selectionDragState !== null;
   }
 
@@ -917,8 +1441,9 @@ export class InkCanvasController {
       this.session.cancelSelectionMove?.();
     }
     this.selectionCommittedStrokes = null;
+    this.renderRuntime.setCommittedExclusions([]);
     this.inputTarget.style.cursor = this.hoveredStrokeId === null ? '' : 'grab';
-    this.sync(this.session.snapshot());
+    this.sync(this.session.read());
   }
 
   private updateSelectionDrag(event: InkClientInputSample): void {
@@ -955,7 +1480,7 @@ export class InkCanvasController {
     if (delta === null) return;
     this.isolateSelectionPreviewFromCommittedLayer();
     this.session.previewSelectionMove?.(delta.dx, delta.dy);
-    this.sync(this.session.snapshot());
+    this.sync(this.session.read());
   }
 
   private isolateSelectionPreviewFromCommittedLayer(): void {
@@ -967,173 +1492,280 @@ export class InkCanvasController {
     }
     const selected = new Set(this.session.selectedStrokeIds?.() ?? []);
     if (selected.size === 0) return;
-    this.selectionCommittedStrokes = this.renderedStrokes.filter(
-      (stroke) => !selected.has(stroke.id),
-    );
-    this.renderCommitted(this.selectionCommittedStrokes, true);
+    this.selectionCommittedStrokes = [];
+    this.renderRuntime.setCommittedExclusions([...selected]);
   }
 
-  private finishStroke(commit: boolean): void {
-    this.cancelFrame();
-    const pointerId = this.activePointerId;
-    this.activePointerId = null;
-    this.activeStylusTouchId = null;
-    if (pointerId !== null && this.inputTarget.hasPointerCapture?.(pointerId)) {
-      this.inputTarget.releasePointerCapture(pointerId);
-    }
-    this.clearCanvas(this.activeCanvas, this.activeContext);
-    this.selectionChromeBounds = null;
-    const closedLoopErase =
-      this.tool === 'eraser' && isClosedLoopEraseGesture(this.activeClientPoints);
-    const points = simplifyPoints(this.activePoints, 0.8);
-    this.activeClientPoints = [];
-    this.activePoints = [];
-    this.activePaintedPointCount = 0;
-    if (!commit || points.length === 0) {
-      return;
-    }
-    if (this.tool === 'eraser') {
-      if (closedLoopErase) {
-        this.session.eraseStrokesInPolygon(points);
-        this.sync(this.session.snapshot());
+  private sealActiveContactForForcedStageFrame(): void {
+    if (this.activePointerId === null && this.activeStylusTouchId === null) return;
+    const captured: InkControllerCapture =
+      this.physicalCandidate !== null && (this.tool === 'pen' || this.tool === 'highlighter')
+        ? {
+            lane: 'physical',
+            provisionalTail: null,
+            result: this.physicalCandidate.sealActive(),
+            sampleCount: 0,
+          }
+        : {
+            lane: 'legacy',
+            provisionalTail: null,
+            result: this.capturePipeline.sealActive(),
+            sampleCount: 0,
+          };
+    this.finishStroke(true, captured);
+  }
+
+  private finishStroke(commit: boolean, captured?: InkControllerCapture): void {
+    const measurement = commit
+      ? this.beginPerformanceSpan('ink-stroke-commit', 'completion')
+      : null;
+    const contact = this.activePerformanceContact;
+    let documentCommandProduced = false;
+    try {
+      const pointerId = this.activePointerId;
+      this.activePointerId = null;
+      this.activeStylusTouchId = null;
+      if (!commit) {
+        this.capturePipeline.cancelActive();
+        this.physicalCandidate?.cancelActive();
+        this.renderRuntime.cancelActive();
+        this.presentationLedger.cancel('cancelled');
+      }
+      if (pointerId !== null && this.inputTarget.hasPointerCapture?.(pointerId)) {
+        this.inputTarget.releasePointerCapture(pointerId);
+      }
+      if (captured?.lane === 'physical') {
+        documentCommandProduced = this.finishPhysicalStroke(commit, captured.result);
         return;
       }
-      const target = points.at(-1);
-      if (target !== undefined) this.session.eraseStrokeAt(target, Math.max(8, this.width));
-      this.sync(this.session.snapshot());
-      return;
+      const captureResult = captured?.lane === 'legacy' ? captured.result : undefined;
+      if (captureResult?.kind === 'rejected') {
+        this.renderRuntime.cancelActive();
+        this.updateToolbar({
+          saveError: null,
+          statusText: 'Ink Mode · Stroke exceeded the capture safety limit and was discarded',
+        });
+        return;
+      }
+      const completed = captureResult?.kind === 'completed' ? captureResult : null;
+      if (completed !== null) {
+        const presentationGeneration = this.presentationLedger.begin();
+        this.renderRuntime.applyActiveDelta({
+          ...(completed.stroke.tool === 'eraser' ? { eraserColor: this.eraserPreviewColor } : {}),
+          presentationDelta: completed.presentationDelta,
+          presentationGeneration,
+          strokeId: completed.stroke.id,
+          style: {
+            color: completed.stroke.color,
+            tool: completed.stroke.tool,
+            width: completed.stroke.width,
+          },
+        });
+        this.renderRuntime.finalizeActive(completed.stroke);
+      }
+      const completedStroke = completed?.stroke ?? null;
+      const points = completedStroke?.points ?? [];
+      const closedLoopErase =
+        (completedStroke?.tool ?? this.tool) === 'eraser' &&
+        isClosedLoopEraseGesture(points, 1 / this.stageFrame.actualScale);
+      if (!commit || points.length === 0) {
+        return;
+      }
+      if ((completedStroke?.tool ?? this.tool) === 'eraser') {
+        if (closedLoopErase) {
+          documentCommandProduced = this.session.eraseStrokesInPolygon(points).length > 0;
+          this.renderRuntime.cancelActive();
+          this.sync(this.session.read());
+          return;
+        }
+        const target = points.at(-1);
+        if (target !== undefined) {
+          documentCommandProduced =
+            this.session.eraseStrokeAt(
+              target,
+              Math.max(8, completedStroke?.width ?? this.width),
+            ) !== null;
+        }
+        this.renderRuntime.cancelActive();
+        this.sync(this.session.read());
+        return;
+      }
+      if (completed === null) return;
+      const stroke = completed.stroke;
+      documentCommandProduced = true;
+      const result = this.session.apply(
+        { id: `draw:${stroke.id}`, kind: 'add', stroke },
+        {
+          bounds: completed.bounds,
+          color: stroke.color,
+          logicalStrokeId: stroke.id,
+          tool: stroke.tool,
+          version: stroke.brushRenderVersion,
+        },
+      );
+      this.renderRuntime.promoteActive(stroke.id);
+      this.sync(this.session.read(), result.change);
+    } finally {
+      if (contact === null) measurement?.cancel();
+      else measurement?.finish({ contact, documentCommandProduced });
+      if (contact !== null) {
+        this.presentationLedger.cancel('cancelled');
+        if (this.activeContactDiagnosticsEnabled) this.inkPerformance.closeContact(contact);
+        this.activeContactDiagnosticsEnabled = false;
+        if (this.activePerformanceContact === contact) {
+          this.activePerformanceContact = null;
+          this.renderRuntime.setActivePerformanceContact(null);
+        }
+      }
+      this.releaseContactStageFrame();
     }
-    this.session.addStroke({
-      color: this.tool === 'highlighter' ? `${this.color}88` : this.color,
-      id: globalThis.crypto.randomUUID(),
-      points,
-      tool: this.tool,
-      width: this.width,
-    });
-    this.sync(this.session.snapshot());
   }
 
-  private scheduleActivePaint(): void {
-    this.pendingInputStartedAt ??= this.now();
-    if (this.frame !== null) {
-      return;
+  private finishPhysicalStroke(
+    commit: boolean,
+    capture: InkUnpublishedPhysicalCandidateCapture,
+  ): boolean {
+    const candidate = this.physicalCandidate;
+    if (candidate === null || !commit) return false;
+    if (capture.kind === 'failed') {
+      this.renderRuntime.cancelActive();
+      this.updateToolbar({
+        saveError: null,
+        statusText: 'Ink Mode · Physical stroke failed closed',
+      });
+      return false;
     }
-    let completedSynchronously = false;
-    const frame = requestAnimationFrame(() => {
-      completedSynchronously = true;
-      this.frame = null;
-      if (this.disposed) return;
-      const inputStartedAt = this.pendingInputStartedAt;
-      this.pendingInputStartedAt = null;
-      const segment = nextActivePaintSegment(this.activePoints, this.activePaintedPointCount);
-      this.activePaintedPointCount = segment.nextPaintedPointCount;
-      if (this.tool === 'eraser') {
-        drawEraserPreview(
-          this.activeContext,
-          segment.points,
-          this.activePoints[0],
-          this.eraserPreviewColor,
-          this.width,
-          this.stageFrame.actualScale,
-          isClosedLoopEraseGesture(this.activeClientPoints),
-        );
+    if (capture.kind !== 'completed') {
+      this.renderRuntime.cancelActive();
+      return false;
+    }
+
+    // The logical document owns durability and undo semantics. A disposable renderer/cache
+    // failure must never strand the physical candidate in `completed` or block the next contact.
+    const result = candidate.commitCompleted();
+    const presentationGeneration = this.presentationLedger.begin();
+    const style = {
+      color: capture.stroke.color,
+      tool: capture.stroke.tool,
+      width: capture.stroke.width,
+    } as const;
+    try {
+      if (capture.presentation === 'degraded-legacy') {
+        this.renderRuntime.applyDegradedPhysicalActiveDelta({
+          diagnostic: capture.diagnostic,
+          presentationDelta: capture.presentationDelta,
+          presentationGeneration,
+          strokeId: capture.stroke.id,
+          style,
+        });
       } else {
-        drawStroke(
-          this.activeContext,
-          segment.points,
-          this.tool === 'highlighter' ? `${this.color}88` : this.color,
-          this.width,
-        );
-      }
-      if (inputStartedAt !== null) {
-        requestAnimationFrame(() => {
-          if (!this.disposed) {
-            this.recordInputToPaint(Math.max(0, this.now() - inputStartedAt));
-          }
+        this.renderRuntime.applyPhysicalActiveDelta({
+          alpha: capture.alpha,
+          color: capture.stroke.color,
+          geometryUpdate: capture.geometryUpdate,
+          presentationDelta: capture.presentationDelta,
+          presentationGeneration,
+          strokeId: capture.stroke.id,
+          style,
         });
       }
+      this.renderRuntime.finalizeActive(capture.stroke);
+      this.renderRuntime.promoteActive(capture.stroke.id);
+    } catch (error) {
+      this.renderRuntime.cancelActive();
+      this.sync(this.session.read(), result.change);
+      this.onRenderDiagnostic(
+        `Renderer recovered after stroke commit: ${error instanceof Error ? error.message : 'unknown rendering failure'}`,
+      );
+      return true;
+    }
+    this.sync(this.session.read(), result.change);
+    return true;
+  }
+
+  private readonly onRenderActiveFrame = (renderGeneration: number | null): void => {
+    if (this.disposed) {
+      this.presentationLedger.cancel('unpresented');
+      return;
+    }
+    this.presentationLedger.settle(renderGeneration, this.activePerformanceContact);
+    if (this.activePointerId === null && this.selectionDragState === null) {
+      this.session.setInteractionActive?.(false);
+    }
+  };
+
+  private beginPerformanceContact(
+    adapter: InkPerformanceContact['adapter'],
+  ): InkPerformanceContact {
+    this.activeContactDiagnosticsEnabled = this.inkPerformance.isEnabled();
+    if (!this.activeContactDiagnosticsEnabled) {
+      const contact =
+        adapter === 'pointer'
+          ? DISABLED_POINTER_PERFORMANCE_CONTACT
+          : DISABLED_STYLUS_PERFORMANCE_CONTACT;
+      this.renderRuntime.setActivePerformanceContact(contact);
+      return contact;
+    }
+    const contact = this.inkPerformance.openContact(adapter);
+    this.renderRuntime.setActivePerformanceContact(contact);
+    return contact;
+  }
+
+  private beginPerformanceSpan(
+    name: InkPerformanceSpanName,
+    workPhase: InkPerformanceWorkPhase,
+    adapter?: InkInputAdapter,
+    inputPhase?: InkInputPhase,
+  ): InkPerformanceSpan | null {
+    if (!this.inkPerformance.isEnabled()) return null;
+    if (
+      this.activePointerId !== null &&
+      (!this.activeContactDiagnosticsEnabled ||
+        this.activePerformanceContact === null ||
+        !this.inkPerformance.ownsContact(this.activePerformanceContact))
+    ) {
+      return null;
+    }
+    return adapter === undefined || inputPhase === undefined
+      ? this.inkPerformance.beginSpan(name, { workPhase })
+      : this.inkPerformance.beginSpan(name, { adapter, inputPhase, workPhase });
+  }
+
+  private visibleRefs(): readonly InkRenderableStrokeRef[] {
+    const viewport = this.stageFrame.logicalViewport;
+    const refs = this.session.query({
+      height: viewport.height,
+      width: viewport.width,
+      x: viewport.left,
+      y: viewport.top,
     });
-    if (!completedSynchronously) this.frame = frame;
+    return [...refs].sort((left, right) => left.order - right.order);
   }
 
-  private renderCommitted(strokes: readonly InkStroke[], forceFull = false): void {
-    const delta = forceFull
-      ? ({ kind: 'full', strokes } as const)
-      : committedStrokeRenderDelta(this.renderedStrokes, strokes);
-    if (delta.kind === 'none') return;
-    if (delta.kind === 'full') {
-      this.clearCanvas(this.committedCanvas, this.committedContext);
+  private updateRenderOverlay(): void {
+    if (this.activePointerId !== null || this.toolbarStore.state.value.interaction !== 'select') {
+      this.renderRuntime.setOverlay({ hovered: [], selected: [] });
+      return;
     }
-    for (const stroke of selectVisibleInkStrokes(
-      delta.strokes,
-      this.viewportTop,
-      this.viewportHeight,
-    )) {
-      if (stroke.tool !== 'eraser') {
-        drawStroke(this.committedContext, stroke.points, stroke.color, stroke.width);
-      }
-    }
-    this.renderedStrokes = [...strokes];
-  }
-
-  private renderSelectionChrome(strokes: readonly InkStroke[]): void {
-    if (this.activePointerId !== null) return;
-    this.clearSelectionChrome();
-    if (this.toolbarStore.state.value.interaction !== 'select') return;
+    const refs = this.visibleRefs();
     const selected = new Set(this.session.selectedStrokeIds?.() ?? []);
     const hovered = this.hoveredStrokeId;
-    const visibleSelected = selectVisibleInkStrokes(
-      strokes.filter((candidate) => selected.has(candidate.id)),
-      this.viewportTop,
-      this.viewportHeight,
-    );
-    const visibleHovered = selectVisibleInkStrokes(
-      strokes.filter((candidate) => candidate.id === hovered && !selected.has(candidate.id)),
-      this.viewportTop,
-      this.viewportHeight,
-    );
-    const visible = [...visibleHovered, ...visibleSelected];
-    this.selectionChromeBounds = selectionChromeBounds(visible, this.stageFrame);
-    for (const stroke of visibleHovered) {
-      drawStroke(this.activeContext, stroke.points, 'rgba(79, 70, 229, 0.3)', stroke.width + 4);
-      drawStroke(this.activeContext, stroke.points, stroke.color, stroke.width);
-    }
-    for (const stroke of visibleSelected) {
-      drawStroke(this.activeContext, stroke.points, 'rgba(79, 70, 229, 0.45)', stroke.width + 8);
-      drawStroke(this.activeContext, stroke.points, stroke.color, stroke.width);
-    }
-  }
-
-  private clearSelectionChrome(): void {
-    const bounds = this.selectionChromeBounds;
-    this.selectionChromeBounds = null;
-    if (bounds === null) return;
-    this.clearCanvasCssRect(this.activeContext, bounds);
+    this.renderRuntime.setOverlay({
+      hovered: refs.filter(({ id }) => id === hovered && !selected.has(id)),
+      selected: refs.filter(({ id }) => selected.has(id)),
+    });
   }
 
   private setHoveredStroke(strokeId: string | null): void {
     if (strokeId === this.hoveredStrokeId) return;
     this.hoveredStrokeId = strokeId;
     this.inputTarget.style.cursor = strokeId === null ? '' : 'grab';
-    this.renderSelectionChrome(this.session.snapshot().surface.strokes);
-  }
-
-  private createCanvas(layer: string): HTMLCanvasElement {
-    const canvas = this.document.createElement('canvas');
-    const ratio = Math.max(1, globalThis.devicePixelRatio || 1);
-    canvas.className = `inkstone-ink-canvas inkstone-ink-canvas-${layer}`;
-    const cssWidth = this.paneWidth(INK_DOCUMENT_LOGICAL_WIDTH);
-    const cssHeight = this.paneHeight(this.viewportHeight);
-    canvas.width = Math.round(cssWidth * ratio);
-    canvas.height = Math.round(cssHeight * ratio);
-    canvas.style.width = '100%';
-    canvas.style.height = '100%';
-    canvas.style.top = '0px';
-    return canvas;
+    this.updateRenderOverlay();
   }
 
   private readonly onScrolled = (): void => {
     if (this.disposed) return;
+    if (this.active) this.session.noteUserInteraction?.();
     this.cancelReadingContextRestore();
     // Native scrolling changes only the client-space projection of the immutable document.
     // The pane-fixed Canvas rect and CSS zoom stay unchanged; only the document origin moves.
@@ -1151,10 +1783,12 @@ export class InkCanvasController {
         },
       }),
     );
-    this.updateViewport(true);
+    this.renderRuntime.projectFrame(this.stageFrame);
+    this.scheduleViewportSettle();
   };
 
   private readonly onNativeNavigationIntent = (): void => {
+    if (this.active) this.session.noteUserInteraction?.();
     this.cancelReadingContextRestore();
   };
 
@@ -1164,8 +1798,19 @@ export class InkCanvasController {
     this.clampDraggedControls();
     this.applyWorkspaceScale();
     this.positionOverlay();
+    if (
+      (this.activePointerId !== null || this.activeStylusTouchId !== null) &&
+      this.deferredStageFrame !== null
+    ) {
+      this.sealActiveContactForForcedStageFrame();
+    }
     if (logicalViewportTop !== null) this.restoreLogicalViewportTop(logicalViewportTop);
-    this.updateViewport(true);
+    if (this.viewportSettleTimer === null) {
+      this.updateViewport(false);
+    } else {
+      this.renderRuntime.projectFrame(this.stageFrame);
+      this.scheduleViewportSettle();
+    }
     const scale = this.viewMode === 'raw' ? 1 : this.stageFrame.actualScale;
     const layout = this.measureLayoutPresentation();
     const visibleLogicalBottom =
@@ -1192,43 +1837,22 @@ export class InkCanvasController {
   }
 
   private updateViewport(force: boolean): void {
-    const redraw = force || this.stageFrameChanged;
-    this.resizeViewportCanvas(this.committedCanvas, this.committedContext);
-    this.resizeViewportCanvas(this.activeCanvas, this.activeContext);
+    this.renderRuntime.setFrame(this.stageFrame);
+    if (force || this.stageFrameChanged) this.renderRuntime.invalidateViewport();
     this.stageFrameChanged = false;
-    if (redraw) {
-      const strokes = this.session.snapshot().surface.strokes;
-      this.renderCommitted(this.selectionCommittedStrokes ?? strokes, true);
-      this.redrawActiveLayer(strokes);
-    }
   }
 
-  private redrawActiveLayer(strokes: readonly InkStroke[]): void {
-    this.clearCanvas(this.activeCanvas, this.activeContext);
-    this.selectionChromeBounds = null;
-    if (this.activePointerId !== null && this.activePoints.length > 0) {
-      if (this.tool === 'eraser') {
-        drawEraserPreview(
-          this.activeContext,
-          this.activePoints,
-          this.activePoints[0],
-          this.eraserPreviewColor,
-          this.width,
-          this.stageFrame.actualScale,
-          isClosedLoopEraseGesture(this.activeClientPoints),
-        );
-      } else {
-        drawStroke(
-          this.activeContext,
-          this.activePoints,
-          this.tool === 'highlighter' ? `${this.color}88` : this.color,
-          this.width,
-        );
-      }
-      this.activePaintedPointCount = this.activePoints.length;
+  private scheduleViewportSettle(): void {
+    const window = this.document.defaultView;
+    if (window === null) {
+      this.updateViewport(true);
       return;
     }
-    this.renderSelectionChrome(strokes);
+    if (this.viewportSettleTimer !== null) window.clearTimeout(this.viewportSettleTimer);
+    this.viewportSettleTimer = window.setTimeout(() => {
+      this.viewportSettleTimer = null;
+      this.updateViewport(true);
+    }, VIEWPORT_SETTLE_DELAY_MS);
   }
 
   private positionOverlay(): void {
@@ -1238,8 +1862,7 @@ export class InkCanvasController {
       const layout = this.measureLayoutPresentation();
       const scale = layout.scale;
       const width = layout.rect.width || INK_DOCUMENT_LOGICAL_WIDTH * scale;
-      const height =
-        layout.rect.height || this.session.snapshot().surface.layout.logicalHeight * scale;
+      const height = layout.rect.height || this.currentRead.logicalHeight * scale;
       const left = layout.rect.left;
       const top = layout.rect.top;
       const documentOriginInset = this.documentOriginInset ?? { x: 0, y: 0 };
@@ -1284,33 +1907,6 @@ export class InkCanvasController {
         },
       }),
     );
-  }
-
-  private resizeViewportCanvas(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D): void {
-    const ratio = Math.max(1, globalThis.devicePixelRatio || 1);
-    const { height, width } = this.stageFrame.canvasClientRect;
-    const pixelWidth = Math.round(width * ratio);
-    const pixelHeight = Math.round(height * ratio);
-    const resized = canvas.width !== pixelWidth || canvas.height !== pixelHeight;
-    if (resized) {
-      canvas.width = pixelWidth;
-      canvas.height = pixelHeight;
-    }
-    if (canvas.style.width !== '100%') canvas.style.width = '100%';
-    if (canvas.style.height !== '100%') canvas.style.height = '100%';
-    if (canvas.style.top !== '0px') canvas.style.top = '0px';
-    const transform = this.stageFrame.canvasBackingTransform(ratio);
-    context.setTransform(
-      transform.a,
-      transform.b,
-      transform.c,
-      transform.d,
-      transform.e,
-      transform.f,
-    );
-    context.lineCap = 'round';
-    context.lineJoin = 'round';
-    if (resized && canvas === this.activeCanvas) this.selectionChromeBounds = null;
   }
 
   private restoreLogicalViewportTop(logicalTop: number): void {
@@ -1391,8 +1987,6 @@ export class InkCanvasController {
         this.overlay.style.height = `${(localHeight * target.height) / actual.height}px`;
       }
     }
-    const canvasRect = this.committedCanvas.getBoundingClientRect();
-    if (isMeasurableRect(canvasRect)) return freezeCssRect(canvasRect);
     const overlayRect = this.overlay.getBoundingClientRect();
     if (isMeasurableRect(overlayRect)) return freezeCssRect(overlayRect);
     return Object.freeze({ ...target });
@@ -1445,36 +2039,28 @@ export class InkCanvasController {
   }
 
   private publishStageFrame(next: InkStageFrame): void {
+    if (this.contactStageFrameFrozen) {
+      this.deferredStageFrame = sameInkStageFrame(this.stageFrame, next) ? null : next;
+      return;
+    }
+    this.publishStageFrameNow(next);
+  }
+
+  private publishStageFrameNow(next: InkStageFrame): void {
     const previous = this.stageFrame;
-    this.stageFrameChanged ||=
-      previous.actualScale !== next.actualScale ||
-      previous.canvasClientRect.left !== next.canvasClientRect.left ||
-      previous.canvasClientRect.top !== next.canvasClientRect.top ||
-      previous.canvasClientRect.width !== next.canvasClientRect.width ||
-      previous.canvasClientRect.height !== next.canvasClientRect.height ||
-      previous.documentClientOrigin.x !== next.documentClientOrigin.x ||
-      previous.documentClientOrigin.y !== next.documentClientOrigin.y;
+    const changed = !sameInkStageFrame(previous, next);
+    this.stageFrameChanged ||= changed;
+    if (changed) this.stageFrameEpoch += 1;
     this.stageFrame = next;
   }
 
-  private clearCanvas(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D): void {
-    context.save();
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.restore();
-  }
-
-  private clearCanvasCssRect(context: CanvasRenderingContext2D, bounds: InkDirtyRect): void {
-    const ratio = Math.max(1, globalThis.devicePixelRatio || 1);
-    context.save();
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.clearRect(
-      Math.floor(bounds.x * ratio),
-      Math.floor(bounds.y * ratio),
-      Math.ceil(bounds.width * ratio),
-      Math.ceil(bounds.height * ratio),
-    );
-    context.restore();
+  private releaseContactStageFrame(): void {
+    this.contactStageFrameFrozen = false;
+    const deferred = this.deferredStageFrame;
+    this.deferredStageFrame = null;
+    if (deferred === null) return;
+    this.publishStageFrameNow(deferred);
+    this.updateViewport(true);
   }
 
   private setToolOptionsVisible(visible: boolean): void {
@@ -1486,6 +2072,7 @@ export class InkCanvasController {
   }
 
   private readonly onToolbarColor = (color: string): void => {
+    this.noteToolbarInteraction();
     this.toolStyles[this.tool] = { ...this.toolStyles[this.tool], color };
     this.updateToolbar({ color });
     this.persistPreference();
@@ -1496,19 +2083,33 @@ export class InkCanvasController {
   };
 
   private readonly onToolbarRedo = (): void => {
-    if (this.session.redo()) this.sync(this.session.snapshot());
+    this.noteToolbarInteraction();
+    if (this.session.redo()) this.sync(this.session.read());
+  };
+
+  private readonly onToolbarExportUnsaved = (): void => {
+    this.noteToolbarInteraction();
+    void this.onExportUnsavedRequested().catch(() => this.sync(this.session.read()));
   };
 
   private readonly onToolbarDeleteSelection = (): void => {
+    this.noteToolbarInteraction();
     const deletedStrokeIds = this.session.deleteSelectedStrokes?.() ?? [];
-    if (deletedStrokeIds.length > 0) this.sync(this.session.snapshot());
+    if (deletedStrokeIds.length > 0) this.sync(this.session.read());
   };
 
   private readonly onToolbarRetry = (): void => {
-    void this.onRetryRequested().catch(() => this.sync(this.session.snapshot()));
+    this.noteToolbarInteraction();
+    const physicalState = this.physicalCandidate?.read();
+    if (physicalState?.kind === 'failed') {
+      this.enterPhysicalCandidate();
+      return;
+    }
+    void this.onRetryRequested().catch(() => this.sync(this.session.read()));
   };
 
   private readonly onToolbarToggleOptions = (): void => {
+    this.noteToolbarInteraction();
     const visible = !this.toolbarStore.state.value.optionsVisible;
     this.setToolOptionsVisible(visible);
     this.persistPreference();
@@ -1516,52 +2117,65 @@ export class InkCanvasController {
   };
 
   private readonly onToolbarTool = (tool: InkStroke['tool']): void => {
-    this.finishStroke(false);
+    this.noteToolbarInteraction();
+    if (this.activePointerId !== null) this.finishStroke(false);
     const style = this.toolStyles[tool];
-    this.updateToolbar({
-      color: style.color,
-      interaction: 'draw',
-      selectedCount: 0,
-      tool,
-      width: style.width,
-    });
+    const previousToolbar = this.toolbarStore.state.value;
+    this.updateToolbar(
+      {
+        color: style.color,
+        interaction: 'draw',
+        selectedCount: 0,
+        tool,
+        width: style.width,
+      },
+      previousToolbar.optionsVisible ||
+        previousToolbar.interaction !== 'draw' ||
+        previousToolbar.selectedCount !== 0,
+    );
     this.hoveredStrokeId = null;
     this.inputTarget.style.cursor = '';
     this.session.clearSelection?.();
-    this.clearCanvas(this.activeCanvas, this.activeContext);
-    this.selectionChromeBounds = null;
+    this.renderRuntime.cancelActive();
+    this.renderRuntime.setOverlay({ hovered: [], selected: [] });
     this.persistPreference();
   };
 
   private readonly onToolbarSelectMove = (): void => {
-    this.finishStroke(false);
+    this.noteToolbarInteraction();
+    if (this.activePointerId !== null) this.finishStroke(false);
     this.updateToolbar({ interaction: 'select', optionsVisible: false });
     this.inputTarget.style.cursor = '';
     this.persistPreference();
   };
 
   private readonly onToolbarToggleMultiple = (): void => {
+    this.noteToolbarInteraction();
     this.updateToolbar({ multiple: !this.toolbarStore.state.value.multiple });
     this.persistPreference();
   };
 
   private readonly onToolbarUndo = (): void => {
-    if (this.session.undo()) this.sync(this.session.snapshot());
+    this.noteToolbarInteraction();
+    if (this.session.undo()) this.sync(this.session.read());
   };
 
   private readonly onToolbarWidth = (width: number): void => {
+    this.noteToolbarInteraction();
     this.toolStyles[this.tool] = { ...this.toolStyles[this.tool], width };
     this.updateToolbar({ width });
     this.persistPreference();
   };
 
   private readonly onToolbarZoomFit = (): void => {
+    this.noteToolbarInteraction();
     this.updateToolbar({ zoomMode: 'fit' });
     this.refreshWorkspacePresentation();
     this.persistPreference();
   };
 
   private readonly onToolbarZoomIn = (): void => {
+    this.noteToolbarInteraction();
     this.updateToolbar({
       zoomMode: 'manual',
       zoomScale: stepInkWorkspaceScale(this.toolbarStore.state.value.zoomScale, 1),
@@ -1571,6 +2185,7 @@ export class InkCanvasController {
   };
 
   private readonly onToolbarZoomOut = (): void => {
+    this.noteToolbarInteraction();
     this.updateToolbar({
       zoomMode: 'manual',
       zoomScale: stepInkWorkspaceScale(this.toolbarStore.state.value.zoomScale, -1),
@@ -1579,17 +2194,21 @@ export class InkCanvasController {
     this.persistPreference();
   };
 
+  private noteToolbarInteraction(): void {
+    if (this.active) this.session.noteUserInteraction?.();
+  }
+
   private refreshWorkspacePresentation(): void {
     const logicalViewportTop = this.viewMode === 'raw' ? null : this.viewportTop;
     this.applyWorkspaceScale();
     this.positionOverlay();
     if (logicalViewportTop !== null) this.restoreLogicalViewportTop(logicalViewportTop);
-    this.updateViewport(true);
-    this.renderCommitted(
-      this.selectionCommittedStrokes ?? this.session.snapshot().surface.strokes,
-      true,
-    );
-    this.renderSelectionChrome(this.session.snapshot().surface.strokes);
+    // Zoom controls are a continuous viewport gesture. Keep presenting the retained bitmap through
+    // the compositor and share the same trailing settle as native scrolling; rebuilding here would
+    // put a full history query and raster preparation on every zoom tick.
+    this.renderRuntime.projectFrame(this.stageFrame);
+    this.scheduleViewportSettle();
+    this.updateRenderOverlay();
   }
 
   private applyWorkspaceScale(): void {
@@ -1663,6 +2282,7 @@ export class InkCanvasController {
       onDone: this.onToolbarDone,
       onDragKeyDown: this.onControlsDragKeyDown,
       onDragStart: this.onControlsDragStart,
+      onExportUnsaved: this.onToolbarExportUnsaved,
       onRedo: this.onToolbarRedo,
       onRetry: this.onToolbarRetry,
       onSelectMove: this.onToolbarSelectMove,
@@ -1765,12 +2385,12 @@ export class InkCanvasController {
     this.session.clearSelection?.();
     this.document.removeEventListener('keydown', this.onDocumentKeyDown);
     this.active = false;
+    this.toolbarHost.dataset.inkstoneControllerActive = 'false';
     this.viewMode = target;
     this.overlay.hidden = target === 'raw';
-    this.activeCanvas.style.pointerEvents = 'none';
     this.hoveredStrokeId = null;
-    this.clearCanvas(this.activeCanvas, this.activeContext);
-    this.selectionChromeBounds = null;
+    this.renderRuntime.cancelActive();
+    this.renderRuntime.setOverlay({ hovered: [], selected: [] });
     this.inputTarget.style.cursor = '';
     this.updateToolbar({ active: false });
     this.root.classList.remove('is-ink-mode', 'is-ink-preview');
@@ -1817,13 +2437,13 @@ export class InkCanvasController {
   }
 
   private activateWorkspace(): void {
-    const layout = this.session.snapshot().surface.layout;
+    const logicalHeight = this.currentRead.logicalHeight;
     this.layoutRoot.classList.add('inkstone-ink-workspace');
     this.layoutRoot.style.setProperty(
       '--inkstone-ink-logical-width',
       `${INK_DOCUMENT_LOGICAL_WIDTH}px`,
     );
-    this.layoutRoot.style.setProperty('--inkstone-ink-logical-height', `${layout.logicalHeight}px`);
+    this.layoutRoot.style.setProperty('--inkstone-ink-logical-height', `${logicalHeight}px`);
     this.applyWorkspaceScale();
   }
 
@@ -1833,14 +2453,6 @@ export class InkCanvasController {
     this.layoutRoot.style.removeProperty('--inkstone-ink-logical-width');
     this.layoutRoot.style.removeProperty('--inkstone-ink-logical-height');
     this.layoutRoot.style.removeProperty('--inkstone-ink-scale');
-  }
-
-  private cancelFrame(): void {
-    if (this.frame !== null) {
-      cancelAnimationFrame(this.frame);
-      this.frame = null;
-    }
-    this.pendingInputStartedAt = null;
   }
 }
 
@@ -1869,69 +2481,6 @@ function freezeCssRect(rect: DOMRect): CssRect {
   return Object.freeze({ height: rect.height, left: rect.left, top: rect.top, width: rect.width });
 }
 
-export function nextActivePaintSegment(
-  points: readonly InkPoint[],
-  paintedPointCount: number,
-): { readonly nextPaintedPointCount: number; readonly points: readonly InkPoint[] } {
-  const validPaintedCount =
-    Number.isInteger(paintedPointCount) &&
-    paintedPointCount >= 0 &&
-    paintedPointCount <= points.length
-      ? paintedPointCount
-      : 0;
-  const start = validPaintedCount === 0 ? 0 : validPaintedCount - 1;
-  return {
-    nextPaintedPointCount: points.length,
-    points: points.slice(start),
-  };
-}
-
-export function committedStrokeRenderDelta(
-  previous: readonly InkStroke[],
-  next: readonly InkStroke[],
-):
-  | { readonly kind: 'append'; readonly strokes: readonly InkStroke[] }
-  | { readonly kind: 'full'; readonly strokes: readonly InkStroke[] }
-  | { readonly kind: 'none'; readonly strokes: readonly InkStroke[] } {
-  const unchangedPrefix =
-    next.length >= previous.length && previous.every((stroke, index) => stroke === next[index]);
-  if (!unchangedPrefix) return { kind: 'full', strokes: next };
-  if (next.length === previous.length) return { kind: 'none', strokes: [] };
-  return { kind: 'append', strokes: next.slice(previous.length) };
-}
-
-export function selectVisibleInkStrokes(
-  strokes: readonly InkStroke[],
-  viewportTop: number,
-  viewportHeight: number,
-): readonly InkStroke[] {
-  if (!Number.isFinite(viewportTop) || !Number.isFinite(viewportHeight) || viewportHeight <= 0) {
-    throw new Error('Ink viewport bounds must be finite and positive.');
-  }
-  const viewportBottom = viewportTop + viewportHeight;
-  return strokes.filter((stroke) => {
-    if (stroke.points.length === 0) return false;
-    let minimumY = Number.POSITIVE_INFINITY;
-    let maximumY = Number.NEGATIVE_INFINITY;
-    for (const point of stroke.points) {
-      minimumY = Math.min(minimumY, point.y);
-      maximumY = Math.max(maximumY, point.y);
-    }
-    const radius = stroke.width / 2;
-    return maximumY + radius >= viewportTop && minimumY - radius <= viewportBottom;
-  });
-}
-
-function requireContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
-  const context = canvas.getContext('2d');
-  if (context === null) {
-    throw new Error('Ink Mode requires a 2D Canvas context.');
-  }
-  context.lineCap = 'round';
-  context.lineJoin = 'round';
-  return context;
-}
-
 function isDrawingPointer(pointerType: string): boolean {
   return pointerType === 'pen' || pointerType === 'mouse' || pointerType === '';
 }
@@ -1945,7 +2494,10 @@ function initialToolStyles(preference: InkToolPreference): InkToolStyles {
   };
 }
 
-function isClosedLoopEraseGesture(points: readonly CssPoint[]): boolean {
+function isClosedLoopEraseGesture(
+  points: readonly CssPoint[],
+  logicalUnitsPerCssPixel = 1,
+): boolean {
   if (points.length < 3 || points.some(({ x, y }) => !Number.isFinite(x) || !Number.isFinite(y))) {
     return false;
   }
@@ -1971,7 +2523,10 @@ function isClosedLoopEraseGesture(points: readonly CssPoint[]): boolean {
   const height = maximumY - minimumY;
   const diagonal = Math.hypot(width, height);
   const closingGap = Math.hypot(last.x - first.x, last.y - first.y);
-  const adaptiveClosingGap = Math.min(120, Math.max(32, diagonal * 0.6));
+  const adaptiveClosingGap = Math.min(
+    120 * logicalUnitsPerCssPixel,
+    Math.max(32 * logicalUnitsPerCssPixel, diagonal * 0.6),
+  );
   let effectiveArea = 0;
   for (let index = 1; index < points.length - 1; index += 1) {
     const point = points[index];
@@ -1983,12 +2538,12 @@ function isClosedLoopEraseGesture(points: readonly CssPoint[]): boolean {
       ) / 2;
   }
   return (
-    length >= 48 &&
-    width >= 16 &&
-    height >= 16 &&
+    length >= 48 * logicalUnitsPerCssPixel &&
+    width >= 16 * logicalUnitsPerCssPixel &&
+    height >= 16 * logicalUnitsPerCssPixel &&
     closingGap <= adaptiveClosingGap &&
     closingGap / length <= 0.3 &&
-    effectiveArea >= Math.max(64, width * height * 0.12)
+    effectiveArea >= Math.max(64 * logicalUnitsPerCssPixel ** 2, width * height * 0.12)
   );
 }
 
@@ -2008,129 +2563,9 @@ function touchInputSample(event: TouchEvent, touch: Touch): InkClientInputSample
   return {
     clientX: touch.clientX,
     clientY: touch.clientY,
-    pressure: touch.force,
+    pressure: 0.5,
     timeStamp: event.timeStamp,
   };
-}
-
-function selectionChromeBounds(
-  strokes: readonly InkStroke[],
-  frame: InkStageFrame,
-): InkDirtyRect | null {
-  let minimumX = Number.POSITIVE_INFINITY;
-  let minimumY = Number.POSITIVE_INFINITY;
-  let maximumX = Number.NEGATIVE_INFINITY;
-  let maximumY = Number.NEGATIVE_INFINITY;
-  for (const stroke of strokes) {
-    const radius = ((stroke.width + 8) / 2 + 2) * frame.actualScale;
-    for (const point of stroke.points) {
-      const canvasPoint = frame.logicalToCanvasCss(point);
-      minimumX = Math.min(minimumX, canvasPoint.x - radius);
-      maximumX = Math.max(maximumX, canvasPoint.x + radius);
-      minimumY = Math.min(minimumY, canvasPoint.y - radius);
-      maximumY = Math.max(maximumY, canvasPoint.y + radius);
-    }
-  }
-  if (!Number.isFinite(minimumX)) return null;
-  const left = Math.max(0, Math.floor(minimumX));
-  const top = Math.max(0, Math.floor(minimumY));
-  const right = Math.min(frame.canvasClientRect.width, Math.ceil(maximumX));
-  const bottom = Math.min(frame.canvasClientRect.height, Math.ceil(maximumY));
-  if (right <= left || bottom <= top) return null;
-  return { height: bottom - top, width: right - left, x: left, y: top };
-}
-
-function drawStroke(
-  context: CanvasRenderingContext2D,
-  points: readonly InkPoint[],
-  color: string,
-  width: number,
-): void {
-  const first = points[0];
-  if (first === undefined) {
-    return;
-  }
-  context.beginPath();
-  context.strokeStyle = color;
-  context.lineWidth = width;
-  context.moveTo(first.x, first.y);
-  if (points.length === 1) {
-    context.lineTo(first.x + 0.01, first.y + 0.01);
-  } else {
-    for (const point of points.slice(1)) {
-      context.lineTo(point.x, point.y);
-    }
-  }
-  context.stroke();
-}
-
-function drawEraserPreview(
-  context: CanvasRenderingContext2D,
-  points: readonly InkPoint[],
-  start: InkPoint | undefined,
-  color: string,
-  width: number,
-  scale: number,
-  closed: boolean,
-): void {
-  const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
-  context.save();
-  context.setLineDash([6 / safeScale, 4 / safeScale]);
-  drawStroke(context, points, color, width);
-  if (start !== undefined) {
-    const radius = 6 / safeScale;
-    context.setLineDash([]);
-    context.beginPath();
-    context.strokeStyle = color;
-    context.lineWidth = 2 / safeScale;
-    context.arc(start.x, start.y, radius, 0, Math.PI * 2);
-    if (closed) context.arc(start.x, start.y, radius / 2, 0, Math.PI * 2);
-    context.stroke();
-  }
-  context.restore();
-}
-
-function simplifyPoints(points: readonly InkPoint[], tolerance: number): readonly InkPoint[] {
-  if (points.length <= 2) {
-    return [...points];
-  }
-  const first = points[0];
-  const last = points.at(-1);
-  if (first === undefined || last === undefined) {
-    return [];
-  }
-  let furthestDistance = 0;
-  let furthestIndex = -1;
-  for (let index = 1; index < points.length - 1; index += 1) {
-    const point = points[index];
-    if (point === undefined) continue;
-    const distance = distanceToSegment(point, first, last);
-    if (distance > furthestDistance) {
-      furthestDistance = distance;
-      furthestIndex = index;
-    }
-  }
-  if (furthestIndex < 0 || furthestDistance <= tolerance) {
-    return [first, last];
-  }
-  return [
-    ...simplifyPoints(points.slice(0, furthestIndex + 1), tolerance).slice(0, -1),
-    ...simplifyPoints(points.slice(furthestIndex), tolerance),
-  ];
-}
-
-function distanceToSegment(point: InkPoint, start: InkPoint, end: InkPoint): number {
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-  if (dx === 0 && dy === 0) {
-    return Math.hypot(point.x - start.x, point.y - start.y);
-  }
-  const t = clamp(
-    ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy),
-    0,
-    1,
-  );
-  return Math.hypot(point.x - (start.x + t * dx), point.y - (start.y + t * dy));
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

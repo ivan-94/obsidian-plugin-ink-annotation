@@ -11,7 +11,8 @@ test-fixtures/vault/.obsidian/*
 !test-fixtures/vault/.obsidian/community-plugins.json
 artifacts/
 hats/
-test-fixtures
-docs/delivery
+test-fixtures/*
+!test-fixtures/ink-brush/
+!test-fixtures/ink-brush/**
+docs/delivery/
 .scratch/
-

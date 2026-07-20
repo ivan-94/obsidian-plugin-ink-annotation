@@ -98,6 +98,27 @@ describe('local Ink tool preference', () => {
       pen: { color: '#123456', width: 4 },
     });
   });
+
+  it('falls back to one in-process preference after browser Storage reaches quota', () => {
+    const storage = new MemoryStorage();
+    const store = new LocalInkToolPreferenceStore(storage, 'Vault A', 'ipad');
+    const preference = {
+      ...LocalInkToolPreferenceStore.DEFAULT,
+      color: '#abcdef',
+      hintShown: true,
+    };
+    let writeCount = 0;
+    storage.setItem = () => {
+      writeCount += 1;
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    };
+
+    expect(() => store.save(preference)).not.toThrow();
+    expect(store.load()).toEqual(preference);
+    expect(() => store.save({ ...preference, width: 8 })).not.toThrow();
+    expect(store.load()).toEqual({ ...preference, width: 8 });
+    expect(writeCount).toBe(1);
+  });
 });
 
 class MemoryStorage implements Storage {

@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { InkDocumentSession } from '../application/ink-document-session';
+import { LegacyRoundInkStrokeGeometry } from '../domain/ink-stroke-geometry';
 import { encodeInkSurfaceRecord, type InkSurfaceRecord } from '../domain/ink-surface';
 import { InkSurfaceRepository } from '../storage/ink-surface-repository';
 import { SidecarRepository, type TextFileStore } from '../storage/sidecar-repository';
@@ -32,6 +33,149 @@ describe('Ink pointer persistence round-trip', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it('freezes the PF-42 Cycle 0 Pointer legacy geometry digest and sidecar bytes', async () => {
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue(
+      '00000000-0000-4000-8000-000000000042',
+    );
+    const store = new MemoryTextFileStore();
+    const meta = await new SidecarRepository(store).getOrCreateNote({
+      createId: () => 'note-pf42-cycle-0',
+      filePath: 'Scale.md',
+      now: '2026-07-18T00:00:00.000Z',
+      sourceFingerprint: 'source-scale',
+    });
+    const repository = new InkSurfaceRepository(store);
+    const initial = fixedSurface(meta.noteId);
+    await repository.writeSurface(initial);
+    const root = document.createElement('div');
+    document.body.append(root);
+    Object.defineProperties(root, {
+      clientHeight: { configurable: true, value: 600 },
+      clientWidth: { configurable: true, value: 704 },
+    });
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 600));
+    const session = new InkDocumentSession({
+      debounceMs: 60_000,
+      now: () => '2026-07-18T00:01:00.000Z',
+      surfaces: [initial],
+      writer: repository,
+    });
+    const controller = new InkCanvasController({ document, root, scrollContainer: root, session });
+    const active = root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-active]');
+    if (active === null) throw new Error('Missing PF-42 active Ink canvas.');
+    vi.spyOn(active, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 704, 600));
+    const move = pointer('pointermove', 40, 50, 100, {
+      coalesced: [
+        pointer('pointermove', 20, 30, 100, { pressure: 0.25, tiltX: 0, tiltY: 0 }),
+        pointer('pointermove', 30, 40, 100, {
+          pressure: Number.NaN,
+          tiltX: Number.NaN,
+          tiltY: Number.NaN,
+        }),
+        pointer('pointermove', 40, 50, 100, { pressure: 0.8, tiltX: 0, tiltY: 0 }),
+      ],
+      pressure: 0.8,
+      tiltX: 0,
+      tiltY: 0,
+    });
+
+    controller.enter();
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 100, { pressure: 0, tiltX: 10, tiltY: 20 }));
+    root.dispatchEvent(move);
+    root.dispatchEvent(
+      pointer('pointerup', 50, 60, 100, {
+        pressure: Number.NaN,
+        tiltX: Number.NaN,
+        tiltY: Number.NaN,
+      }),
+    );
+    await controller.exit();
+    controller.dispose();
+
+    const persisted = await repository.readSurface(initial.filePath, initial.id);
+    if (persisted === null || persisted.strokes[0] === undefined) {
+      throw new Error('Missing PF-42 persisted stroke.');
+    }
+    const geometry = new LegacyRoundInkStrokeGeometry().compile(persisted.strokes[0]);
+
+    expect(geometry.digest).toBe('c6edd6a3');
+    expect(encodeInkSurfaceRecord(persisted)).toBe(`{
+  "createdAt": "2026-07-14T08:00:00.000Z",
+  "filePath": "Scale.md",
+  "id": "surface-scale",
+  "layout": {
+    "blockFingerprints": [
+      "block-1"
+    ],
+    "fontFamily": "system-ui",
+    "fontSize": 16,
+    "lineHeight": 24,
+    "logicalHeight": 1200,
+    "logicalWidth": 704,
+    "sourceRevision": "source-scale",
+    "themeMode": "light",
+    "originY": 0
+  },
+  "noteId": "note-pf42-cycle-0",
+  "revision": 2,
+  "schemaVersion": 2,
+  "status": "active",
+  "strokes": [
+    {
+      "color": "#4f46d8",
+      "id": "00000000-0000-4000-8000-000000000042",
+      "tool": "pen",
+      "width": 4,
+      "deltas": [
+        {
+          "dp": 0.25,
+          "dt": 0,
+          "dx": 10.602409638554215,
+          "dy": 10.602409638554217,
+          "tiltX": 0,
+          "tiltY": 0
+        },
+        {
+          "dp": 0.25,
+          "dt": 0,
+          "dx": 10.602409638554217,
+          "dy": 10.602409638554214,
+          "tiltX": null,
+          "tiltY": null
+        },
+        {
+          "dp": 0.30000000000000004,
+          "dt": 0,
+          "dx": 10.602409638554214,
+          "dy": 10.60240963855422,
+          "tiltX": 0,
+          "tiltY": 0
+        },
+        {
+          "dp": -0.30000000000000004,
+          "dt": 0,
+          "dx": 10.60240963855422,
+          "dy": 10.602409638554214,
+          "tiltX": null,
+          "tiltY": null
+        }
+      ],
+      "origin": {
+        "pressure": 0,
+        "time": 100,
+        "x": 10.602409638554215,
+        "y": 21.20481927710843,
+        "tiltX": 10.000000000000004,
+        "tiltY": 20.000000000000004
+      },
+      "pointEncoding": "delta-v1"
+    }
+  ],
+  "updatedAt": "2026-07-18T00:01:00.000Z"
+}
+`);
   });
 
   it('persists, previews, re-enters, draws again, reloads, and renders one coordinate plane', async () => {
@@ -81,6 +225,7 @@ describe('Ink pointer persistence round-trip', () => {
         {
           points: [
             { pressure: 0.7, time: 10, x: 48, y: 60 },
+            { pressure: 0.7, time: 20, x: 96, y: 120 },
             { pressure: 0.7, time: 30, x: 144, y: 180 },
           ],
         },
@@ -145,7 +290,7 @@ describe('Ink pointer persistence round-trip', () => {
       controller.enter();
       root.dispatchEvent(pointer('pointerdown', 80 + first.x * scale, 100 + first.y * scale, 10));
       root.dispatchEvent(pointer('pointerup', 80 + second.x * scale, 100 + second.y * scale, 20));
-      expect(contexts.get(active)?.setTransform).toHaveBeenCalledWith(scale, 0, 0, scale, 0, 0);
+      expect(contexts.get(active)?.setTransform).toHaveBeenCalledWith(scale, 0, 0, scale, 80, 100);
       await controller.exit();
       controller.dispose();
 
@@ -172,8 +317,8 @@ describe('Ink pointer persistence round-trip', () => {
         0,
         0,
         scale,
-        0,
-        0,
+        80,
+        100,
       );
       reloaded.controller.dispose();
 
@@ -349,15 +494,26 @@ function logicalPoint(x: number, y: number) {
   return { pressure: 0.5, time: x + y, x, y };
 }
 
-function pointer(type: string, x: number, y: number, timeStamp: number): Event {
+function pointer(
+  type: string,
+  x: number,
+  y: number,
+  timeStamp: number,
+  overrides: {
+    readonly coalesced?: readonly Event[];
+    readonly pressure?: number;
+    readonly tiltX?: number;
+    readonly tiltY?: number;
+  } = {},
+): Event {
   const event = new MouseEvent(type, { bubbles: true, button: 0, clientX: x, clientY: y });
   Object.defineProperties(event, {
-    getCoalescedEvents: { value: () => [event] },
+    getCoalescedEvents: { value: () => overrides.coalesced ?? [event] },
     pointerId: { value: 1 },
     pointerType: { value: 'pen' },
-    pressure: { value: 0.7 },
-    tiltX: { value: 0 },
-    tiltY: { value: 0 },
+    pressure: { value: overrides.pressure ?? 0.7 },
+    tiltX: { value: overrides.tiltX ?? 0 },
+    tiltY: { value: overrides.tiltY ?? 0 },
     timeStamp: { value: timeStamp },
   });
   return event;

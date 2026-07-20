@@ -1,460 +1,202 @@
 import { describe, expect, it } from 'vitest';
 
-import type { InkSurfaceRecord } from '../domain/ink-surface';
-import { LocalInkRecoveryStore, planLocalInkRecovery } from './local-ink-recovery';
+import { hashRecoveryBytes, type InkPreparedCommandPatch } from '../domain/ink-recovery-patch';
+import {
+  encodeInkSurfaceRecord,
+  type InkStroke,
+  type InkSurfaceRecord,
+} from '../domain/ink-surface';
+import {
+  LocalInkRecoveryReader,
+  planLocalInkRecovery,
+  type LocalInkRecoveryCheckpoint,
+} from './local-ink-recovery';
 
-describe('local Ink recovery checkpoint', () => {
-  it('fences a disposed manager after a reloaded manager claims the file', () => {
+describe('retired Ink Recovery read-only migration', () => {
+  it('reads a legacy v3 checkpoint without mutating or clearing any source bytes', () => {
     const storage = new MemoryStorage();
-    const store = new LocalInkRecoveryStore(storage, 'Vault', 'device-a');
-    store.claim('Ink.md', 'old-manager');
-    store.save('Ink.md', [surface('a', 1, ['old'])], 'old-manager');
-
-    store.claim('Ink.md', 'new-manager');
-
-    expect(() => store.save('Ink.md', [surface('a', 1, ['late-old'])], 'old-manager')).toThrow(
-      /stale Ink recovery owner/u,
+    const base = surface('saved');
+    const pending = revision(base, 2, [...base.strokes, stroke('draft')]);
+    storage.seed(
+      checkpointKey(),
+      JSON.stringify({
+        capturedAt: pending.updatedAt,
+        expectedBases: [encodeInkSurfaceRecord(base)],
+        filePath: 'Ink.md',
+        generation: 'legacy-v3',
+        pendingAttempts: [encodeInkSurfaceRecord(pending)],
+        records: [encodeInkSurfaceRecord(pending)],
+        version: 3,
+      }),
     );
-    expect(() => store.save('Ink.md', [surface('a', 1, ['new'])], 'new-manager')).not.toThrow();
-    expect(store.load('Ink.md')).toMatchObject({ records: [{ strokes: [{ id: 'new' }] }] });
-  });
+    const before = storage.snapshot();
 
-  it('round-trips validated bounded records and clears only the captured generation', () => {
-    const storage = new MemoryStorage();
-    const store = new LocalInkRecoveryStore(storage, 'Vault', 'device-a');
-    const first = store.save('Ink.md', [surface('a', 1, ['unsaved'])]);
-    const second = store.save('Ink.md', [surface('a', 1, ['newer'])]);
+    const checkpoint = new LocalInkRecoveryReader(storage, 'Vault', 'device-a').load('Ink.md');
 
-    store.clear('Ink.md', first);
-    expect(store.load('Ink.md')).toMatchObject({
-      generation: second,
-      records: [{ id: 'a', strokes: [{ id: 'newer' }] }],
-    });
-
-    store.clear('Ink.md', second);
-    expect(store.load('Ink.md')).toBeNull();
-  });
-
-  it('fails closed for legacy divergent content even when the revision still matches', () => {
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      filePath: 'Ink.md',
-      generation: 'generation-a',
-      records: [surface('a', 2, ['saved', 'unsaved'])],
-      version: 1 as const,
-    };
-
-    expect(
-      planLocalInkRecovery([surface('a', 2, ['saved'])], checkpoint, '2026-07-16T01:00:00.000Z'),
-    ).toMatchObject({ kind: 'conflict' });
-
-    expect(
-      planLocalInkRecovery([surface('a', 3, ['other'])], checkpoint, '2026-07-16T01:00:00.000Z'),
-    ).toMatchObject({ kind: 'conflict' });
-  });
-
-  it('treats an already persisted checkpoint as recovered instead of writing again', () => {
-    const checkpointRecord = surface('a', 2, ['saved']);
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      filePath: 'Ink.md',
-      generation: 'generation-a',
-      records: [checkpointRecord],
-      version: 1 as const,
-    };
-
-    expect(
-      planLocalInkRecovery(
-        [{ ...checkpointRecord, revision: 3, updatedAt: '2026-07-16T00:30:00.000Z' }],
-        checkpoint,
-        '2026-07-16T01:00:00.000Z',
-      ),
-    ).toMatchObject({ kind: 'none', records: [{ revision: 3 }], writes: [] });
-  });
-
-  it('fails closed for a version-2 optimistic revision without an exact expected base', () => {
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      filePath: 'Ink.md',
-      generation: 'generation-a',
-      records: [surface('a', 2, ['pending'])],
-      version: 2 as const,
-    };
-
-    expect(
-      planLocalInkRecovery([surface('a', 1, [])], checkpoint, '2026-07-16T01:00:00.000Z'),
-    ).toMatchObject({ kind: 'conflict' });
-  });
-
-  it('fails closed when a legacy optimistic checkpoint diverges at the canonical revision', () => {
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      filePath: 'Ink.md',
-      generation: 'generation-a',
-      records: [surface('a', 2, ['local-pending'])],
-      version: 2 as const,
-    };
-
-    expect(
-      planLocalInkRecovery(
-        [surface('a', 2, ['concurrent-canonical'])],
-        checkpoint,
-        '2026-07-16T01:00:00.000Z',
-      ),
-    ).toMatchObject({ kind: 'conflict' });
-  });
-
-  it('restores a version-3 working record only from its exact expected base', () => {
-    const base = surface('a', 1, []);
-    const working = surface('a', 1, ['local-working']);
-    const pending = {
-      ...working,
-      revision: 2,
-      updatedAt: '2026-07-16T00:30:00.000Z',
-    };
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      expectedBases: [base],
-      filePath: 'Ink.md',
-      generation: 'generation-v3',
-      pendingAttempts: [pending],
-      records: [working],
-      version: 3 as const,
-    };
-
-    expect(planLocalInkRecovery([base], checkpoint, '2026-07-16T01:00:00.000Z')).toMatchObject({
-      expectedBases: [{ id: 'a', revision: 1, strokes: [] }],
-      kind: 'restore',
-      records: [{ id: 'a', revision: 2, strokes: [{ id: 'local-working' }] }],
-      writes: [{ id: 'a', revision: 2, strokes: [{ id: 'local-working' }] }],
-    });
-  });
-
-  it('treats the exact version-3 pending attempt as an idempotent recovery success', () => {
-    const base = surface('a', 1, []);
-    const pending = surface('a', 2, ['already-landed']);
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      expectedBases: [base],
-      filePath: 'Ink.md',
-      generation: 'generation-v3',
-      pendingAttempts: [pending],
-      records: [pending],
-      version: 3 as const,
-    };
-
-    expect(planLocalInkRecovery([pending], checkpoint, '2026-07-16T01:00:00.000Z')).toMatchObject({
-      expectedBases: [],
-      kind: 'none',
-      records: [{ id: 'a', revision: 2, strokes: [{ id: 'already-landed' }] }],
-      writes: [],
-    });
-  });
-
-  it('writes newer working content from an already-landed version-3 pending attempt', () => {
-    const base = surface('a', 1, []);
-    const pending = surface('a', 2, ['landed']);
-    const working = surface('a', 2, ['landed', 'after-failure']);
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      expectedBases: [base],
-      filePath: 'Ink.md',
-      generation: 'generation-v3',
-      pendingAttempts: [pending],
-      records: [working],
-      version: 3 as const,
-    };
-
-    expect(planLocalInkRecovery([pending], checkpoint, '2026-07-16T01:00:00.000Z')).toMatchObject({
-      expectedBases: [{ id: 'a', revision: 2, strokes: [{ id: 'landed' }] }],
-      kind: 'restore',
-      records: [
-        {
-          id: 'a',
-          revision: 3,
-          strokes: [{ id: 'landed' }, { id: 'after-failure' }],
-        },
-      ],
-      writes: [{ id: 'a', revision: 3 }],
-    });
-  });
-
-  it('recognizes recovered working content after a crash before checkpoint clearing', () => {
-    const base = surface('a', 1, []);
-    const pending = surface('a', 2, ['pending']);
-    const working = surface('a', 1, ['pending', 'newer-working']);
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      expectedBases: [base],
-      filePath: 'Ink.md',
-      generation: 'generation-v3',
-      pendingAttempts: [pending],
-      records: [working],
-      version: 3 as const,
-    };
-    const recovered = {
-      ...working,
-      revision: 2,
-      updatedAt: '2026-07-16T01:00:00.000Z',
-    };
-
-    expect(planLocalInkRecovery([recovered], checkpoint, '2026-07-16T02:00:00.000Z')).toMatchObject(
-      {
-        expectedBases: [],
-        kind: 'none',
-        records: [{ id: 'a', revision: 2, strokes: [{ id: 'pending' }, { id: 'newer-working' }] }],
-        writes: [],
-      },
-    );
-  });
-
-  it('recognizes a second recovery revision after the pending attempt landed before the crash', () => {
-    const base = surface('a', 1, []);
-    const pending = surface('a', 2, ['pending']);
-    const working = surface('a', 2, ['pending', 'newer-working']);
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      expectedBases: [base],
-      filePath: 'Ink.md',
-      generation: 'generation-v3',
-      pendingAttempts: [pending],
-      records: [working],
-      version: 3 as const,
-    };
-    const recovered = {
-      ...working,
-      revision: 3,
-      updatedAt: '2026-07-16T01:00:00.000Z',
-    };
-
-    expect(planLocalInkRecovery([recovered], checkpoint, '2026-07-16T02:00:00.000Z')).toMatchObject(
-      {
-        expectedBases: [],
-        kind: 'none',
-        records: [{ id: 'a', revision: 3, strokes: [{ id: 'pending' }, { id: 'newer-working' }] }],
-        writes: [],
-      },
-    );
-  });
-
-  it('rejects a version-3 canonical record with the expected revision but different content', () => {
-    const base = surface('a', 1, ['original']);
-    const working = surface('a', 1, ['original', 'local']);
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      expectedBases: [base],
-      filePath: 'Ink.md',
-      generation: 'generation-v3',
-      pendingAttempts: [surface('a', 2, ['original', 'local'])],
-      records: [working],
-      version: 3 as const,
-    };
-
-    expect(
-      planLocalInkRecovery(
-        [surface('a', 1, ['concurrent'])],
-        checkpoint,
-        '2026-07-16T01:00:00.000Z',
-      ),
-    ).toMatchObject({ kind: 'conflict' });
-  });
-
-  it('restores a version-3 checkpoint whose base was polluted only by transient canvas extent', () => {
-    const canonical = surface('a', 1, ['saved']);
-    const pollutedBase = {
-      ...canonical,
-      layout: { ...canonical.layout, logicalHeight: canonical.layout.logicalHeight + 600 },
-    };
-    const pending = {
-      ...pollutedBase,
-      revision: 2,
-      strokes: [...pollutedBase.strokes, stroke('local-pending')],
-      updatedAt: '2026-07-16T00:30:00.000Z',
-    };
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:31:00.000Z',
-      expectedBases: [pollutedBase],
-      filePath: 'Ink.md',
-      generation: 'generation-transient-extent',
-      pendingAttempts: [pending],
-      records: [pending],
-      version: 3 as const,
-    };
-
-    expect(planLocalInkRecovery([canonical], checkpoint, '2026-07-16T01:00:00.000Z')).toMatchObject(
-      {
-        expectedBases: [canonical],
-        kind: 'restore',
-        records: [
-          {
-            layout: { logicalHeight: pollutedBase.layout.logicalHeight },
-            revision: 2,
-            strokes: [{ id: 'saved' }, { id: 'local-pending' }],
-          },
-        ],
-        writes: [{ id: 'a', revision: 2 }],
-      },
-    );
-  });
-
-  it('does not forgive any canonical difference alongside a transient extent mismatch', () => {
-    const canonical = surface('a', 1, ['saved']);
-    const divergentBase = {
-      ...canonical,
-      layout: {
-        ...canonical.layout,
-        fontFamily: 'concurrent-font',
-        logicalHeight: canonical.layout.logicalHeight + 600,
-      },
-    };
-    const pending = {
-      ...divergentBase,
-      revision: 2,
-      strokes: [...divergentBase.strokes, stroke('local-pending')],
-    };
-
-    expect(
-      planLocalInkRecovery(
-        [canonical],
-        {
-          capturedAt: '2026-07-16T00:31:00.000Z',
-          expectedBases: [divergentBase],
-          filePath: 'Ink.md',
-          generation: 'generation-real-divergence',
-          pendingAttempts: [pending],
-          records: [pending],
-          version: 3,
-        },
-        '2026-07-16T01:00:00.000Z',
-      ),
-    ).toMatchObject({ kind: 'conflict' });
-  });
-
-  it('restores independent local and remote stroke appends from one exact checkpoint base', () => {
-    const base = surface('a', 1, []);
-    const localPending = surface('a', 2, ['local-pending']);
-    const remoteCanonical = surface('a', 2, ['remote-canonical']);
-
-    expect(
-      planLocalInkRecovery(
-        [remoteCanonical],
-        {
-          capturedAt: '2026-07-17T02:30:00.000Z',
-          expectedBases: [base],
-          filePath: 'Ink.md',
-          generation: 'generation-concurrent-appends',
-          pendingAttempts: [localPending],
-          records: [localPending],
-          version: 3,
-        },
-        '2026-07-17T02:31:00.000Z',
-      ),
-    ).toMatchObject({
-      expectedBases: [remoteCanonical],
-      kind: 'restore',
-      records: [
-        {
-          revision: 3,
-          strokes: [{ id: 'remote-canonical' }, { id: 'local-pending' }],
-        },
-      ],
-      writes: [
-        {
-          revision: 3,
-          strokes: [{ id: 'remote-canonical' }, { id: 'local-pending' }],
-        },
-      ],
-    });
-  });
-
-  it('keeps version-3 expected bases aligned with only the records that require writes', () => {
-    const baseA = surface('a', 1, []);
-    const pendingA = surface('a', 2, ['already-landed']);
-    const baseB = surface('b', 1, []);
-    const pendingB = surface('b', 2, ['needs-write']);
-    const checkpoint = {
-      capturedAt: '2026-07-16T00:00:00.000Z',
-      expectedBases: [baseA, baseB],
-      filePath: 'Ink.md',
-      generation: 'generation-v3',
-      pendingAttempts: [pendingA, pendingB],
-      records: [pendingA, pendingB],
-      version: 3 as const,
-    };
-
-    expect(
-      planLocalInkRecovery([pendingA, baseB], checkpoint, '2026-07-16T01:00:00.000Z'),
-    ).toMatchObject({
-      expectedBases: [{ id: 'b', revision: 1 }],
-      kind: 'restore',
-      records: [
-        { id: 'a', revision: 2, strokes: [{ id: 'already-landed' }] },
-        { id: 'b', revision: 2, strokes: [{ id: 'needs-write' }] },
-      ],
-      writes: [{ id: 'b', revision: 2 }],
-    });
-  });
-
-  it('keeps version-2 checkpoints readable without auto-promoting unverifiable content', () => {
-    const store = new LocalInkRecoveryStore(new MemoryStorage(), 'Vault', 'device-a');
-    store.save('Ink.md', [surface('a', 2, ['pending'])]);
-    const checkpoint = store.load('Ink.md');
-    if (checkpoint === null) throw new Error('Missing saved recovery checkpoint.');
-
-    expect(checkpoint.version).toBe(2);
-    expect(
-      planLocalInkRecovery([surface('a', 1, [])], checkpoint, '2026-07-16T01:00:00.000Z'),
-    ).toMatchObject({ kind: 'conflict' });
-  });
-
-  it('round-trips version-3 expected bases, pending attempts and working records', () => {
-    const store = new LocalInkRecoveryStore(new MemoryStorage(), 'Vault', 'device-a');
-    const base = surface('a', 1, []);
-    const pending = surface('a', 2, ['pending']);
-    const working = surface('a', 2, ['pending', 'newer-working']);
-
-    store.save('Ink.md', [working], undefined, {
-      expectedBases: [base],
-      pendingAttempts: [pending],
-    });
-
-    expect(store.load('Ink.md')).toMatchObject({
-      expectedBases: [{ id: 'a', revision: 1, strokes: [] }],
-      pendingAttempts: [{ id: 'a', revision: 2, strokes: [{ id: 'pending' }] }],
-      records: [
-        {
-          id: 'a',
-          revision: 2,
-          strokes: [{ id: 'pending' }, { id: 'newer-working' }],
-        },
-      ],
+    expect(checkpoint).toMatchObject({
+      expectedBases: [{ revision: 1, strokes: [{ id: 'saved' }] }],
+      pendingAttempts: [{ revision: 2, strokes: [{ id: 'saved' }, { id: 'draft' }] }],
       version: 3,
     });
+    expect(storage.snapshot()).toEqual(before);
+    expect(storage.mutationCount).toBe(0);
   });
 
-  it('quarantines corrupt checkpoint bytes instead of permanently blocking the note', () => {
+  it('replays an unacknowledged v4 command chain while keeping the journal byte-for-byte intact', () => {
     const storage = new MemoryStorage();
-    const store = new LocalInkRecoveryStore(storage, 'Vault', 'device-a');
-    store.save('Ink.md', [surface('a', 1, ['unsaved'])]);
-    const checkpointKey = storage.key(0);
-    if (checkpointKey === null) throw new Error('Missing checkpoint fixture.');
-    storage.setItem(checkpointKey, '{');
+    seedV4Journal(storage, surface('saved'), stroke('draft'));
+    const before = storage.snapshot();
 
-    expect(() => store.load('Ink.md')).toThrow(/quarantined/u);
-    expect(store.load('Ink.md')).toBeNull();
-    expect(storage.keys().some((key) => key.includes('quarantine'))).toBe(true);
+    const checkpoint = new LocalInkRecoveryReader(storage, 'Vault', 'device-a').load('Ink.md');
+
+    expect(checkpoint).toMatchObject({
+      acknowledgedRecords: [{ strokes: [{ id: 'saved' }] }],
+      acknowledgedSequence: 0,
+      baseRecords: [{ strokes: [{ id: 'saved' }] }],
+      lastSequence: 1,
+      records: [{ strokes: [{ id: 'saved' }, { id: 'draft' }] }],
+      version: 4,
+    });
+    expect(storage.snapshot()).toEqual(before);
+    expect(storage.mutationCount).toBe(0);
+  });
+
+  it('preserves corrupt legacy bytes in place and reports a read failure', () => {
+    const storage = new MemoryStorage();
+    storage.seed(checkpointKey(), '{not-json');
+    const before = storage.snapshot();
+
+    expect(() => new LocalInkRecoveryReader(storage, 'Vault', 'device-a').load('Ink.md')).toThrow(
+      'raw bytes were preserved',
+    );
+    expect(storage.snapshot()).toEqual(before);
+    expect(storage.mutationCount).toBe(0);
+  });
+
+  it('plans one exact v3 CAS migration into canonical sidecars', () => {
+    const base = surface('saved');
+    const pending = revision(base, 2, [...base.strokes, stroke('draft')]);
+    const checkpoint: LocalInkRecoveryCheckpoint = {
+      capturedAt: pending.updatedAt,
+      expectedBases: [base],
+      filePath: 'Ink.md',
+      generation: 'legacy-v3',
+      pendingAttempts: [pending],
+      records: [pending],
+      version: 3,
+    };
+
+    expect(planLocalInkRecovery([base], checkpoint, '2026-07-19T01:00:00.000Z')).toEqual({
+      expectedBases: [base],
+      kind: 'restore',
+      records: [pending],
+      writes: [pending],
+    });
+  });
+
+  it('fails closed when the canonical surface set no longer matches legacy Recovery', () => {
+    const base = surface('saved');
+    const checkpoint: LocalInkRecoveryCheckpoint = {
+      capturedAt: base.updatedAt,
+      filePath: 'Ink.md',
+      generation: 'legacy-v2',
+      records: [base],
+      version: 2,
+    };
+
+    expect(
+      planLocalInkRecovery([{ ...base, id: 'replacement' }], checkpoint, base.updatedAt),
+    ).toMatchObject({ kind: 'conflict' });
   });
 });
 
-class MemoryStorage implements Storage {
+function seedV4Journal(storage: MemoryStorage, base: InkSurfaceRecord, added: InkStroke): void {
+  const generation = 'legacy-v4';
+  const ownerId = 'crashed-process';
+  const encodedRecords = [encodeInkSurfaceRecord(base)];
+  const baseDigest = hashRecoveryBytes(JSON.stringify(encodedRecords));
+  const command: InkPreparedCommandPatch = {
+    commandId: 'draw:draft',
+    commandKind: 'add',
+    documentGeneration: 0,
+    formatVersion: 1,
+    surfacePatches: [
+      {
+        deleted: [],
+        surfaceId: base.id,
+        upserted: [{ index: base.strokes.length, previousDigest: null, stroke: added }],
+      },
+    ],
+  };
+  const payload = JSON.stringify(command);
+  const payloadChecksum = hashRecoveryBytes(payload);
+  const afterDigest = hashRecoveryBytes(
+    JSON.stringify({
+      beforeDigest: baseDigest,
+      commandId: command.commandId,
+      payloadChecksum,
+      sequence: 1,
+    }),
+  );
+  const root = journalRoot();
+  const generationRoot = `${root}generation/${encodeURIComponent(generation)}/`;
+  storage.seed(
+    `${root}head`,
+    JSON.stringify({
+      baseDigest,
+      capturedAt: '2026-07-19T00:00:00.000Z',
+      digestMode: 'command-chain-v1',
+      filePath: 'Ink.md',
+      generation,
+      kind: 'head',
+      ownerId,
+      version: 4,
+    }),
+  );
+  storage.seed(
+    `${generationRoot}base`,
+    JSON.stringify({
+      filePath: 'Ink.md',
+      generation,
+      kind: 'base',
+      ownerId,
+      records: encodedRecords,
+      recordsChecksum: hashRecoveryBytes(JSON.stringify(encodedRecords)),
+      version: 4,
+    }),
+  );
+  storage.seed(
+    `${generationRoot}entry/1`,
+    JSON.stringify({
+      afterDigest,
+      beforeDigest: baseDigest,
+      command,
+      commandId: command.commandId,
+      generation,
+      kind: 'entry',
+      ownerId,
+      payloadChecksum,
+      payloadLength: new TextEncoder().encode(payload).byteLength,
+      sequence: 1,
+      version: 4,
+    }),
+  );
+}
+
+function checkpointKey(): string {
+  return `inkstone:Vault:device-a:ink-recovery-v1:${encodeURIComponent('Ink.md')}`;
+}
+
+function journalRoot(): string {
+  return `inkstone:Vault:device-a:ink-recovery-journal-v4:${encodeURIComponent('Ink.md')}:`;
+}
+
+class MemoryStorage implements Pick<Storage, 'getItem' | 'key' | 'length'> {
   private readonly values = new Map<string, string>();
+  mutationCount = 0;
 
   get length(): number {
     return this.values.size;
-  }
-
-  clear(): void {
-    this.values.clear();
   }
 
   getItem(key: string): string | null {
@@ -465,60 +207,60 @@ class MemoryStorage implements Storage {
     return [...this.values.keys()][index] ?? null;
   }
 
-  removeItem(key: string): void {
-    this.values.delete(key);
-  }
-
-  setItem(key: string, value: string): void {
+  seed(key: string, value: string): void {
     this.values.set(key, value);
   }
 
-  keys(): readonly string[] {
-    return [...this.values.keys()];
+  snapshot(): readonly (readonly [string, string])[] {
+    return [...this.values.entries()];
   }
 }
 
-function surface(id: string, revision: number, strokeIds: readonly string[]): InkSurfaceRecord {
+function revision(
+  record: InkSurfaceRecord,
+  nextRevision: number,
+  strokes: readonly InkStroke[],
+): InkSurfaceRecord {
   return {
-    createdAt: '2026-07-16T00:00:00.000Z',
+    ...record,
+    revision: nextRevision,
+    strokes,
+    updatedAt: '2026-07-19T00:00:00.000Z',
+  };
+}
+
+function surface(strokeId: string): InkSurfaceRecord {
+  return {
+    createdAt: '2026-07-18T00:00:00.000Z',
     deviceId: 'device-a',
     filePath: 'Ink.md',
-    id,
+    id: 'surface-a',
     layout: {
       blockFingerprints: [],
       fontFamily: 'system-ui',
       fontSize: 16,
       lineHeight: 24,
-      logicalHeight: 1_200,
+      logicalHeight: 1_000,
       logicalWidth: 704,
       originY: 0,
       sourceRevision: 'source-a',
       themeMode: 'light',
     },
     noteId: 'note-a',
-    revision,
+    revision: 1,
     schemaVersion: 2,
     status: 'active',
-    strokes: strokeIds.map((strokeId) => ({
-      color: '#d97777',
-      id: strokeId,
-      points: [{ pressure: 0.5, time: 1, x: 10, y: 20 }],
-      tool: 'pen',
-      width: 4,
-    })),
-    updatedAt: '2026-07-16T00:00:00.000Z',
+    strokes: [stroke(strokeId)],
+    updatedAt: '2026-07-18T00:00:00.000Z',
   };
 }
 
-function stroke(id: string): InkSurfaceRecord['strokes'][number] {
+function stroke(id: string): InkStroke {
   return {
     color: '#111111',
     id,
-    points: [
-      { pressure: 0.5, time: 0, x: 1, y: 1 },
-      { pressure: 0.5, time: 1, x: 2, y: 2 },
-    ],
+    points: [{ pressure: 0.5, time: 1, x: 10, y: 20 }],
     tool: 'pen',
-    width: 2,
+    width: 4,
   };
 }

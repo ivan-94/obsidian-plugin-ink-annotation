@@ -33,6 +33,14 @@ describe('Ink fixed-width workspace CSS', () => {
     expect(styles).not.toMatch(/\.inkstone-ink-canvas-active\s*\{[^}]*touch-action:\s*none/u);
   });
 
+  it('stacks stable and mutable Active Stroke layers without capturing input', () => {
+    const activeStackRule = styles.match(/\.inkstone-ink-active-stack\s*\{([^}]*)\}/u)?.[1] ?? '';
+
+    expect(activeStackRule).toMatch(/position:\s*absolute/u);
+    expect(activeStackRule).toMatch(/inset:\s*0/u);
+    expect(activeStackRule).toMatch(/pointer-events:\s*none/u);
+  });
+
   it('keeps the pane-wide surface pointer-transparent so native Reading View scrolling remains available', () => {
     expect(styles).toMatch(/\.inkstone-ink-surface\s*\{[^}]*pointer-events:\s*none/u);
     expect(styles).not.toMatch(

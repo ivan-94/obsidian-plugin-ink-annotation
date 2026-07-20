@@ -3,11 +3,7 @@ import {
   type InkModeState,
   type InkSaveIntent,
 } from '../domain/ink-mode-state';
-import {
-  encodeInkSurfaceRecord,
-  type InkStroke,
-  type InkSurfaceRecord,
-} from '../domain/ink-surface';
+import type { InkStroke, InkSurfaceRecord } from '../domain/ink-surface';
 
 export type InkPersistenceState =
   | { readonly kind: 'idle' }
@@ -15,14 +11,18 @@ export type InkPersistenceState =
   | { readonly kind: 'saved-locally' }
   | { readonly error: unknown; readonly kind: 'error'; readonly message: string };
 
+export type InkColdLaneCheckpoint = () => Promise<void>;
+
 export interface InkSurfaceWriter {
   updateSurface(
     record: InkSurfaceRecord,
     expectedBase?: InkSurfaceRecord,
+    checkpoint?: InkColdLaneCheckpoint,
   ): Promise<InkSurfaceRecord | void>;
   updateSurfacesAtomically?(
     records: readonly InkSurfaceRecord[],
     expectedBases?: readonly InkSurfaceRecord[],
+    checkpoint?: InkColdLaneCheckpoint,
   ): Promise<readonly InkSurfaceRecord[] | void>;
 }
 
@@ -32,14 +32,10 @@ export interface InkSurfaceSessionSnapshot {
   readonly surface: InkSurfaceRecord;
 }
 
-export interface InkSurfaceRecoveryState {
-  readonly expectedBase: InkSurfaceRecord;
-  readonly pendingAttempt: InkSurfaceRecord | null;
-  readonly record: InkSurfaceRecord;
-}
-
 /** Owns the live vector model; persistence never blocks drawing or discards unsaved strokes. */
 export class InkSurfaceSession {
+  private appendStrokes: InkStroke[] | null = null;
+  private readonly autoFlush: boolean;
   private confirmedBase: InkSurfaceRecord;
   private readonly debounceMs: number;
   private dirty = false;
@@ -47,26 +43,32 @@ export class InkSurfaceSession {
   private readonly now: () => string;
   private readonly onChange: (snapshot: InkSurfaceSessionSnapshot) => void;
   private pendingAttempt: InkSurfaceRecord | null = null;
+  private pendingAttemptContentVersion: number | null = null;
   private pendingAttemptStarted = false;
   private persistence: InkPersistenceState = { kind: 'idle' };
   private readonly repository: InkSurfaceWriter;
   private state: InkModeState = { dirty: false, kind: 'ink-mode', saveError: null };
+  private strokeIds: Set<string>;
   private surface: InkSurfaceRecord;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private workingContentVersion = 0;
 
   constructor(input: {
+    readonly autoFlush?: boolean;
     readonly debounceMs?: number;
     readonly now?: () => string;
     readonly onChange?: (snapshot: InkSurfaceSessionSnapshot) => void;
     readonly repository: InkSurfaceWriter;
     readonly surface: InkSurfaceRecord;
   }) {
+    this.autoFlush = input.autoFlush ?? true;
     this.debounceMs = input.debounceMs ?? 500;
     this.now = input.now ?? (() => new Date().toISOString());
     this.onChange = input.onChange ?? (() => undefined);
     this.repository = input.repository;
     this.surface = input.surface;
     this.confirmedBase = input.surface;
+    this.strokeIds = new Set(input.surface.strokes.map(({ id }) => id));
   }
 
   snapshot(): InkSurfaceSessionSnapshot {
@@ -77,18 +79,7 @@ export class InkSurfaceSession {
     };
   }
 
-  recoveryState(): InkSurfaceRecoveryState {
-    const requiresRecovery =
-      (this.state.kind === 'saving' && (this.dirty || this.pendingAttempt !== null)) ||
-      (this.state.kind === 'ink-mode' && (this.state.dirty || this.state.saveError !== null));
-    return {
-      expectedBase: this.confirmedBase,
-      pendingAttempt: requiresRecovery ? this.preparePendingAttempt() : null,
-      record: this.surface,
-    };
-  }
-
-  /** Re-opens a retained Reading/Preview session without disturbing dirty recovery state. */
+  /** Re-opens a Reading/Preview session without disturbing dirty in-memory state. */
   enter(): void {
     if (this.state.kind === 'saving') {
       throw new Error('Cannot enter Ink Mode while a local save is still running.');
@@ -118,10 +109,18 @@ export class InkSurfaceSession {
     if (this.state.kind === 'reading') {
       throw new Error('Cannot add an Ink stroke outside Ink Mode.');
     }
-    if (this.surface.strokes.some((candidate) => candidate.id === stroke.id)) {
+    if (this.strokeIds.has(stroke.id)) {
       throw new Error(`Ink stroke ID ${stroke.id} already exists in this surface.`);
     }
-    this.replaceStrokes([...this.surface.strokes, stroke]);
+    // The first append after a canonical/replace boundary owns one copy. Consecutive live-first
+    // appends then mutate that private buffer in O(1). If persistence is in flight, fork first so
+    // the exact cold candidate being encoded can never change underneath I/O.
+    if (this.appendStrokes !== this.surface.strokes || this.pendingAttemptStarted) {
+      this.appendStrokes = [...this.surface.strokes];
+    }
+    this.appendStrokes.push(stroke);
+    this.strokeIds.add(stroke.id);
+    this.replaceWorkingStrokes(this.appendStrokes);
   }
 
   replaceStrokes(strokes: readonly InkStroke[]): void {
@@ -131,14 +130,23 @@ export class InkSurfaceSession {
     if (new Set(strokes.map((stroke) => stroke.id)).size !== strokes.length) {
       throw new Error('Ink stroke replacement contains duplicate IDs.');
     }
+    const replacement = [...strokes];
+    this.appendStrokes = replacement;
+    this.strokeIds = new Set(replacement.map(({ id }) => id));
+    this.replaceWorkingStrokes(replacement);
+  }
+
+  private replaceWorkingStrokes(strokes: InkStroke[]): void {
+    this.workingContentVersion += 1;
     this.dirty = true;
-    this.surface = { ...this.surface, strokes: [...strokes] };
+    this.surface = { ...this.surface, strokes };
     if (this.pendingAttempt !== null && !this.pendingAttemptStarted) {
       this.pendingAttempt = {
         ...this.surface,
         revision: this.confirmedBase.revision + 1,
         updatedAt: this.pendingAttempt.updatedAt,
       };
+      this.pendingAttemptContentVersion = this.workingContentVersion;
     }
     this.persistence = { kind: 'idle' };
     if (this.state.kind === 'ink-mode') {
@@ -210,29 +218,38 @@ export class InkSurfaceSession {
   }
 
   private async persistUntilClean(): Promise<void> {
+    // End the synchronous submit stack before canonical comparison, encoding, or repository work.
+    // The Live Document has already fenced this cold task behind contact/frame idleness.
+    await Promise.resolve();
     this.setPersistence({ kind: 'saving' });
     try {
       do {
         const candidate = this.preparePendingAttempt();
+        const candidateContentVersion = this.pendingAttemptContentVersion;
+        if (candidateContentVersion === null) {
+          throw new Error('Ink canonical candidate is missing its working content version.');
+        }
         this.pendingAttemptStarted = true;
-        this.dirty = !sameWorkingContent(this.surface, candidate);
-        // Publish the exact candidate currently in flight before awaiting I/O. A version-3 local
-        // checkpoint keeps both this attempt and its confirmed base, including the ambiguous case
-        // where the Vault write landed before an error.
+        this.dirty = this.workingContentVersion !== candidateContentVersion;
+        // Publish the exact cold candidate currently in flight before awaiting I/O. The in-memory
+        // attempt remains stable across an ambiguous result so Retry can use the same base.
         if (!this.dirty) this.surface = candidate;
         this.emit();
         const committed =
           (await this.repository.updateSurface(candidate, this.confirmedBase)) ?? candidate;
         this.confirmedBase = committed;
         this.pendingAttempt = null;
+        this.pendingAttemptContentVersion = null;
         this.pendingAttemptStarted = false;
         // Drawing may have continued while bytes were in flight. Advance the persisted
         // revision while retaining the newer live stroke array for the next loop.
         this.surface = this.dirty
           ? carryWorkingChangesForward(candidate, this.surface, committed)
           : committed;
-        // A synchronous recovery checkpoint must advance its base revision as soon as the
-        // canonical write does, including when a newer stroke arrived while bytes were in flight.
+        this.appendStrokes = null;
+        this.strokeIds = new Set(this.surface.strokes.map(({ id }) => id));
+        // Publish the advanced base immediately, including when a newer stroke arrived while
+        // canonical bytes were in flight.
         this.emit();
       } while (this.dirty);
 
@@ -255,6 +272,7 @@ export class InkSurfaceSession {
   }
 
   private scheduleFlush(): void {
+    if (!this.autoFlush) return;
     this.clearTimer();
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -269,12 +287,14 @@ export class InkSurfaceSession {
         revision: this.confirmedBase.revision + 1,
         updatedAt: this.now(),
       };
+      this.pendingAttemptContentVersion = this.workingContentVersion;
     } else if (!this.pendingAttemptStarted) {
       this.pendingAttempt = {
         ...this.surface,
         revision: this.confirmedBase.revision + 1,
         updatedAt: this.pendingAttempt.updatedAt,
       };
+      this.pendingAttemptContentVersion = this.workingContentVersion;
     }
     return this.pendingAttempt;
   }
@@ -294,16 +314,6 @@ export class InkSurfaceSession {
   private emit(): void {
     this.onChange(this.snapshot());
   }
-}
-
-function sameWorkingContent(working: InkSurfaceRecord, candidate: InkSurfaceRecord): boolean {
-  return (
-    encodeInkSurfaceRecord({
-      ...working,
-      revision: candidate.revision,
-      updatedAt: candidate.updatedAt,
-    }) === encodeInkSurfaceRecord(candidate)
-  );
 }
 
 function persistenceFailureMessage(error: unknown): string {

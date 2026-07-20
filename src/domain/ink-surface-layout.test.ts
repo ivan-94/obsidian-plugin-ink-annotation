@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
 
+import { SharedInkStrokeGeometry } from './ink-shared-stroke-geometry';
 import {
   decodeInkSurfaceRecord,
   encodeInkSurfaceRecord,
+  type InkPhysicalPoint,
   type InkPoint,
+  type InkStroke,
   type InkSurfaceRecord,
 } from './ink-surface';
 import {
+  confirmInkDocumentRebase,
   confirmInkRebase,
+  joinInkStrokeSurfaceFragments,
   partitionInkBlocks,
+  previewInkDocumentRebase,
   previewInkRebase,
   reconcileInkSurface,
   splitInkStrokeIntoSurfaceFragments,
@@ -39,15 +45,17 @@ describe('bounded Ink surface layout', () => {
 
   it('splits a crossing stroke into local linked fragments with a shared boundary point', () => {
     const fragments = splitInkStrokeIntoSurfaceFragments({
-      color: '#4f46d8',
-      linkedStrokeId: 'stroke-user-1',
-      points: [point(100, 550), point(200, 650)],
+      stroke: {
+        color: '#4f46d8',
+        id: 'stroke-user-1',
+        points: [point(100, 550), point(200, 650)],
+        tool: 'pen',
+        width: 4,
+      },
       surfaces: [
-        { endY: 600, id: 'surface-a', startY: 0 },
-        { endY: 1200, id: 'surface-b', startY: 600 },
+        { endY: 600, id: 'surface-a', logicalHeight: 600, startY: 0 },
+        { endY: 1200, id: 'surface-b', logicalHeight: 600, startY: 600 },
       ],
-      tool: 'pen',
-      width: 4,
     });
 
     expect(fragments).toHaveLength(2);
@@ -61,15 +69,17 @@ describe('bounded Ink surface layout', () => {
 
   it('preserves drawing direction when a stroke crosses surfaces from bottom to top', () => {
     const fragments = splitInkStrokeIntoSurfaceFragments({
-      color: '#4f46d8',
-      linkedStrokeId: 'stroke-upward',
-      points: [point(200, 650), point(100, 550)],
+      stroke: {
+        color: '#4f46d8',
+        id: 'stroke-upward',
+        points: [point(200, 650), point(100, 550)],
+        tool: 'pen',
+        width: 4,
+      },
       surfaces: [
-        { endY: 600, id: 'surface-a', startY: 0 },
-        { endY: 1200, id: 'surface-b', startY: 600 },
+        { endY: 600, id: 'surface-a', logicalHeight: 600, startY: 0 },
+        { endY: 1200, id: 'surface-b', logicalHeight: 600, startY: 600 },
       ],
-      tool: 'pen',
-      width: 4,
     });
 
     expect(fragments[0]?.stroke.points).toMatchObject([
@@ -84,18 +94,20 @@ describe('bounded Ink surface layout', () => {
 
   it('round-trips a stroke across multiple surfaces below the visual error threshold', () => {
     const bounds = [
-      { endY: 400, id: 'a', startY: 0 },
-      { endY: 800, id: 'b', startY: 400 },
-      { endY: 1200, id: 'c', startY: 800 },
+      { endY: 400, id: 'a', logicalHeight: 400, startY: 0 },
+      { endY: 800, id: 'b', logicalHeight: 400, startY: 400 },
+      { endY: 1200, id: 'c', logicalHeight: 400, startY: 800 },
     ];
     const original = [point(20, 350), point(220, 650), point(420, 950)];
     const fragments = splitInkStrokeIntoSurfaceFragments({
-      color: '#4f46d8',
-      linkedStrokeId: 'long-stroke',
-      points: original,
+      stroke: {
+        color: '#4f46d8',
+        id: 'long-stroke',
+        points: original,
+        tool: 'pen',
+        width: 4,
+      },
       surfaces: bounds,
-      tool: 'pen',
-      width: 4,
     });
     const reloaded = fragments.map((fragment) => {
       const bound = bounds.find((candidate) => candidate.id === fragment.surfaceId);
@@ -103,7 +115,7 @@ describe('bounded Ink surface layout', () => {
       const record = {
         ...surfaceFixture(),
         id: fragment.surfaceId,
-        layout: { ...surfaceFixture().layout, logicalHeight: bound.endY - bound.startY },
+        layout: { ...surfaceFixture().layout, logicalHeight: bound.logicalHeight },
         strokes: [fragment.stroke],
       };
       return {
@@ -119,6 +131,672 @@ describe('bounded Ink surface layout', () => {
     );
 
     expect(maximumPolylineError(original, joined)).toBeLessThanOrEqual(1e-9);
+  });
+
+  it('preserves the complete physical brush identity through split and fences per-surface rebase', () => {
+    const physicalStroke: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'physical-crossing',
+      inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+      points: [physicalPoint(100, 550), physicalPoint(200, 650)],
+      tool: 'pen',
+      width: 4,
+    };
+
+    const fragments = splitInkStrokeIntoSurfaceFragments({
+      stroke: physicalStroke,
+      surfaces: [
+        { endY: 600, id: 'surface-a', logicalHeight: 600, startY: 0 },
+        { endY: 1200, id: 'surface-b', logicalHeight: 600, startY: 600 },
+      ],
+    });
+
+    expect(fragments.map(({ stroke }) => stroke)).toMatchObject([
+      {
+        brushRenderVersion: 'pen-physical-v1',
+        color: '#112233',
+        inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+        linkedStrokeId: 'physical-crossing',
+        tool: 'pen',
+        width: 4,
+      },
+      {
+        brushRenderVersion: 'pen-physical-v1',
+        color: '#112233',
+        inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+        linkedStrokeId: 'physical-crossing',
+        tool: 'pen',
+        width: 4,
+      },
+    ]);
+
+    const record = {
+      ...surfaceFixture(),
+      layout: { ...surfaceFixture().layout, logicalHeight: 600, originY: 0 },
+      schemaVersion: 3 as const,
+      strokes: [fragments[0]?.stroke as InkStroke],
+    };
+    expect(() =>
+      previewInkRebase(record, section('section-b', 300, 500, ['block-b']), {
+        ...layout(),
+        logicalHeight: 700,
+        logicalWidth: 480,
+      }),
+    ).toThrow(/document-level rebase/u);
+    const stalePreview = {
+      baseRevision: record.revision,
+      record: { ...record, layout: { ...record.layout, logicalHeight: 700 } },
+      surfaceId: record.id,
+    };
+    expect(() => confirmInkRebase(record, stalePreview, '2026-07-14T12:00:00.000Z')).toThrow(
+      /document-level rebase/u,
+    );
+    expect(record.strokes).toEqual([fragments[0]?.stroke]);
+  });
+
+  it('joins schema-v3 fragments only when every complete brush identity field matches', () => {
+    const fragments = splitInkStrokeIntoSurfaceFragments({
+      stroke: {
+        brushRenderVersion: 'pen-physical-v1',
+        color: '#112233',
+        id: 'physical-crossing',
+        inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+        points: [physicalPoint(100, 550), physicalPoint(200, 650)],
+        tool: 'pen',
+        width: 4,
+      },
+      surfaces: [
+        { endY: 600, id: 'surface-a', logicalHeight: 600, startY: 0 },
+        { endY: 1200, id: 'surface-b', logicalHeight: 600, startY: 600 },
+      ],
+    });
+
+    const joined = joinInkStrokeSurfaceFragments(
+      boundedPhysicalJoinFragments(fragments, [
+        { endY: 600, id: 'surface-a', logicalHeight: 600, startY: 0 },
+        { endY: 1200, id: 'surface-b', logicalHeight: 600, startY: 600 },
+      ]),
+    );
+
+    expect(joined).toMatchObject([
+      {
+        brushRenderVersion: 'pen-physical-v1',
+        color: '#112233',
+        id: 'physical-crossing',
+        inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+        points: [{ y: 550 }, { y: 650 }],
+        tool: 'pen',
+        width: 4,
+      },
+    ]);
+
+    const second = fragments[1]?.stroke;
+    if (second === undefined) throw new Error('Missing physical test fragment.');
+    const { linkedStrokeId: _linkedStrokeId, ...withoutLinkedIdentity } = second;
+    void _linkedStrokeId;
+    for (const mismatched of [
+      {
+        ...second,
+        brushRenderVersion: 'highlighter-chisel-v1' as const,
+        tool: 'highlighter' as const,
+      },
+      { ...second, color: '#445566' },
+      {
+        ...second,
+        inputProfile: { pressure: 'unavailable' as const, tilt: 'unavailable' as const },
+      },
+      { ...withoutLinkedIdentity, id: 'physical-crossing' },
+      { ...second, width: 5 },
+    ]) {
+      expect(() =>
+        joinInkStrokeSurfaceFragments([
+          {
+            endY: 600,
+            logicalHeight: 600,
+            schemaVersion: 3,
+            startY: 0,
+            stroke: fragments[0]?.stroke as InkStroke,
+            surfaceId: 'surface-a',
+          },
+          {
+            endY: 1200,
+            logicalHeight: 600,
+            schemaVersion: 3,
+            startY: 600,
+            stroke: mismatched,
+            surfaceId: 'surface-b',
+          },
+        ]),
+      ).toThrow(/brush identity|unlinked fragment provenance/u);
+    }
+  });
+
+  it('round-trips a crossing physical trace without promoting synthetic clip samples to canonical input', () => {
+    const original: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'physical-no-boundary-sample',
+      inputProfile: { pressure: 'measured', tilt: 'measured' },
+      points: [
+        physicalPoint(100, 550, 10, 0.2, {
+          altitude: 0.4,
+          azimuth: 6.1,
+          kind: 'measured',
+          reliable: true,
+        }),
+        physicalPoint(200, 650, 20, 0.8, {
+          altitude: 0.7,
+          azimuth: 0.2,
+          kind: 'measured',
+          reliable: true,
+        }),
+      ],
+      tool: 'pen',
+      width: 4,
+    };
+    const bounds = [
+      { endY: 600, id: 'surface-a', logicalHeight: 600, startY: 0 },
+      { endY: 1200, id: 'surface-b', logicalHeight: 600, startY: 600 },
+    ];
+    const persisted = splitInkStrokeIntoSurfaceFragments({
+      stroke: original,
+      surfaces: bounds,
+    }).map((fragment) => {
+      const bound = bounds.find(({ id }) => id === fragment.surfaceId);
+      if (bound === undefined) throw new Error('Missing physical test surface bound.');
+      const fixture = surfaceFixture();
+      const record: InkSurfaceRecord = {
+        ...fixture,
+        id: fragment.surfaceId,
+        layout: {
+          ...fixture.layout,
+          logicalHeight: bound.logicalHeight,
+          originY: bound.startY,
+        },
+        schemaVersion: 3,
+        strokes: [fragment.stroke],
+      };
+      const reloaded = decodeInkSurfaceRecord(encodeInkSurfaceRecord(record));
+      return {
+        endY: bound.endY,
+        logicalHeight: bound.logicalHeight,
+        schemaVersion: reloaded.schemaVersion,
+        startY: bound.startY,
+        stroke: reloaded.strokes[0] as InkStroke,
+        surfaceId: bound.id,
+      };
+    });
+
+    expect(() => joinInkStrokeSurfaceFragments(persisted.slice(0, 1))).toThrow(
+      /incomplete physical fragment boundary/u,
+    );
+
+    const joined = joinInkStrokeSurfaceFragments(persisted)[0];
+    expect(joined?.points).toEqual(original.points);
+
+    const geometry = new SharedInkStrokeGeometry();
+    const active = geometry.compile(original);
+    const reloaded = joined === undefined ? undefined : geometry.compile(joined);
+    expect(active.kind).toBe('unpublished');
+    expect(reloaded?.kind).toBe('unpublished');
+    if (active.kind !== 'unpublished' || reloaded?.kind !== 'unpublished') {
+      throw new Error('Expected unpublished physical geometry in the HAT-only lane.');
+    }
+    expect(reloaded.geometry.traceDigest).toBe(active.geometry.traceDigest);
+    expect(reloaded.geometry.geometryDigest).toBe(active.geometry.geometryDigest);
+  });
+
+  it('rejects a synthetic physical clip sample that is not owned by a linked surface fragment', () => {
+    const fixture = surfaceFixture();
+    const syntheticPoint: InkPhysicalPoint = {
+      ...physicalPoint(10, 0),
+      fragmentBoundary: 'synthetic-clip',
+      fragmentBoundaryEdge: 'start',
+      fragmentBoundaryId: 'orphan-boundary',
+      fragmentTraceOrder: 0.5,
+    };
+    expect(() =>
+      encodeInkSurfaceRecord({
+        ...fixture,
+        layout: { ...fixture.layout, originY: 0 },
+        schemaVersion: 3,
+        strokes: [
+          {
+            brushRenderVersion: 'pen-physical-v1',
+            color: '#112233',
+            id: 'unlinked-synthetic',
+            inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+            points: [syntheticPoint],
+            tool: 'pen',
+            width: 4,
+          },
+        ],
+      }),
+    ).toThrow(/unlinked fragment provenance/u);
+  });
+
+  it('recovers an exact physical trace when an interior surface contains only paired clip samples', () => {
+    const firstHeight = 38.47056495976742;
+    const secondHeight = 798.581941134064;
+    const thirdHeight = 162.9474939061686;
+    const firstBoundary = firstHeight;
+    const secondBoundary = firstBoundary + secondHeight;
+    const finalBoundary = secondBoundary + thirdHeight;
+    const stroke: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'physical-three-surfaces',
+      inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+      points: [
+        physicalPoint(125.61794581918201, 0, 0, 0.2),
+        physicalPoint(447.5428689098781, finalBoundary, 1_000, 0.8),
+      ],
+      tool: 'pen',
+      width: 4,
+    };
+    const surfaces = [
+      { endY: firstBoundary, id: 'a', logicalHeight: firstHeight, startY: 0 },
+      {
+        endY: secondBoundary,
+        id: 'b',
+        logicalHeight: secondHeight,
+        startY: firstBoundary,
+      },
+      {
+        endY: finalBoundary,
+        id: 'c',
+        logicalHeight: thirdHeight,
+        startY: secondBoundary,
+      },
+    ];
+    const fragments = splitInkStrokeIntoSurfaceFragments({
+      stroke,
+      surfaces,
+    });
+    const persisted = fragments.map((fragment) => {
+      const bound = surfaces.find(({ id }) => id === fragment.surfaceId);
+      if (bound === undefined) throw new Error('Missing three-surface physical bound.');
+      const fixture = surfaceFixture();
+      const reloaded = decodeInkSurfaceRecord(
+        encodeInkSurfaceRecord({
+          ...fixture,
+          id: fragment.surfaceId,
+          layout: {
+            ...fixture.layout,
+            logicalHeight: bound.logicalHeight,
+            originY: bound.startY,
+          },
+          schemaVersion: 3,
+          strokes: [fragment.stroke],
+        }),
+      );
+      return {
+        endY: bound.endY,
+        logicalHeight: bound.logicalHeight,
+        schemaVersion: 3 as const,
+        startY: bound.startY,
+        stroke: reloaded.strokes[0] as InkStroke,
+        surfaceId: bound.id,
+      };
+    });
+
+    expect(fragments).toHaveLength(3);
+    expect(fragments[1]?.stroke.points).toMatchObject([
+      { fragmentBoundary: 'synthetic-clip', y: 0 },
+      { fragmentBoundary: 'synthetic-clip', y: secondHeight },
+    ]);
+    expect(joinInkStrokeSurfaceFragments(persisted)[0]?.points).toEqual(stroke.points);
+  });
+
+  it('uses persisted fragment trace order for equal-time multi-surface leave and re-entry', () => {
+    const points = [50, 850, 250, 1_050, 350].map((y, index) =>
+      physicalPoint(20 + index * 10, y, 10, 0.2 + index * 0.1),
+    );
+    const stroke: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'physical-equal-time-reentry',
+      inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+      points,
+      tool: 'pen',
+      width: 4,
+    };
+    const surfaces = [
+      { endY: 400, id: 'a', logicalHeight: 400, startY: 0 },
+      { endY: 800, id: 'b', logicalHeight: 400, startY: 400 },
+      { endY: 1_200, id: 'c', logicalHeight: 400, startY: 800 },
+    ];
+    const fragments = splitInkStrokeIntoSurfaceFragments({ stroke, surfaces });
+    const joinedInput = fragments.map((fragment) => {
+      const surface = surfaces.find(({ id }) => id === fragment.surfaceId);
+      if (surface === undefined) throw new Error('Missing equal-time test surface.');
+      return {
+        endY: surface.endY,
+        logicalHeight: surface.logicalHeight,
+        schemaVersion: 3 as const,
+        startY: surface.startY,
+        stroke: fragment.stroke,
+        surfaceId: surface.id,
+      };
+    });
+
+    expect(joinInkStrokeSurfaceFragments([...joinedInput].reverse())[0]?.points).toEqual(points);
+  });
+
+  it('snaps fractional clip coordinates to the exact shared surface boundary', () => {
+    const origin = 56.970881592869134;
+    const topHeight = 183.53055948968995;
+    const bottomHeight = 400;
+    const boundary = origin + topHeight;
+    const points = [
+      physicalPoint(10, boundary - 100, 1, 0.2),
+      physicalPoint(30, boundary + 100, 3, 0.8),
+    ];
+    const stroke: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'physical-fractional-boundary',
+      inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+      points,
+      tool: 'pen',
+      width: 4,
+    };
+    const surfaces = [
+      { endY: boundary, id: 'top', logicalHeight: topHeight, startY: origin },
+      {
+        endY: boundary + bottomHeight,
+        id: 'bottom',
+        logicalHeight: bottomHeight,
+        startY: boundary,
+      },
+    ];
+    const fragments = splitInkStrokeIntoSurfaceFragments({ stroke, surfaces });
+    const persisted = fragments.map((fragment) => {
+      const bound = surfaces.find(({ id }) => id === fragment.surfaceId);
+      if (bound === undefined) throw new Error('Missing fractional physical test bound.');
+      const fixture = surfaceFixture();
+      const reloaded = decodeInkSurfaceRecord(
+        encodeInkSurfaceRecord({
+          ...fixture,
+          id: fragment.surfaceId,
+          layout: {
+            ...fixture.layout,
+            logicalHeight: bound.logicalHeight,
+            originY: bound.startY,
+          },
+          schemaVersion: 3,
+          strokes: [fragment.stroke],
+        }),
+      );
+      return {
+        endY: bound.endY,
+        logicalHeight: bound.logicalHeight,
+        schemaVersion: 3 as const,
+        startY: bound.startY,
+        stroke: reloaded.strokes[0] as InkStroke,
+        surfaceId: bound.id,
+      };
+    });
+
+    expect(fragments[0]?.stroke.points.at(-1)?.y).toBe(topHeight);
+    expect(fragments[1]?.stroke.points[0]?.y).toBe(0);
+    expect(joinInkStrokeSurfaceFragments(persisted)[0]?.points).toEqual(points);
+  });
+
+  it('rejects a persisted physical run whose provenance order contradicts point order', () => {
+    const stroke: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'physical-order-fragment',
+      inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+      linkedStrokeId: 'physical-order',
+      points: [
+        {
+          ...physicalPoint(10, 10, 1),
+          fragmentGlobalY: 10,
+          fragmentTraceOrder: 1,
+        } as InkPhysicalPoint,
+        {
+          ...physicalPoint(20, 20, 2),
+          fragmentGlobalY: 20,
+          fragmentTraceOrder: 0,
+        } as InkPhysicalPoint,
+      ],
+      tool: 'pen',
+      width: 4,
+    };
+
+    expect(() =>
+      joinInkStrokeSurfaceFragments([
+        {
+          endY: 100,
+          logicalHeight: 100,
+          schemaVersion: 3,
+          startY: 0,
+          stroke,
+          surfaceId: 'only',
+        },
+      ]),
+    ).toThrow(/non-monotonic physical fragment trace order/u);
+  });
+
+  it('requires both sides of an authored physical boundary copy before canonical join', () => {
+    const stroke: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'physical-authored-boundary',
+      inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+      points: [
+        physicalPoint(10, 550, 1, 0.2),
+        physicalPoint(20, 600, 2, 0.6),
+        physicalPoint(30, 650, 3, 0.8),
+      ],
+      tool: 'pen',
+      width: 4,
+    };
+    const surfaces = [
+      { endY: 600, id: 'top', logicalHeight: 600, startY: 0 },
+      { endY: 1_200, id: 'bottom', logicalHeight: 600, startY: 600 },
+    ];
+    const fragments = splitInkStrokeIntoSurfaceFragments({ stroke, surfaces });
+    const canonical = fragments.map((fragment) => {
+      const surface = surfaces.find(({ id }) => id === fragment.surfaceId) as (typeof surfaces)[0];
+      return {
+        endY: surface.endY,
+        logicalHeight: surface.logicalHeight,
+        schemaVersion: 3 as const,
+        startY: surface.startY,
+        stroke: fragment.stroke,
+        surfaceId: surface.id,
+      };
+    });
+
+    expect(() => joinInkStrokeSurfaceFragments(canonical.slice(0, 1))).toThrow(
+      /incomplete physical fragment boundary/u,
+    );
+    expect(joinInkStrokeSurfaceFragments(canonical)[0]?.points).toEqual(stroke.points);
+  });
+
+  it('rejects two same-side copies that try to impersonate a complete physical boundary pair', () => {
+    const surfaces = [
+      { endY: 600, id: 'top', logicalHeight: 600, startY: 0 },
+      { endY: 1_200, id: 'bottom', logicalHeight: 600, startY: 600 },
+    ];
+    const fragments = splitInkStrokeIntoSurfaceFragments({
+      stroke: {
+        brushRenderVersion: 'pen-physical-v1',
+        color: '#112233',
+        id: 'physical-same-side-forgery',
+        inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+        points: [physicalPoint(10, 550, 1, 0.2), physicalPoint(30, 650, 3, 0.8)],
+        tool: 'pen',
+        width: 4,
+      },
+      surfaces,
+    });
+    const top = boundedPhysicalJoinFragments(fragments, surfaces)[0];
+    if (top === undefined) throw new Error('Missing top physical forgery fixture.');
+    const forged = {
+      ...top,
+      stroke: { ...top.stroke, id: `${top.stroke.id}-forged` },
+      surfaceId: 'forged-top',
+    };
+
+    expect(() => joinInkStrokeSurfaceFragments([top, forged])).toThrow(
+      /duplicate physical trace order|invalid physical fragment boundary/u,
+    );
+  });
+
+  it('fails closed when a schema-v3 visible fragment is missing or mismatches brush metadata', () => {
+    const legacyShape = {
+      color: '#112233',
+      id: 'missing-metadata',
+      points: [point(10, 10), point(20, 20)],
+      tool: 'pen' as const,
+      width: 4,
+    };
+
+    expect(() =>
+      joinInkStrokeSurfaceFragments([
+        {
+          endY: 100,
+          logicalHeight: 100,
+          schemaVersion: 3,
+          startY: 0,
+          stroke: legacyShape,
+          surfaceId: 'only',
+        },
+      ]),
+    ).toThrow(/brush metadata/u);
+    expect(() =>
+      joinInkStrokeSurfaceFragments([
+        {
+          logicalHeight: 100,
+          schemaVersion: 3,
+          startY: 0,
+          stroke: {
+            ...legacyShape,
+            brushRenderVersion: 'pen-physical-v1',
+            inputProfile: { pressure: 'measured', tilt: 'measured' },
+            tool: 'highlighter',
+          },
+          surfaceId: 'only',
+          endY: 100,
+        },
+      ]),
+    ).toThrow(/brush metadata/u);
+  });
+
+  it('preserves stationary pressure impulses and never invents a physical orientation at a surface boundary', () => {
+    const stationary = splitInkStrokeIntoSurfaceFragments({
+      stroke: {
+        brushRenderVersion: 'pen-physical-v1',
+        color: '#112233',
+        id: 'stationary-pressure',
+        inputProfile: { pressure: 'measured', tilt: 'measured' },
+        points: [physicalPoint(20, 20, 1, 0.1), physicalPoint(20, 20, 2, 0.9)],
+        tool: 'pen',
+        width: 4,
+      },
+      surfaces: [{ endY: 100, id: 'only', logicalHeight: 100, startY: 0 }],
+    });
+
+    expect(stationary[0]?.stroke.points).toMatchObject([
+      { pressure: 0.1, pressureKind: 'measured', time: 1 },
+      { pressure: 0.9, pressureKind: 'measured', time: 2 },
+    ]);
+
+    const crossing = splitInkStrokeIntoSurfaceFragments({
+      stroke: {
+        brushRenderVersion: 'highlighter-chisel-v1',
+        color: '#ffcc00',
+        id: 'orientation-loss',
+        inputProfile: { pressure: 'measured', tilt: 'measured' },
+        points: [
+          physicalPoint(10, 550, 1, 0.4, {
+            altitude: 0.4,
+            azimuth: 6.1,
+            kind: 'measured',
+            reliable: true,
+          }),
+          physicalPoint(20, 650, 2, 0.6, { kind: 'unavailable' }),
+        ],
+        tool: 'highlighter',
+        width: 12,
+      },
+      surfaces: [
+        { endY: 600, id: 'top', logicalHeight: 600, startY: 0 },
+        { endY: 1200, id: 'bottom', logicalHeight: 600, startY: 600 },
+      ],
+    });
+
+    expect(crossing[0]?.stroke.points.at(-1)).toMatchObject({
+      orientation: { kind: 'unavailable' },
+      pressure: 0.5,
+      pressureKind: 'measured',
+    });
+    expect(crossing[1]?.stroke.points[0]).toMatchObject({
+      orientation: { kind: 'unavailable' },
+      pressure: 0.5,
+      pressureKind: 'measured',
+      time: 1.5,
+      x: 15,
+      y: 0,
+    });
+  });
+
+  it('does not synthesize legacy tilt when only one interpolation endpoint measured it', () => {
+    const fragments = splitInkStrokeIntoSurfaceFragments({
+      stroke: {
+        color: '#112233',
+        id: 'partial-legacy-tilt',
+        points: [{ ...point(10, 550), tiltX: 12, tiltY: -6 }, point(20, 650)],
+        tool: 'pen',
+        width: 4,
+      },
+      surfaces: [
+        { endY: 600, id: 'top', logicalHeight: 600, startY: 0 },
+        { endY: 1200, id: 'bottom', logicalHeight: 600, startY: 600 },
+      ],
+    });
+
+    expect(fragments[0]?.stroke.points.at(-1)).not.toHaveProperty('tiltX');
+    expect(fragments[0]?.stroke.points.at(-1)).not.toHaveProperty('tiltY');
+  });
+
+  it('joins equal-time physical fragments deterministically from trace topology, not input order', () => {
+    const stroke: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'logical',
+      inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+      points: [
+        physicalPoint(10, 550, 10, 0.1),
+        physicalPoint(15, 600, 10, 0.5),
+        physicalPoint(20, 650, 10, 0.9),
+      ],
+      tool: 'pen',
+      width: 4,
+    };
+    const bounds = [
+      { endY: 600, id: 'top', logicalHeight: 600, startY: 0 },
+      { endY: 1_200, id: 'bottom', logicalHeight: 600, startY: 600 },
+    ];
+    const canonical = boundedPhysicalJoinFragments(
+      splitInkStrokeIntoSurfaceFragments({ stroke, surfaces: bounds }),
+      bounds,
+    );
+
+    const forward = joinInkStrokeSurfaceFragments(canonical);
+    const reversed = joinInkStrokeSurfaceFragments([...canonical].reverse());
+
+    expect(reversed).toEqual(forward);
+    expect(forward[0]?.points).toMatchObject([
+      { pressure: 0.1, x: 10, y: 550 },
+      { pressure: 0.5, x: 15, y: 600 },
+      { pressure: 0.9, x: 20, y: 650 },
+    ]);
   });
 
   it('keeps exact sections active, relocates intact moves, and isolates changed/missing targets', () => {
@@ -216,6 +894,172 @@ describe('bounded Ink surface layout', () => {
     expect(() => confirmInkRebase({ ...record, revision: 2 }, preview, 'later')).toThrow(
       /changed after the preview/u,
     );
+  });
+
+  it('rebases a complete linked physical stroke by join, document transform, and resplit', () => {
+    const sourceBounds = [
+      { endY: 600, id: 'surface-a', logicalHeight: 600, startY: 0 },
+      { endY: 1_200, id: 'surface-b', logicalHeight: 600, startY: 600 },
+    ];
+    const logicalStroke: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'physical-rebase',
+      inputProfile: { pressure: 'measured', tilt: 'measured' },
+      points: [
+        physicalPoint(100, 550, 1, 0.2),
+        physicalPoint(150, 600, 2, 0.5),
+        physicalPoint(200, 650, 3, 0.8),
+      ],
+      tool: 'pen',
+      width: 4,
+    };
+    const fragments = splitInkStrokeIntoSurfaceFragments({
+      stroke: logicalStroke,
+      surfaces: sourceBounds,
+    });
+    const records = sourceBounds.map((bound, index): InkSurfaceRecord => {
+      const fragment = fragments.find(({ surfaceId }) => surfaceId === bound.id);
+      if (fragment === undefined) throw new Error(`Missing ${bound.id} rebase fixture.`);
+      const fixture = surfaceFixture();
+      return {
+        ...fixture,
+        id: bound.id,
+        layout: {
+          ...fixture.layout,
+          logicalHeight: bound.logicalHeight,
+          originY: bound.startY,
+        },
+        revision: index + 3,
+        schemaVersion: 3,
+        status: 'needs-rebase',
+        strokes: [fragment.stroke],
+      };
+    });
+    const original = structuredClone(records);
+
+    const targets = [
+      {
+        endY: 300,
+        layout: { ...layout(), logicalHeight: 300, logicalWidth: 480 },
+        section: section('target-a', 300, 400, ['target-a'], 'Target A'),
+        startY: 0,
+        surfaceId: 'surface-a',
+      },
+      {
+        endY: 600,
+        layout: { ...layout(), logicalHeight: 300, logicalWidth: 480 },
+        section: section('target-b', 401, 500, ['target-b'], 'Target B'),
+        startY: 300,
+        surfaceId: 'surface-b',
+      },
+    ] as const;
+    const preview = previewInkDocumentRebase(records, targets);
+
+    expect(records).toEqual(original);
+    expect(preview.records).toMatchObject([
+      {
+        binding: { sectionFingerprint: 'target-a' },
+        layout: { logicalHeight: 300, logicalWidth: 480, originY: 0 },
+        revision: 3,
+        status: 'active',
+      },
+      {
+        binding: { sectionFingerprint: 'target-b' },
+        layout: { logicalHeight: 300, logicalWidth: 480, originY: 300 },
+        revision: 4,
+        status: 'active',
+      },
+    ]);
+    expect(
+      joinInkStrokeSurfaceFragments(
+        preview.records.flatMap((record) =>
+          record.strokes.map((stroke) => ({
+            endY: (record.layout.originY as number) + record.layout.logicalHeight,
+            logicalHeight: record.layout.logicalHeight,
+            schemaVersion: record.schemaVersion,
+            startY: record.layout.originY as number,
+            stroke,
+            surfaceId: record.id,
+          })),
+        ),
+      ),
+    ).toEqual([
+      {
+        ...logicalStroke,
+        points: logicalStroke.points.map((point) => ({
+          ...point,
+          x: point.x * 0.5,
+          y: point.y * 0.5,
+        })),
+      },
+    ]);
+
+    const incomplete = preview.records.slice(0, 1);
+    const incompleteOriginal = structuredClone(incomplete);
+    expect(() => previewInkDocumentRebase(incomplete, targets.slice(0, 1))).toThrow(
+      /incomplete physical fragment boundary/u,
+    );
+    expect(incomplete).toEqual(incompleteOriginal);
+  });
+
+  it('confirms every document-rebase surface exactly once or rejects the whole stale preview', () => {
+    const records = [0, 600].map((originY, index): InkSurfaceRecord => {
+      const fixture = surfaceFixture();
+      return {
+        ...fixture,
+        id: `surface-${index}`,
+        layout: { ...fixture.layout, logicalHeight: 600, originY },
+        revision: index + 7,
+        schemaVersion: 2,
+        strokes: [],
+      };
+    });
+    const preview = previewInkDocumentRebase(
+      records,
+      records.map((record, index) => ({
+        endY: index * 400 + 400,
+        layout: { ...layout(), logicalHeight: 400 },
+        section: section(`target-${index}`, index * 100, index * 100 + 80, [`target-${index}`]),
+        startY: index * 400,
+        surfaceId: record.id,
+      })),
+    );
+    const confirmed = confirmInkDocumentRebase(records, preview, '2026-07-19T06:00:00.000Z');
+
+    expect(confirmed).toMatchObject([
+      { revision: 8, updatedAt: '2026-07-19T06:00:00.000Z' },
+      { revision: 9, updatedAt: '2026-07-19T06:00:00.000Z' },
+    ]);
+    const stale: InkSurfaceRecord[] = [
+      { ...(records[0] as InkSurfaceRecord), revision: 8 },
+      records[1] as InkSurfaceRecord,
+    ];
+    const unchanged = structuredClone(stale);
+    expect(() => confirmInkDocumentRebase(stale, preview, 'later')).toThrow(
+      /document changed after the preview/u,
+    );
+    expect(stale).toEqual(unchanged);
+  });
+
+  it('preserves a schema-v3 structural origin through rebase and canonical encoding', () => {
+    const legacy = surfaceFixture();
+    const record: InkSurfaceRecord = {
+      ...legacy,
+      layout: { ...legacy.layout, originY: 600 },
+      schemaVersion: 3,
+      strokes: legacy.strokes.map((stroke) => ({
+        ...stroke,
+        brushRenderVersion: 'legacy-round-v1',
+        inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+      })),
+    };
+    const preview = previewInkRebase(record, section('section-b', 300, 500, ['block-b']), layout());
+
+    const confirmed = confirmInkRebase(record, preview, '2026-07-14T12:00:00.000Z');
+    const reloaded = decodeInkSurfaceRecord(encodeInkSurfaceRecord(confirmed));
+
+    expect(reloaded.layout.originY).toBe(600);
   });
 
   it('keeps intact siblings active through deterministic section reorder/edit cases', () => {
@@ -340,6 +1184,46 @@ function surfaceFixture(): InkSurfaceRecord {
 
 function point(x: number, y: number) {
   return { pressure: 0.5, time: x + y, x, y };
+}
+
+function physicalPoint(
+  x: number,
+  y: number,
+  time = x + y,
+  pressure = 0.5,
+  orientation:
+    | { readonly kind: 'unavailable' }
+    | {
+        readonly altitude: number;
+        readonly azimuth: number;
+        readonly kind: 'measured';
+        readonly reliable: boolean;
+      } = { kind: 'unavailable' },
+) {
+  return { orientation, pressure, pressureKind: 'measured' as const, time, x, y };
+}
+
+function boundedPhysicalJoinFragments(
+  fragments: readonly { readonly stroke: InkStroke; readonly surfaceId: string }[],
+  bounds: readonly {
+    readonly endY: number;
+    readonly id: string;
+    readonly logicalHeight: number;
+    readonly startY: number;
+  }[],
+) {
+  return fragments.map((fragment) => {
+    const bound = bounds.find(({ id }) => id === fragment.surfaceId);
+    if (bound === undefined) throw new Error(`Missing physical bound ${fragment.surfaceId}.`);
+    return {
+      endY: bound.endY,
+      logicalHeight: bound.logicalHeight,
+      schemaVersion: 3 as const,
+      startY: bound.startY,
+      stroke: fragment.stroke,
+      surfaceId: bound.id,
+    };
+  });
 }
 
 function surfaceForSection(name: string, sourceStart: number, sourceEnd: number): InkSurfaceRecord {

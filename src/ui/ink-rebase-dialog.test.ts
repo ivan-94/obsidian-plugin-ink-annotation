@@ -7,9 +7,12 @@ import type { InkLayoutObservation, InkSurfaceSection } from '../domain/ink-surf
 import { InkRebaseDialog } from './ink-rebase-dialog';
 
 describe('Ink rebase dialog', () => {
+  let canvas: ReturnType<typeof contextFixture>;
+
   beforeEach(() => {
     document.body.replaceChildren();
-    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(contextFixture());
+    canvas = contextFixture();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvas.context);
   });
 
   afterEach(() => vi.restoreAllMocks());
@@ -72,6 +75,64 @@ describe('Ink rebase dialog', () => {
     expect(onConfirm).not.toHaveBeenCalled();
     expect(document.querySelector('[data-inkstone-rebase-dialog]')).toBeNull();
   });
+
+  it('previews a physical nib from shared filled contours instead of a line-width stroke', () => {
+    const dialog = new InkRebaseDialog({
+      document,
+      onConfirm: () => Promise.resolve(),
+      record: physicalSurface(),
+      targets: [target('A', 100, 200)],
+    });
+
+    void dialog.show();
+
+    expect(canvas.scale).toHaveBeenCalledOnce();
+    expect(canvas.closePath).toHaveBeenCalled();
+    expect(canvas.fill).toHaveBeenCalledOnce();
+    expect(canvas.stroke).not.toHaveBeenCalled();
+  });
+
+  it('keeps a linked physical fragment fail-closed without crashing or writing', async () => {
+    const record = physicalSurface();
+    const physical = record.strokes[0];
+    if (physical === undefined) throw new Error('Missing linked physical rebase fixture.');
+    const linked: InkSurfaceRecord = {
+      ...record,
+      strokes: [
+        {
+          ...physical,
+          id: 'physical-pen-surface-a',
+          linkedStrokeId: 'physical-pen',
+          points: physical.points.map((point, fragmentTraceOrder) => ({
+            ...point,
+            fragmentGlobalY: point.y,
+            fragmentTraceOrder,
+          })),
+        },
+      ],
+    };
+    const original = structuredClone(linked);
+    const onConfirm = vi.fn<(updated: InkSurfaceRecord) => Promise<void>>();
+    const dialog = new InkRebaseDialog({
+      document,
+      onConfirm,
+      record: linked,
+      targets: [target('A', 100, 200)],
+    });
+
+    const result = dialog.show();
+
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-inkstone-rebase-confirm]')?.disabled,
+    ).toBe(true);
+    expect(document.querySelector('.inkstone-ink-rebase-dialog__status')?.textContent).toMatch(
+      /document-level rebase/u,
+    );
+    expect(linked).toEqual(original);
+    expect(onConfirm).not.toHaveBeenCalled();
+    document.querySelector<HTMLButtonElement>('[data-inkstone-rebase-cancel]')?.click();
+    await expect(result).resolves.toBe('cancelled');
+  });
 });
 
 function surface(): InkSurfaceRecord {
@@ -113,6 +174,35 @@ function surface(): InkSurfaceRecord {
   };
 }
 
+function physicalSurface(): InkSurfaceRecord {
+  const base = surface();
+  return {
+    ...base,
+    layout: { ...base.layout, originY: 0 },
+    schemaVersion: 3,
+    strokes: [
+      {
+        brushRenderVersion: 'pen-physical-v1',
+        color: '#112233',
+        id: 'physical-pen',
+        inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+        points: [
+          {
+            orientation: { kind: 'unavailable' },
+            pressure: 1,
+            pressureKind: 'measured',
+            time: 0,
+            x: 100,
+            y: 100,
+          },
+        ],
+        tool: 'pen',
+        width: 4,
+      },
+    ],
+  };
+}
+
 function target(
   name: string,
   sourceStart: number,
@@ -147,17 +237,29 @@ function point(x: number, y: number) {
   return { pressure: 0.5, time: x + y, x, y };
 }
 
-function contextFixture(): CanvasRenderingContext2D {
-  return {
+function contextFixture() {
+  const closePath = vi.fn();
+  const fill = vi.fn();
+  const scale = vi.fn();
+  const stroke = vi.fn();
+  const context = {
     beginPath: vi.fn(),
+    closePath,
     clearRect: vi.fn(),
+    fill,
+    fillStyle: '#000',
+    globalAlpha: 1,
+    globalCompositeOperation: 'source-over',
     lineCap: 'round',
     lineJoin: 'round',
     lineTo: vi.fn(),
     moveTo: vi.fn(),
-    scale: vi.fn(),
-    stroke: vi.fn(),
+    restore: vi.fn(),
+    save: vi.fn(),
+    scale,
+    stroke,
     strokeStyle: '#000',
     lineWidth: 1,
   } as unknown as CanvasRenderingContext2D;
+  return { closePath, context, fill, scale, stroke };
 }

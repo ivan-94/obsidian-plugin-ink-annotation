@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { VaultAnnotationIndex } from '../../domain/vault-annotation-index';
 import type { InkSurfaceRecord } from '../../domain/ink-surface';
+import { splitInkStrokeIntoSurfaceFragments } from '../../domain/ink-surface-layout';
 import { summarizeInkSurface } from '../../domain/ink-surface-summary';
 import { AnnotationSidebarView } from './annotation-sidebar-view';
 
@@ -185,13 +186,107 @@ describe('Annotation sidebar scope switching', () => {
     const inkRow = container.querySelector('[data-inkstone-ink-row="surface-1"]');
     const textRow = container.querySelector('[data-annotation-id="text-1"]');
 
-    view.applyInkSurfaceChanged(inkSurface(2));
+    view.applyInkSurfaceSummaries('Note.md', [summarizeInkSurface(inkSurface(2))]);
 
     expect(listCurrentFile).toHaveBeenCalledTimes(1);
     expect(listSurfaceSummaries).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(inkRow?.textContent).toContain('2 strokes'));
     expect(container.querySelector('[data-inkstone-ink-row="surface-1"]')).toBe(inkRow);
     expect(container.querySelector('[data-annotation-id="text-1"]')).toBe(textRow);
+  });
+
+  it('replaces a fragment thumbnail with the repository joined note summary immediately', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const initial = {
+      ...summarizeInkSurface(inkSurface(1)),
+      thumbnailSvg: '<svg data-ink-geometry-digest="fragment-only"></svg>',
+    };
+    const listSurfaceSummaries = vi.fn(() => Promise.resolve([initial]));
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: sidebarCommands(),
+      inkRepository: { listSurfaceSummaries } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {
+        rebuild: () => Promise.resolve({ indexed: 0, issues: [] }),
+        restoreCached: () => Promise.resolve(0),
+      } as never,
+    });
+    await view.onOpen();
+    const top = {
+      ...initial,
+      revision: 2,
+      thumbnailSvg: '<svg data-ink-geometry-digest="joined-note"></svg>',
+    };
+    const bottom = { ...top, id: 'surface-2', position: 20 };
+
+    view.applyInkSurfaceSummaries('Note.md', [top, bottom]);
+
+    await vi.waitFor(() =>
+      expect(container.querySelectorAll('[data-inkstone-ink-thumbnail]')).toHaveLength(2),
+    );
+    const thumbnails = [
+      ...container.querySelectorAll<HTMLImageElement>('[data-inkstone-ink-thumbnail]'),
+    ];
+    expect(
+      thumbnails.every((thumbnail) => decodeURIComponent(thumbnail.src).includes('joined-note')),
+    ).toBe(true);
+    expect(listSurfaceSummaries).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let an older sidebar summary reload overwrite a joined mutation projection', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const initial = {
+      ...summarizeInkSurface(inkSurface(1)),
+      thumbnailSvg: '<svg data-ink-geometry-digest="initial"></svg>',
+    };
+    let resolveOlder:
+      ((summaries: readonly ReturnType<typeof summarizeInkSurface>[]) => void) | undefined;
+    const older = new Promise<readonly ReturnType<typeof summarizeInkSurface>[]>((resolve) => {
+      resolveOlder = resolve;
+    });
+    const listSurfaceSummaries = vi
+      .fn<() => Promise<readonly ReturnType<typeof summarizeInkSurface>[]>>()
+      .mockResolvedValueOnce([initial])
+      .mockReturnValueOnce(older);
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: sidebarCommands(),
+      inkRepository: { listSurfaceSummaries } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {
+        rebuild: () => Promise.resolve({ indexed: 0, issues: [] }),
+        restoreCached: () => Promise.resolve(0),
+      } as never,
+    });
+    await view.onOpen();
+
+    const olderRefresh = view.refresh();
+    await vi.waitFor(() => expect(listSurfaceSummaries).toHaveBeenCalledTimes(2));
+    const joined = {
+      ...initial,
+      revision: 2,
+      thumbnailSvg: '<svg data-ink-geometry-digest="joined-newest"></svg>',
+    };
+    view.applyInkSurfaceSummaries('Note.md', [joined]);
+    resolveOlder?.([
+      { ...initial, thumbnailSvg: '<svg data-ink-geometry-digest="stale-fragment"></svg>' },
+    ]);
+    await olderRefresh;
+
+    const thumbnail = container.querySelector<HTMLImageElement>('[data-inkstone-ink-thumbnail]');
+    expect(decodeURIComponent(thumbnail?.src ?? '')).toContain('joined-newest');
+    expect(decodeURIComponent(thumbnail?.src ?? '')).not.toContain('stale-fragment');
   });
 
   it('keeps the loaded Current file when the active leaf changes within the same file', async () => {
@@ -929,6 +1024,38 @@ describe('Annotation sidebar scope switching', () => {
       ?.click();
     await vi.waitFor(() => expect(repairs).toEqual(['Repair.md:lost-target:lost-target']));
   });
+
+  it('keeps an Ink conflict usable without previewing an incomplete linked fragment', () => {
+    const container = document.createElement('div');
+    const invoker = document.createElement('button');
+    document.body.append(container, invoker);
+    const top = linkedPhysicalConflictFragment();
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: sidebarCommands(),
+      inkRepository: { listSurfaceSummaries: () => Promise.resolve([]) } as never,
+      service: {} as never,
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {} as never,
+    });
+    const harness = view as unknown as {
+      currentInkConflicts: readonly unknown[];
+      showConflictDialog: (invoker: HTMLElement) => void;
+    };
+    harness.currentInkConflicts = [
+      {
+        candidates: [{ path: 'Ink/top.conflict.json', record: top }],
+        kind: 'same-revision-divergence',
+        selectedPath: 'Ink/top.json',
+        surfaceId: top.id,
+      },
+    ];
+
+    expect(() => harness.showConflictDialog(invoker)).not.toThrow();
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(document.querySelector('img[alt^="Ink preview"]')).toBeNull();
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('1 stroke · active');
+  });
 });
 
 function clickScope(container: HTMLElement, label: string): void {
@@ -1003,6 +1130,7 @@ function inkSurface(strokeCount: number): InkSurfaceRecord {
       lineHeight: 24,
       logicalHeight: 1_200,
       logicalWidth: 704,
+      originY: 0,
       sourceRevision: 'source-1',
       themeMode: 'light',
     },
@@ -1021,5 +1149,40 @@ function inkSurface(strokeCount: number): InkSurfaceRecord {
       width: 4,
     })),
     updatedAt: `2026-07-16T02:00:0${strokeCount}.000Z`,
+  };
+}
+
+function linkedPhysicalConflictFragment(): InkSurfaceRecord {
+  const [top] = splitInkStrokeIntoSurfaceFragments({
+    stroke: {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'linked-conflict',
+      inputProfile: { pressure: 'measured', tilt: 'measured' },
+      points: [40, 50, 60].map((y, index) => ({
+        orientation: { kind: 'unavailable' as const },
+        pressure: 0.5,
+        pressureKind: 'measured' as const,
+        time: index,
+        x: 40,
+        y,
+      })),
+      tool: 'pen',
+      width: 4,
+    },
+    surfaces: [
+      { endY: 50, id: 'top', logicalHeight: 50, startY: 0 },
+      { endY: 100, id: 'bottom', logicalHeight: 50, startY: 50 },
+    ],
+  });
+  if (top === undefined) throw new Error('Missing linked conflict fixture.');
+  return {
+    ...inkSurface(0),
+    id: top.surfaceId,
+    layout: { ...inkSurface(0).layout, logicalHeight: 50, originY: 0 },
+    revision: 1,
+    schemaVersion: 3,
+    strokes: [top.stroke],
+    updatedAt: '2026-07-18T00:00:00.000Z',
   };
 }

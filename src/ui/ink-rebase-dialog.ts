@@ -1,10 +1,14 @@
-import type { InkPoint, InkSurfaceRecord } from '../domain/ink-surface';
+import { SharedInkStrokeGeometry } from '../domain/ink-shared-stroke-geometry';
+import type { InkSurfaceRecord } from '../domain/ink-surface';
 import {
   confirmInkRebase,
   previewInkRebase,
   type InkLayoutObservation,
   type InkSurfaceSection,
 } from '../domain/ink-surface-layout';
+import { drawInkBrushGeometryToCanvas } from './ink-brush-canvas-adapter';
+
+const SHARED_INK_GEOMETRY = new SharedInkStrokeGeometry();
 
 export interface InkRebaseTarget {
   readonly layout: InkLayoutObservation;
@@ -91,21 +95,31 @@ export class InkRebaseDialog {
     this.document.body.append(dialog);
     this.element = dialog;
 
-    const render = (): void => {
+    const previewSelected = (): ReturnType<typeof previewInkRebase> | null => {
       const target = this.targets[Number.parseInt(select.value, 10) || 0];
-      if (target === undefined) return;
-      const preview = previewInkRebase(this.record, target.section, target.layout);
-      previewLabel.textContent = `Preview: ${targetLabel(target.section, 0)}`;
-      renderPreview(canvas, preview.record);
+      if (target === undefined) return null;
+      try {
+        const preview = previewInkRebase(this.record, target.section, target.layout);
+        previewLabel.textContent = `Preview: ${targetLabel(target.section, 0)}`;
+        status.textContent = '';
+        confirm.disabled = false;
+        renderPreview(canvas, preview.record);
+        return preview;
+      } catch (error) {
+        previewLabel.textContent = 'Preview unavailable';
+        status.textContent = error instanceof Error ? error.message : String(error);
+        confirm.disabled = true;
+        canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+        return null;
+      }
     };
-    select.addEventListener('change', render);
+    select.addEventListener('change', previewSelected);
     cancel.addEventListener('click', () => this.close('cancelled'));
     confirm.addEventListener('click', () => {
-      const target = this.targets[Number.parseInt(select.value, 10) || 0];
-      if (target === undefined) return;
+      const preview = previewSelected();
+      if (preview === null) return;
       confirm.disabled = true;
       status.textContent = 'Saving rebase…';
-      const preview = previewInkRebase(this.record, target.section, target.layout);
       const updated = confirmInkRebase(this.record, preview, this.now());
       void this.onConfirm(updated).then(
         () => this.close('confirmed'),
@@ -115,7 +129,7 @@ export class InkRebaseDialog {
         },
       );
     });
-    render();
+    previewSelected();
     select.focus();
 
     return new Promise((resolve) => {
@@ -148,27 +162,20 @@ function renderPreview(canvas: HTMLCanvasElement, record: InkSurfaceRecord): voi
     canvas.width / record.layout.logicalWidth,
     canvas.height / record.layout.logicalHeight,
   );
-  for (const stroke of record.strokes) {
-    if (stroke.tool === 'eraser') continue;
-    drawPreviewStroke(context, stroke.points, stroke.color, stroke.width * scale, scale);
+  context.save();
+  try {
+    context.scale(scale, scale);
+    for (const stroke of record.strokes) {
+      if (stroke.tool === 'eraser') continue;
+      const compiled = SHARED_INK_GEOMETRY.compile(stroke);
+      if (!('geometry' in compiled)) {
+        throw new Error(
+          `Unsupported Ink Brush Geometry ${compiled.requestedVersion}: ${compiled.reason}.`,
+        );
+      }
+      drawInkBrushGeometryToCanvas(context, compiled.geometry);
+    }
+  } finally {
+    context.restore();
   }
-}
-
-function drawPreviewStroke(
-  context: CanvasRenderingContext2D,
-  points: readonly InkPoint[],
-  color: string,
-  width: number,
-  scale: number,
-): void {
-  const first = points[0];
-  if (first === undefined) return;
-  context.beginPath();
-  context.lineCap = 'round';
-  context.lineJoin = 'round';
-  context.lineWidth = Math.max(1, width);
-  context.strokeStyle = color;
-  context.moveTo(first.x * scale, first.y * scale);
-  for (const point of points.slice(1)) context.lineTo(point.x * scale, point.y * scale);
-  context.stroke();
 }

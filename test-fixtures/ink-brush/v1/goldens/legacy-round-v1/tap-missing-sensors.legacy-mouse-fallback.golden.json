@@ -1,0 +1,91 @@
+{
+  "caseId": "legacy-mouse-fallback",
+  "fixtureId": "tap-missing-sensors",
+  "geometry": {
+    "bounds": {
+      "height": 4,
+      "width": 4,
+      "x": 18,
+      "y": 10
+    },
+    "byteSizeEstimate": 286,
+    "digest": "29951ed7",
+    "paint": {
+      "color": "#111111",
+      "composite": "source-over",
+      "lineCap": "round",
+      "lineJoin": "round",
+      "opacity": 1
+    },
+    "points": [
+      {
+        "pressure": 0.5,
+        "time": 0,
+        "x": 20,
+        "y": 12
+      },
+      {
+        "pressure": 0.5,
+        "time": 12,
+        "x": 20,
+        "y": 12
+      }
+    ],
+    "strokeId": "tap-missing-sensors:legacy-mouse-fallback",
+    "tool": "pen",
+    "version": "legacy-round-v1",
+    "width": 4
+  },
+  "goldenSchemaVersion": 1,
+  "trace": {
+    "points": [
+      {
+        "pressure": 0.5,
+        "time": 0,
+        "x": 20,
+        "y": 12
+      },
+      {
+        "pressure": 0.5,
+        "time": 12,
+        "x": 20,
+        "y": 12
+      }
+    ],
+    "rawSampleCount": 2,
+    "samples": [
+      {
+        "orientation": {
+          "altitude": {
+            "kind": "unavailable"
+          },
+          "azimuth": {
+            "kind": "unavailable"
+          }
+        },
+        "pressure": {
+          "kind": "unavailable"
+        },
+        "time": 0,
+        "x": 20,
+        "y": 12
+      },
+      {
+        "orientation": {
+          "altitude": {
+            "kind": "unavailable"
+          },
+          "azimuth": {
+            "kind": "unavailable"
+          }
+        },
+        "pressure": {
+          "kind": "unavailable"
+        },
+        "time": 12,
+        "x": 20,
+        "y": 12
+      }
+    ]
+  }
+}

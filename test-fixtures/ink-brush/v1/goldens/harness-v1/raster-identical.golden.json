@@ -1,0 +1,42 @@
+{
+  "candidate": {
+    "alpha": [0, 128, 255, 0],
+    "bounds": { "height": 1, "width": 1, "x": 0, "y": 0 },
+    "coverage": [0, 128, 255, 0],
+    "height": 2,
+    "scale": 2,
+    "width": 2
+  },
+  "expected": {
+    "checks": {
+      "alphaWeightedIoU": true,
+      "boundaryP95": true,
+      "maximumNormalizedAlphaDelta": true
+    },
+    "deterministic": true,
+    "kind": "compared",
+    "metrics": {
+      "alphaWeightedIoU": 1,
+      "boundaryP95PhysicalPixels": 0,
+      "maximumNormalizedAlphaDelta": 0
+    },
+    "passed": true,
+    "thresholds": {
+      "maximumBoundaryP95PhysicalPixels": 0.5,
+      "maximumNormalizedAlphaDelta": 0.00392156862745098,
+      "minimumAlphaWeightedIoU": 0.995,
+      "requiredBoundaryOutputScale": 2
+    }
+  },
+  "goldenSchemaVersion": 1,
+  "kind": "raster-comparison",
+  "reference": {
+    "alpha": [0, 128, 255, 0],
+    "bounds": { "height": 1, "width": 1, "x": 0, "y": 0 },
+    "coverage": [0, 128, 255, 0],
+    "height": 2,
+    "scale": 2,
+    "width": 2
+  },
+  "tool": "pen"
+}

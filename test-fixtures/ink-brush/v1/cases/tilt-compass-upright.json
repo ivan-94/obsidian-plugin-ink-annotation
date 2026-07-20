@@ -1,0 +1,105 @@
+{
+  "cases": [
+    {
+      "batchings": [
+        {
+          "batches": [
+            { "phase": "down", "sampleIndexes": [0] },
+            { "phase": "move", "sampleIndexes": [1, 2, 3, 4] },
+            { "phase": "up", "sampleIndexes": [5] }
+          ],
+          "id": "compass-through-upright"
+        }
+      ],
+      "brush": {
+        "color": "#ffd54f",
+        "inputProfile": { "pressure": "measured", "tilt": "measured" },
+        "tool": "highlighter",
+        "version": "highlighter-chisel-v1"
+      },
+      "id": "four-directions-and-upright",
+      "kind": "normalized-contact",
+      "samples": [
+        {
+          "orientation": {
+            "altitude": { "kind": "measured", "reliable": true, "value": 0.6 },
+            "azimuth": { "kind": "measured", "reliable": true, "value": 0 }
+          },
+          "pressure": { "kind": "measured", "value": 0.5 },
+          "time": 0,
+          "x": 0,
+          "y": 0
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "measured", "reliable": true, "value": 0.6 },
+            "azimuth": {
+              "kind": "measured",
+              "reliable": true,
+              "value": 1.5707963267948966
+            }
+          },
+          "pressure": { "kind": "measured", "value": 0.5 },
+          "time": 10,
+          "x": 5,
+          "y": 0
+        },
+        {
+          "orientation": {
+            "altitude": {
+              "kind": "measured",
+              "reliable": true,
+              "value": 1.5707963267948966
+            },
+            "azimuth": {
+              "kind": "measured",
+              "reliable": true,
+              "value": 1.5707963267948966
+            }
+          },
+          "pressure": { "kind": "measured", "value": 0.5 },
+          "time": 20,
+          "x": 10,
+          "y": 0
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "measured", "reliable": true, "value": 0.6 },
+            "azimuth": {
+              "kind": "measured",
+              "reliable": true,
+              "value": 3.141592653589793
+            }
+          },
+          "pressure": { "kind": "measured", "value": 0.5 },
+          "time": 30,
+          "x": 15,
+          "y": 0
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "measured", "reliable": true, "value": 0.6 },
+            "azimuth": { "kind": "measured", "reliable": true, "value": 4.71238898038469 }
+          },
+          "pressure": { "kind": "measured", "value": 0.5 },
+          "time": 40,
+          "x": 20,
+          "y": 0
+        },
+        {
+          "orientation": {
+            "altitude": { "kind": "measured", "reliable": true, "value": 0.6 },
+            "azimuth": { "kind": "measured", "reliable": true, "value": 0 }
+          },
+          "pressure": { "kind": "measured", "value": 0.5 },
+          "time": 50,
+          "x": 25,
+          "y": 0
+        }
+      ]
+    }
+  ],
+  "fixtureSchemaVersion": 1,
+  "id": "tilt-compass-upright",
+  "kind": "synthetic"
+}

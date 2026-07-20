@@ -1,10 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { TextAnnotationRecord } from '../domain/text-annotation';
 import type { InkSurfaceRecord } from '../domain/ink-surface';
+import { summarizeInkSurface, type InkSurfaceSummary } from '../domain/ink-surface-summary';
 import { VaultAnnotationIndex, textRecordToIndexEntry } from '../domain/vault-annotation-index';
 import {
-  applyCanonicalInkSurfaceChanged,
+  CanonicalInkSurfaceProjectionCoordinator,
+  applyCanonicalInkSurfaceSummaries,
   applyCanonicalRecordChanged,
   applyCanonicalRecordRemoved,
 } from './vault-index-events';
@@ -81,12 +83,19 @@ describe('Vault index canonical record events', () => {
     expect(index.snapshot()).toEqual([]);
   });
 
-  it('incrementally indexes Ink metadata and removes a surface tombstone without retaining points', () => {
+  it('projects one authoritative note-level Ink summary set without retaining points', () => {
     const index = new VaultAnnotationIndex();
     index.rebuild([]);
     const active = inkSurface({ revision: 1 });
+    const summary = summarizeInkSurface(active);
 
-    expect(applyCanonicalInkSurfaceChanged(index, active)).toBe('applied');
+    expect(
+      applyCanonicalInkSurfaceSummaries(index, {
+        filePath: active.filePath,
+        noteId: active.noteId,
+        summaries: [summary],
+      }),
+    ).toBe('applied');
     expect(index.snapshot()).toMatchObject([
       {
         id: 'surface-1',
@@ -97,10 +106,16 @@ describe('Vault index canonical record events', () => {
     ]);
     expect(JSON.stringify(index.snapshot())).not.toContain('pressure');
     expect(
-      applyCanonicalInkSurfaceChanged(index, {
-        ...active,
-        deletedAt: '2026-07-14T10:00:00.000Z',
-        revision: 2,
+      applyCanonicalInkSurfaceSummaries(index, {
+        filePath: active.filePath,
+        noteId: active.noteId,
+        summaries: [
+          {
+            ...summary,
+            deletedAt: '2026-07-14T10:00:00.000Z',
+            revision: 2,
+          },
+        ],
       }),
     ).toBe('removed');
     expect(index.snapshot()).toEqual([]);
@@ -109,12 +124,27 @@ describe('Vault index canonical record events', () => {
   it('removes a live Ink projection that is multiple revisions behind its tombstone', () => {
     const index = new VaultAnnotationIndex();
     index.rebuild([]);
-    expect(applyCanonicalInkSurfaceChanged(index, inkSurface({ revision: 1 }))).toBe('applied');
+    const active = inkSurface({ revision: 1 });
+    const summary = summarizeInkSurface(active);
+    expect(
+      applyCanonicalInkSurfaceSummaries(index, {
+        filePath: active.filePath,
+        noteId: active.noteId,
+        summaries: [summary],
+      }),
+    ).toBe('applied');
 
     expect(
-      applyCanonicalInkSurfaceChanged(index, {
-        ...inkSurface({ revision: 4 }),
-        deletedAt: '2026-07-14T10:00:00.000Z',
+      applyCanonicalInkSurfaceSummaries(index, {
+        filePath: active.filePath,
+        noteId: active.noteId,
+        summaries: [
+          {
+            ...summary,
+            deletedAt: '2026-07-14T10:00:00.000Z',
+            revision: 4,
+          },
+        ],
       }),
     ).toBe('removed');
     expect(index.snapshot()).toEqual([]);
@@ -125,14 +155,25 @@ describe('Vault index canonical record events', () => {
     (projectedRevision) => {
       const index = new VaultAnnotationIndex();
       index.rebuild([]);
+      const active = inkSurface({ revision: projectedRevision });
       expect(
-        applyCanonicalInkSurfaceChanged(index, inkSurface({ revision: projectedRevision })),
+        applyCanonicalInkSurfaceSummaries(index, {
+          filePath: active.filePath,
+          noteId: active.noteId,
+          summaries: [summarizeInkSurface(active)],
+        }),
       ).toBe('applied');
 
       expect(
-        applyCanonicalInkSurfaceChanged(index, {
-          ...inkSurface({ revision: 4 }),
-          deletedAt: '2026-07-14T10:00:00.000Z',
+        applyCanonicalInkSurfaceSummaries(index, {
+          filePath: active.filePath,
+          noteId: active.noteId,
+          summaries: [
+            {
+              ...summarizeInkSurface(inkSurface({ revision: 4 })),
+              deletedAt: '2026-07-14T10:00:00.000Z',
+            },
+          ],
         }),
       ).toBe('stale');
       expect(index.snapshot()).toMatchObject([{ revision: projectedRevision }]);
@@ -143,14 +184,148 @@ describe('Vault index canonical record events', () => {
     const index = new VaultAnnotationIndex();
     index.rebuild([]);
     const active = inkSurface({ revision: 1 });
-    expect(applyCanonicalInkSurfaceChanged(index, active)).toBe('applied');
+    expect(
+      applyCanonicalInkSurfaceSummaries(index, {
+        filePath: active.filePath,
+        noteId: active.noteId,
+        summaries: [summarizeInkSurface(active)],
+      }),
+    ).toBe('applied');
 
-    expect(applyCanonicalInkSurfaceChanged(index, { ...active, revision: 2, strokes: [] })).toBe(
-      'removed',
-    );
+    expect(
+      applyCanonicalInkSurfaceSummaries(index, {
+        filePath: active.filePath,
+        noteId: active.noteId,
+        summaries: [summarizeInkSurface({ ...active, revision: 2, strokes: [] })],
+      }),
+    ).toBe('removed');
     expect(index.snapshot()).toEqual([]);
   });
+
+  it('loads joined note summaries before updating the index and realtime summary consumer', async () => {
+    const index = new VaultAnnotationIndex();
+    index.rebuild([]);
+    const changed = inkSurface({ revision: 2 });
+    const top = {
+      ...summarizeInkSurface(changed),
+      thumbnailSvg: '<svg data-ink-geometry-digest="joined-geometry"></svg>',
+    };
+    const bottom: InkSurfaceSummary = {
+      ...top,
+      id: 'surface-2',
+      position: 120,
+    };
+    const applied: (readonly InkSurfaceSummary[])[] = [];
+    const coordinator = new CanonicalInkSurfaceProjectionCoordinator({
+      applySummaries: (_filePath, summaries) => applied.push(summaries),
+      index,
+      listSurfaceSummaries: () => Promise.resolve([top, bottom]),
+    });
+
+    await expect(coordinator.refresh(changed)).resolves.toBe('applied');
+
+    expect(applied).toEqual([[top, bottom]]);
+    expect(applied[0]?.every(({ thumbnailSvg }) => thumbnailSvg.includes('joined-geometry'))).toBe(
+      true,
+    );
+    expect(index.snapshot()).toMatchObject([
+      { id: 'surface-1', revision: 2 },
+      { id: 'surface-2', revision: 2 },
+    ]);
+  });
+
+  it('drops an older note-summary read when a newer canonical mutation completes first', async () => {
+    const index = new VaultAnnotationIndex();
+    index.rebuild([]);
+    const first = deferred<readonly InkSurfaceSummary[]>();
+    const second = deferred<readonly InkSurfaceSummary[]>();
+    const changed = inkSurface({ revision: 1 });
+    const newest = {
+      ...summarizeInkSurface({ ...changed, revision: 2 }),
+      thumbnailSvg: '<svg data-ink-geometry-digest="newest"></svg>',
+    };
+    const applied: (readonly InkSurfaceSummary[])[] = [];
+    const listSurfaceSummaries = vi
+      .fn<() => Promise<readonly InkSurfaceSummary[]>>()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const coordinator = new CanonicalInkSurfaceProjectionCoordinator({
+      applySummaries: (_filePath, summaries) => applied.push(summaries),
+      index,
+      listSurfaceSummaries,
+    });
+
+    const olderRefresh = coordinator.refresh(changed);
+    await Promise.resolve();
+    const newerChanged: InkSurfaceRecord = { ...changed, revision: 2 };
+    const newerRefresh = coordinator.refresh(newerChanged);
+    second.resolve([newest]);
+    await expect(newerRefresh).resolves.toBe('applied');
+    first.resolve([summarizeInkSurface(changed)]);
+
+    await expect(olderRefresh).resolves.toBe('superseded');
+    expect(applied).toEqual([[newest]]);
+    expect(index.snapshot()).toMatchObject([{ id: 'surface-1', revision: 2 }]);
+  });
+
+  it('coalesces one synchronous multi-surface commit into one note-summary reload', async () => {
+    const index = new VaultAnnotationIndex();
+    index.rebuild([]);
+    const changed = inkSurface({ revision: 2 });
+    const summary = summarizeInkSurface(changed);
+    const listSurfaceSummaries = vi.fn(() => Promise.resolve([summary]));
+    const coordinator = new CanonicalInkSurfaceProjectionCoordinator({
+      index,
+      listSurfaceSummaries,
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 30 }, () => coordinator.refresh(changed)),
+    );
+
+    expect(listSurfaceSummaries).toHaveBeenCalledOnce();
+    expect(results.filter((result) => result === 'applied')).toHaveLength(1);
+    expect(results.filter((result) => result === 'superseded')).toHaveLength(29);
+  });
+
+  it('keeps the previous projections when a joined-summary reload fails', async () => {
+    const index = new VaultAnnotationIndex();
+    const changed = inkSurface({ revision: 1 });
+    const initial = summarizeInkSurface(changed);
+    index.rebuild([]);
+    applyCanonicalInkSurfaceSummaries(index, {
+      filePath: changed.filePath,
+      noteId: changed.noteId,
+      summaries: [initial],
+    });
+    const applied: (readonly InkSurfaceSummary[])[] = [];
+    const coordinator = new CanonicalInkSurfaceProjectionCoordinator({
+      applySummaries: (_filePath, summaries) => applied.push(summaries),
+      index,
+      listSurfaceSummaries: () => Promise.reject(new Error('summary unavailable')),
+    });
+
+    const newerChanged: InkSurfaceRecord = { ...changed, revision: 2 };
+    await expect(coordinator.refresh(newerChanged)).rejects.toThrow('summary unavailable');
+
+    expect(applied).toEqual([]);
+    expect(index.snapshot()).toMatchObject([{ id: 'surface-1', revision: 1 }]);
+  });
 });
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolvePromise: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve: (value) => resolvePromise?.(value),
+  };
+}
 
 function record(input: {
   readonly deletedAt?: string;

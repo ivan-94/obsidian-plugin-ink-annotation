@@ -10,9 +10,28 @@ describe('parseSettings', () => {
     expect(parseSettings({ diagnosticsEnabled: true, ignored: 'value' })).toEqual({
       deviceId: '',
       diagnosticsEnabled: true,
+      inkPresentationAdapter: 'main-canvas-2d',
       showInkPreviewByDefault: true,
       stylePresets: DEFAULT_STYLE_PRESETS,
     });
+  });
+
+  it('keeps the unverified Worker renderer behind an explicit fail-closed selection', () => {
+    expect(parseSettings({ diagnosticsEnabled: false }).inkPresentationAdapter).toBe(
+      'main-canvas-2d',
+    );
+    expect(
+      parseSettings({
+        diagnosticsEnabled: false,
+        inkPresentationAdapter: 'worker-offscreen-2d',
+      }).inkPresentationAdapter,
+    ).toBe('worker-offscreen-2d');
+    expect(
+      parseSettings({
+        diagnosticsEnabled: false,
+        inkPresentationAdapter: 'webgpu',
+      }).inkPresentationAdapter,
+    ).toBe('main-canvas-2d');
   });
 
   it('shows saved Ink in preview by default while preserving an explicit opt-out', () => {

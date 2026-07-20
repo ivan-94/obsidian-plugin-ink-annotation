@@ -1,0 +1,58 @@
+{
+  "cases": [
+    {
+      "id": "joined-logical-stroke-across-two-surfaces",
+      "kind": "logical-scene",
+      "strokes": [
+        {
+          "brush": {
+            "color": "#111111",
+            "inputProfile": { "pressure": "measured", "tilt": "unavailable" },
+            "tool": "pen",
+            "version": "pen-physical-v1"
+          },
+          "id": "logical-stroke-1",
+          "points": [
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.4 },
+              "time": 0,
+              "x": 10,
+              "y": 40
+            },
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.6 },
+              "time": 10,
+              "x": 20,
+              "y": 50
+            },
+            {
+              "orientation": {
+                "altitude": { "kind": "unavailable" },
+                "azimuth": { "kind": "unavailable" }
+              },
+              "pressure": { "kind": "measured", "value": 0.5 },
+              "time": 20,
+              "x": 30,
+              "y": 60
+            }
+          ]
+        }
+      ],
+      "surfaces": [
+        { "id": "surface-a", "maximumY": 50, "minimumY": 0 },
+        { "id": "surface-b", "maximumY": 100, "minimumY": 50 }
+      ]
+    }
+  ],
+  "fixtureSchemaVersion": 1,
+  "id": "surface-boundary-crossing",
+  "kind": "synthetic"
+}

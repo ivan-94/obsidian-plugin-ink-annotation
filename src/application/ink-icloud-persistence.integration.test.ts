@@ -179,7 +179,7 @@ describe('Ink iCloud-resilient persistence', () => {
         kind: 'error',
         message: 'Another Ink version arrived. Your local strokes are safe.',
       },
-      surface: { strokes: [{ id: 'local-crossing' }, { id: 'shared' }] },
+      surface: { strokes: [{ id: 'shared' }, { id: 'local-crossing' }] },
     });
   });
 

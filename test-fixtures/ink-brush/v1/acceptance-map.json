@@ -1,0 +1,63 @@
+{
+  "acceptanceMapSchemaVersion": 1,
+  "contractCases": [
+    {
+      "caseId": "unknown-version-fail-closed",
+      "owners": ["S29"]
+    },
+    {
+      "caseId": "active-committed-reload-export-digest",
+      "owners": ["S31", "S32", "S33"]
+    }
+  ],
+  "fixtureOwners": [
+    {
+      "fixtureId": "tap-missing-sensors",
+      "owners": ["S30", "S31", "S32"]
+    },
+    {
+      "fixtureId": "pressure-ramp-line",
+      "owners": ["S31"]
+    },
+    {
+      "fixtureId": "pressure-impulse-straight",
+      "owners": ["S30", "S31"]
+    },
+    {
+      "fixtureId": "same-path-slow-fast",
+      "owners": ["S31", "S32"]
+    },
+    {
+      "fixtureId": "uneven-coalesced-s-curve",
+      "owners": ["S30"]
+    },
+    {
+      "fixtureId": "tilt-compass-upright",
+      "owners": ["S30", "S32"]
+    },
+    {
+      "fixtureId": "corner-hairpin-self-cross",
+      "owners": ["S30", "S31"]
+    },
+    {
+      "fixtureId": "surface-boundary-crossing",
+      "owners": ["S29", "S30", "S32", "S33"]
+    },
+    {
+      "fixtureId": "two-highlighter-crossings",
+      "owners": ["S32", "S33"]
+    },
+    {
+      "fixtureId": "mixed-legacy-physical",
+      "owners": ["S29", "S33"]
+    },
+    {
+      "fixtureId": "zoom-dpr-export",
+      "owners": ["S33"]
+    },
+    {
+      "fixtureId": "real-pencil-small-writing",
+      "owners": ["S34"]
+    }
+  ]
+}

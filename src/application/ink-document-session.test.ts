@@ -1,9 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { InkStroke, InkSurfaceRecord } from '../domain/ink-surface';
+import { SharedInkStrokeGeometry } from '../domain/ink-shared-stroke-geometry';
+import {
+  encodeInkSurfaceRecord,
+  type InkStroke,
+  type InkSurfaceRecord,
+} from '../domain/ink-surface';
+import { splitInkStrokeIntoSurfaceFragments } from '../domain/ink-surface-layout';
 import { InkDocumentSession } from './ink-document-session';
 
 describe('continuous Ink document session', () => {
+  afterEach(() => vi.useRealTimers());
   it('rejects a multi-chunk writer that cannot guarantee atomic persistence', () => {
     expect(
       () =>
@@ -24,26 +31,15 @@ describe('continuous Ink document session', () => {
     expect(session.snapshot().surface.id).toBe('document:a:b');
   });
 
-  it('exposes bounded base revisions for synchronous crash recovery while dirty', () => {
-    const session = createSession([surface('a', 600), surface('b', 400)]).session;
+  it('keeps one crossing Add live without touching bounded canonical storage synchronously', () => {
+    const { session, writer } = createSession([surface('a', 600), surface('b', 400)]);
 
     session.addStroke(stroke('crossing', 550, 650));
 
-    expect(session.recoverySnapshot()).toMatchObject({
-      expectedBases: [
-        { id: 'a', revision: 1, strokes: [] },
-        { id: 'b', revision: 1, strokes: [] },
-      ],
-      pendingAttempts: [
-        { id: 'a', revision: 2, strokes: [{ linkedStrokeId: 'crossing' }] },
-        { id: 'b', revision: 2, strokes: [{ linkedStrokeId: 'crossing' }] },
-      ],
-      records: [
-        { id: 'a', revision: 1, strokes: [{ linkedStrokeId: 'crossing' }] },
-        { id: 'b', revision: 1, strokes: [{ linkedStrokeId: 'crossing' }] },
-      ],
-      requiresRecovery: true,
-    });
+    expect(session.read()).toMatchObject({ strokeCount: 1 });
+    expect(session.read().strokes[0]?.stroke.id).toBe('crossing');
+    expect(writer.records).toEqual([]);
+    expect(writer.atomicBatches).toEqual([]);
   });
 
   it('re-enters clean chunks after another bounded chunk failed during Preview exit', async () => {
@@ -86,6 +82,84 @@ describe('continuous Ink document session', () => {
     expect(session.snapshot().surface.layout.logicalHeight).toBe(1000);
   });
 
+  it('materializes an encodable schema-v3 cold snapshot with a document origin', () => {
+    const session = createSession([
+      v3Surface('bottom', 600, 400),
+      v3Surface('top', 0, 600),
+    ]).session;
+
+    const cold = session.materializeColdSnapshot().surface;
+
+    expect(cold.layout.originY).toBe(0);
+    expect(() => encodeInkSurfaceRecord(cold)).not.toThrow();
+  });
+
+  it.each([1, 2] as const)(
+    'fails closed instead of composing active schema-v%d and schema-v3 surfaces',
+    (legacySchemaVersion) => {
+      const legacy = surface('legacy', 600);
+      const legacySurface: InkSurfaceRecord = {
+        ...legacy,
+        layout: {
+          ...legacy.layout,
+          ...(legacySchemaVersion === 1 ? {} : { originY: 0 }),
+        },
+        schemaVersion: legacySchemaVersion,
+      };
+
+      expect(() => createSession([legacySurface, v3Surface('physical', 600, 400)])).toThrow(
+        /mixed Ink schema.*semantic conflict/iu,
+      );
+    },
+  );
+
+  it.each([1, 2] as const)(
+    'keeps normalized legacy brush metadata through schema-v%d move, Undo, and Redo',
+    (schemaVersion) => {
+      const legacy: InkStroke = {
+        ...stroke('normalized-legacy', 100, 120),
+        brushRenderVersion: 'legacy-round-v1',
+        inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+      };
+      const base = surface('a', 600);
+      const session = createSession([
+        {
+          ...base,
+          layout: {
+            ...base.layout,
+            ...(schemaVersion === 1 ? {} : { originY: 0 }),
+          },
+          schemaVersion,
+          strokes: [legacy],
+        },
+      ]).session;
+
+      expect(
+        session.apply({
+          dx: 10,
+          dy: 20,
+          id: `move-normalized-v${schemaVersion}`,
+          ids: ['normalized-legacy'],
+          kind: 'move',
+        }).kind,
+      ).toBe('committed');
+      expect(session.snapshot().surface.strokes[0]).toMatchObject({
+        brushRenderVersion: 'legacy-round-v1',
+        inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+      });
+      expect(session.undo()).toBe(true);
+      expect(session.snapshot().surface.strokes[0]).toMatchObject({
+        brushRenderVersion: 'legacy-round-v1',
+        inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+      });
+      expect(session.redo()).toBe(true);
+      expect(session.snapshot().surface.strokes[0]).toMatchObject({
+        brushRenderVersion: 'legacy-round-v1',
+        inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+      });
+    },
+  );
+
   it('keeps lower persisted Ink reachable when current Markdown becomes shorter', () => {
     const lower: InkSurfaceRecord = {
       ...surface('lower', 400),
@@ -116,8 +190,13 @@ describe('continuous Ink document session', () => {
       schemaVersion: 2,
     };
     const { session, writer } = createSession([top, bottom]);
+    const beforeExtension = session.read();
 
     expect(session.ensureMinimumHeight(1_600)).toBe(true);
+    expect(session.read()).toMatchObject({
+      generation: beforeExtension.generation + 1,
+      logicalHeight: 1_600,
+    });
     expect(session.snapshot().surface.layout.logicalHeight).toBe(1_600);
     await session.background();
     expect(writer.records).toEqual([]);
@@ -175,6 +254,80 @@ describe('continuous Ink document session', () => {
       id: 'user-stroke',
       points: [{ y: 550 }, { y: 600 }, { y: 650 }],
     });
+  });
+
+  it('preserves one physical brush identity through cold split, Undo, Redo, and reconstruction', async () => {
+    const { session, writer } = createSession([v3Surface('a', 0, 600), v3Surface('b', 600, 400)]);
+    const authored = physicalStroke('physical-crossing', 550, 650);
+
+    session.addStroke(authored);
+
+    expect(session.snapshot().surface).toMatchObject({
+      schemaVersion: 3,
+      strokes: [physicalIdentity('physical-crossing')],
+    });
+    await session.background();
+    expect(writer.records.flatMap(({ strokes }) => strokes)).toMatchObject([
+      physicalIdentity('physical-crossing', 'physical-crossing-a'),
+      physicalIdentity('physical-crossing', 'physical-crossing-b'),
+    ]);
+
+    expect(session.undo()).toBe(true);
+    expect(session.snapshot().surface.strokes).toEqual([]);
+    expect(session.redo()).toBe(true);
+    expect(session.snapshot().surface.strokes).toMatchObject([
+      physicalIdentity('physical-crossing'),
+    ]);
+
+    const reloaded = createSession(writer.records).session;
+    expect(reloaded.snapshot().surface.strokes).toMatchObject([
+      physicalIdentity('physical-crossing'),
+    ]);
+    const reloadedStroke = reloaded.snapshot().surface.strokes[0];
+    expect(reloadedStroke?.points).toEqual(authored.points);
+    if (reloadedStroke === undefined) throw new Error('Missing reloaded physical Logical Stroke.');
+    const geometry = new SharedInkStrokeGeometry();
+    const activeGeometry = geometry.compile(authored);
+    const reloadedGeometry = geometry.compile(reloadedStroke);
+    if (activeGeometry.kind !== 'unpublished' || reloadedGeometry.kind !== 'unpublished') {
+      throw new Error('Expected unpublished physical geometry in the HAT-only lane.');
+    }
+    expect(reloadedGeometry.geometry.traceDigest).toBe(activeGeometry.geometry.traceDigest);
+    expect(reloadedGeometry.geometry.geometryDigest).toBe(activeGeometry.geometry.geometryDigest);
+  });
+
+  it('fails closed when loaded schema-v3 fragments omit or disagree on complete brush identity', () => {
+    const missing = {
+      ...stroke('physical-crossing', 550, 600),
+      id: 'physical-crossing-a',
+      linkedStrokeId: 'physical-crossing',
+    };
+    expect(() => createSession([{ ...v3Surface('a', 0, 600), strokes: [missing] }])).toThrow(
+      /brush metadata/u,
+    );
+
+    const fragments = splitInkStrokeIntoSurfaceFragments({
+      stroke: physicalStroke('physical-crossing', 550, 650),
+      surfaces: [
+        { endY: 600, id: 'a', logicalHeight: 600, startY: 0 },
+        { endY: 1_000, id: 'b', logicalHeight: 400, startY: 600 },
+      ],
+    });
+    const first = fragments.find(({ surfaceId }) => surfaceId === 'a')?.stroke;
+    const bottom = fragments.find(({ surfaceId }) => surfaceId === 'b')?.stroke;
+    if (first === undefined || bottom === undefined) {
+      throw new Error('Missing physical mismatch fixture fragment.');
+    }
+    const second = {
+      ...bottom,
+      color: '#445566',
+    };
+    expect(() =>
+      createSession([
+        { ...v3Surface('a', 0, 600), strokes: [first] },
+        { ...v3Surface('b', 600, 400), strokes: [second] },
+      ]),
+    ).toThrow(/brush identity/u);
   });
 
   it('keeps temporal path order when one stroke leaves and later re-enters the same chunk', () => {
@@ -427,7 +580,7 @@ describe('continuous Ink document session', () => {
     expect(session.eraseStrokesInPolygon(loop)).toEqual(['user-stroke']);
     await expect(session.background()).rejects.toThrow('batch unavailable');
     expect(session.snapshot().surface.strokes).toEqual([]);
-    expect(session.recoverySnapshot()).toMatchObject({ requiresRecovery: true });
+    expect(session.read().persistence).toMatchObject({ kind: 'error' });
 
     await session.retry();
     expect(session.snapshot().surface.strokes).toEqual([]);
@@ -454,6 +607,157 @@ describe('continuous Ink document session', () => {
     expect(session.selectedStrokeIds()).toEqual([]);
     await session.background();
     expect(writer.records).toEqual([]);
+  });
+
+  it('uses physical nib coverage for viewport queries and point selection', () => {
+    const pressureTap: InkStroke = {
+      brushRenderVersion: 'pen-physical-v1',
+      color: '#112233',
+      id: 'pressure-tap',
+      inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+      points: [
+        {
+          orientation: { kind: 'unavailable' },
+          pressure: 1,
+          pressureKind: 'measured',
+          time: 0,
+          x: 100,
+          y: 100,
+        },
+      ],
+      tool: 'pen',
+      width: 4,
+    };
+    const session = createSession([v3Surface('physical', 0, 600, [pressureTap])]).session;
+
+    expect(session.read().strokes[0]?.bounds.height).toBeGreaterThan(4);
+    expect(
+      session.query({ height: 0.2, width: 0.2, x: 99.9, y: 102.4 }).map(({ id }) => id),
+    ).toEqual(['pressure-tap']);
+    expect(session.strokeIdAt(point(100, 102.4), 0)).toBe('pressure-tap');
+  });
+
+  it('reuses trusted completed physical bounds during the add transaction', () => {
+    const authored = physicalStroke('prepared-physical', 100, 120);
+    const prepared = new SharedInkStrokeGeometry().compile(authored);
+    if (!('geometry' in prepared)) throw new Error('Expected compiled physical geometry.');
+    const compile = vi.spyOn(SharedInkStrokeGeometry.prototype, 'compile');
+    const session = createSession([v3Surface('physical', 0, 600)]).session;
+
+    expect(
+      session.apply(
+        { id: 'add-prepared-physical', kind: 'add', stroke: authored },
+        prepared.geometry,
+      ),
+    ).toMatchObject({ kind: 'committed' });
+
+    expect(compile).not.toHaveBeenCalled();
+    expect(session.read().strokes[0]?.bounds).toEqual(prepared.geometry.bounds);
+  });
+
+  it('rejects mismatched prepared geometry before storage or live mutation', () => {
+    const authored = physicalStroke('prepared-physical', 100, 120);
+    const prepared = new SharedInkStrokeGeometry().compile(authored);
+    if (!('geometry' in prepared)) throw new Error('Expected compiled physical geometry.');
+    const writer = new RecordingWriter();
+    const session = new InkDocumentSession({
+      surfaces: [v3Surface('physical', 0, 600)],
+      writer,
+    });
+
+    expect(() =>
+      session.apply(
+        { id: 'add-prepared-physical', kind: 'add', stroke: authored },
+        { ...prepared.geometry, logicalStrokeId: 'forged-logical-stroke' },
+      ),
+    ).toThrow('Prepared Ink geometry does not match Logical Stroke prepared-physical.');
+    expect(writer.records).toEqual([]);
+    expect(session.read().strokeCount).toBe(0);
+  });
+
+  it('keeps an ordinary foreground pause memory-only until explicit exit', async () => {
+    vi.useFakeTimers();
+    const writer = new RecordingWriter();
+    const session = new InkDocumentSession({
+      surfaces: [v3Surface('physical', 0, 600)],
+      writer,
+    });
+
+    session.addStroke(physicalStroke('done-save', 100, 120));
+    expect(writer.records).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(writer.records).toEqual([]);
+
+    const exit = session.exit();
+    await vi.runAllTimersAsync();
+    await exit;
+    expect(writer.records).toMatchObject([{ strokes: [{ id: 'done-save' }] }]);
+  });
+
+  it('best-effort saves only after one complete sustained-inactivity window', async () => {
+    vi.useFakeTimers();
+    const writer = new RecordingWriter();
+    const session = new InkDocumentSession({
+      inactivityMs: 30_000,
+      surfaces: [v3Surface('physical', 0, 600)],
+      writer,
+    });
+
+    session.addStroke(physicalStroke('idle-save', 100, 120));
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(writer.records).toEqual([]);
+
+    session.noteUserInteraction();
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(writer.records).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.runAllTimersAsync();
+    expect(writer.records).toMatchObject([{ strokes: [{ id: 'idle-save' }] }]);
+  });
+
+  it('restarts sustained inactivity when a new document command arrives', async () => {
+    vi.useFakeTimers();
+    const writer = new RecordingWriter();
+    const session = new InkDocumentSession({
+      inactivityMs: 30_000,
+      surfaces: [v3Surface('physical', 0, 600)],
+      writer,
+    });
+
+    session.addStroke(physicalStroke('idle-first', 100, 120));
+    await vi.advanceTimersByTimeAsync(20_000);
+    session.addStroke(physicalStroke('idle-second', 140, 160));
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(writer.records).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    await vi.runAllTimersAsync();
+    expect(writer.records.at(-1)?.strokes.map(({ id }) => id)).toEqual([
+      'idle-first',
+      'idle-second',
+    ]);
+  });
+
+  it('keeps historical Eraser records canonical but out of the visible read model', () => {
+    const historicalEraser: InkStroke = {
+      color: '#ffffff',
+      id: 'historical-eraser',
+      points: [point(100, 100), point(120, 120)],
+      tool: 'eraser',
+      width: 16,
+    };
+    const session = createSession([
+      v3Surface('with-historical-eraser', 0, 600, [historicalEraser]),
+    ]).session;
+
+    expect(session.read()).toMatchObject({ strokeCount: 0, strokes: [] });
+    expect(session.query({ height: 40, width: 40, x: 90, y: 90 })).toEqual([]);
+    expect(session.strokeIdAt(point(110, 110), 20)).toBeNull();
+    expect(session.materializeColdSnapshot().surface.strokes).toEqual([historicalEraser]);
   });
 
   it('supports additive toggle selection and clears it from empty workspace', () => {
@@ -538,6 +842,113 @@ describe('continuous Ink document session', () => {
     expect(session.snapshot().surface.strokes[0]?.id).toBe('selected');
   });
 
+  it('preserves physical version and input profile through move, restyle, Undo, and Redo', async () => {
+    const authored: InkStroke = {
+      ...physicalStroke('physical-crossing', 550, 650),
+      points: [
+        { ...physicalPoint(100, 550), time: 1 },
+        { ...physicalPoint(150, 600), time: 2 },
+        { ...physicalPoint(200, 650), time: 3 },
+      ],
+    };
+    const fragments = splitInkStrokeIntoSurfaceFragments({
+      stroke: authored,
+      surfaces: [
+        { endY: 600, id: 'a', logicalHeight: 600, startY: 0 },
+        { endY: 1_000, id: 'b', logicalHeight: 400, startY: 600 },
+      ],
+    });
+    const first = fragments.find(({ surfaceId }) => surfaceId === 'a')?.stroke;
+    const second = fragments.find(({ surfaceId }) => surfaceId === 'b')?.stroke;
+    if (first === undefined || second === undefined) {
+      throw new Error('Missing physical move fixture fragment.');
+    }
+    const { session, writer } = createSession([
+      { ...v3Surface('a', 0, 600), strokes: [first] },
+      { ...v3Surface('b', 600, 400), strokes: [second] },
+    ]);
+
+    session.selectStrokeAt(point(151, 601), 8);
+    session.previewSelectionMove(20, 20);
+    expect(session.commitSelectionMove()).toBe(true);
+    expect(session.snapshot().surface.strokes).toMatchObject([
+      physicalIdentity('physical-crossing'),
+    ]);
+    await session.background();
+    expect(writer.records.slice(-2).flatMap(({ strokes }) => strokes)).toMatchObject([
+      physicalIdentity('physical-crossing', 'physical-crossing-a'),
+      physicalIdentity('physical-crossing', 'physical-crossing-b'),
+    ]);
+
+    const restyled = session.apply({
+      id: 'restyle-physical',
+      ids: ['physical-crossing'],
+      kind: 'restyle',
+      style: { color: '#445566', width: 6 },
+    });
+    expect(restyled.kind).toBe('committed');
+    expect(session.snapshot().surface.strokes).toMatchObject([
+      {
+        ...physicalIdentity('physical-crossing'),
+        color: '#445566',
+        width: 6,
+      },
+    ]);
+
+    expect(session.undo()).toBe(true);
+    expect(session.snapshot().surface.strokes).toMatchObject([
+      physicalIdentity('physical-crossing'),
+    ]);
+    expect(session.redo()).toBe(true);
+    expect(session.snapshot().surface.strokes).toMatchObject([
+      {
+        ...physicalIdentity('physical-crossing'),
+        color: '#445566',
+        width: 6,
+      },
+    ]);
+  });
+
+  it('rejects a physical restyle that would mismatch tool and immutable brush version', () => {
+    const physical = physicalStroke('physical-pen', 100, 120);
+    const session = createSession([{ ...v3Surface('a', 0, 600), strokes: [physical] }]).session;
+    const before = session.snapshot().surface;
+
+    expect(() =>
+      session.apply({
+        id: 'invalid-physical-restyle',
+        ids: ['physical-pen'],
+        kind: 'restyle',
+        style: { tool: 'highlighter' },
+      }),
+    ).toThrow(/brush metadata/u);
+    expect(session.snapshot().surface).toEqual(before);
+    expect(session.canUndo()).toBe(false);
+  });
+
+  it('keeps legacy-round metadata valid when restyling between visible legacy tools', () => {
+    const legacy: InkStroke = {
+      ...stroke('legacy', 100, 120),
+      brushRenderVersion: 'legacy-round-v1',
+      inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+    };
+    const session = createSession([{ ...v3Surface('a', 0, 600), strokes: [legacy] }]).session;
+
+    expect(
+      session.apply({
+        id: 'legacy-tool-restyle',
+        ids: ['legacy'],
+        kind: 'restyle',
+        style: { tool: 'highlighter' },
+      }).kind,
+    ).toBe('committed');
+    expect(session.snapshot().surface.strokes[0]).toMatchObject({
+      brushRenderVersion: 'legacy-round-v1',
+      inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+      tool: 'highlighter',
+    });
+  });
+
   it('flushes a cross-chunk move through one atomic writer operation', async () => {
     const { session, writer } = createSession([surface('a', 600), surface('b', 400)]);
     session.addStroke(stroke('selected', 550, 650));
@@ -600,7 +1011,7 @@ describe('continuous Ink document session', () => {
     expect(results.map(({ status }) => status)).toEqual(['rejected', 'rejected']);
     expect(writer.singleWriteAttempts).toBe(1);
     expect(writer.atomicBatches).toEqual([]);
-    expect(session.recoverySnapshot()).toMatchObject({ requiresRecovery: true });
+    expect(session.read().persistence).toMatchObject({ kind: 'error' });
   });
 
   it('allows horizontal margin movement while clamping the shared vertical delta', () => {
@@ -632,8 +1043,49 @@ describe('continuous Ink document session', () => {
 
     const reloaded = createSession(latest as InkSurfaceRecord[]).session;
 
-    expect(reloaded.snapshot().surface.strokes).toEqual(session.snapshot().surface.strokes);
+    expect(reloaded.snapshot().surface.strokes).toMatchObject([
+      {
+        id: 'user-stroke',
+        points: [
+          { x: 100, y: 550 },
+          { x: 150, y: 600 },
+          { x: 200, y: 650 },
+        ],
+      },
+    ]);
+    expect(session.snapshot().surface.strokes[0]?.points).toHaveLength(2);
   });
+
+  it.each(['pen', 'highlighter'] as const)(
+    'normalizes an unversioned %s capture at the schema-v3 live boundary',
+    async (tool) => {
+      const writer = new RecordingWriter();
+      const session = new InkDocumentSession({
+        surfaces: [v3Surface('v3', 0, 600)],
+        writer,
+      });
+      const authored: InkStroke = {
+        ...stroke(`legacy-${tool}`, 100, 120),
+        tool,
+      };
+
+      expect(session.apply({ id: `add-${tool}`, kind: 'add', stroke: authored })).toMatchObject({
+        kind: 'committed',
+      });
+
+      expect(session.read().strokes[0]?.stroke).toMatchObject({
+        brushRenderVersion: 'legacy-round-v1',
+        inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+        tool,
+      });
+      await session.background();
+      expect(writer.records.at(-1)?.strokes[0]).toMatchObject({
+        brushRenderVersion: 'legacy-round-v1',
+        inputProfile: { pressure: 'legacy-unknown', tilt: 'legacy-unknown' },
+        tool,
+      });
+    },
+  );
 });
 
 function createSession(surfaces: readonly InkSurfaceRecord[]) {
@@ -759,11 +1211,49 @@ function surface(id: string, height: number): InkSurfaceRecord {
   };
 }
 
+function v3Surface(
+  id: string,
+  originY: number,
+  height: number,
+  strokes: readonly InkStroke[] = [],
+): InkSurfaceRecord {
+  return {
+    ...surface(id, height),
+    layout: { ...surface(id, height).layout, originY },
+    schemaVersion: 3,
+    strokes,
+  };
+}
+
 function stroke(id: string, startY: number, endY: number): InkStroke {
   return {
     color: '#4f46d8',
     id,
     points: [point(100, startY), point(200, endY)],
+    tool: 'pen',
+    width: 4,
+  };
+}
+
+function physicalStroke(id: string, startY: number, endY: number): InkStroke {
+  return {
+    brushRenderVersion: 'pen-physical-v1',
+    color: '#112233',
+    id,
+    inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+    points: [physicalPoint(100, startY), physicalPoint(200, endY)],
+    tool: 'pen',
+    width: 4,
+  };
+}
+
+function physicalIdentity(linkedId: string, fragmentId = linkedId) {
+  return {
+    brushRenderVersion: 'pen-physical-v1',
+    color: '#112233',
+    id: fragmentId,
+    inputProfile: { pressure: 'measured', tilt: 'unavailable' },
+    ...(fragmentId === linkedId ? {} : { linkedStrokeId: linkedId }),
     tool: 'pen',
     width: 4,
   };
@@ -775,4 +1265,15 @@ function fragment(id: string, linkedStrokeId: string, startY: number, endY: numb
 
 function point(x: number, y: number) {
   return { pressure: 0.5, time: x + y, x, y };
+}
+
+function physicalPoint(x: number, y: number) {
+  return {
+    orientation: { kind: 'unavailable' as const },
+    pressure: 0.5,
+    pressureKind: 'measured' as const,
+    time: x + y,
+    x,
+    y,
+  };
 }

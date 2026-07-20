@@ -1,8 +1,11 @@
 import { DEFAULT_STYLE_PRESETS, StylePresetCatalog, type StylePreset } from './domain/style-preset';
 
+export type InkPresentationAdapter = 'main-canvas-2d' | 'worker-offscreen-2d';
+
 export interface InkstoneSettings {
   readonly deviceId: string;
   readonly diagnosticsEnabled: boolean;
+  readonly inkPresentationAdapter: InkPresentationAdapter;
   readonly showInkPreviewByDefault: boolean;
   readonly stylePresets: readonly StylePreset[];
 }
@@ -10,6 +13,7 @@ export interface InkstoneSettings {
 export const DEFAULT_SETTINGS: InkstoneSettings = Object.freeze({
   deviceId: '',
   diagnosticsEnabled: false,
+  inkPresentationAdapter: 'main-canvas-2d',
   showInkPreviewByDefault: true,
   stylePresets: DEFAULT_STYLE_PRESETS,
 });
@@ -28,6 +32,10 @@ export function parseSettings(value: unknown): InkstoneSettings {
   return {
     deviceId: typeof value.deviceId === 'string' ? value.deviceId : '',
     diagnosticsEnabled,
+    inkPresentationAdapter:
+      value.inkPresentationAdapter === 'worker-offscreen-2d'
+        ? 'worker-offscreen-2d'
+        : 'main-canvas-2d',
     showInkPreviewByDefault:
       typeof value.showInkPreviewByDefault === 'boolean'
         ? value.showInkPreviewByDefault

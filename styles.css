@@ -2173,14 +2173,16 @@
   z-index: 8;
 }
 
-.inkstone-ink-canvas {
+.inkstone-ink-active-stack {
   inset: 0;
   position: absolute;
   pointer-events: none;
 }
 
-.inkstone-ink-canvas-committed {
-  opacity: 0.94;
+.inkstone-ink-canvas {
+  inset: 0;
+  position: absolute;
+  pointer-events: none;
 }
 
 .inkstone-ink-controls {

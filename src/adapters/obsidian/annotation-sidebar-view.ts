@@ -10,7 +10,6 @@ import {
 import { annotationTargetText, type TextAnnotationRecord } from '../../domain/text-annotation';
 import type { StylePreset } from '../../domain/style-preset';
 import type { CurrentFileAnnotationList } from '../../domain/current-file-annotation-list';
-import type { InkSurfaceRecord } from '../../domain/ink-surface';
 import { CurrentFileSidebar } from '../../ui/current-file-sidebar';
 import { VaultAnnotationSidebar } from '../../ui/vault-annotation-sidebar';
 import type {
@@ -52,6 +51,7 @@ export class AnnotationSidebarView extends ItemView {
   private readonly sidebarIsland: UiIsland<AnnotationSidebarAppProps> =
     createPreactIsland(AnnotationSidebarApp);
   private readonly sidebarStore = new AnnotationSidebarStore();
+  private readonly currentInkSummaryGenerations = new Map<string, number>();
   private currentRefreshGeneration = 0;
   private readonly commands: Required<Pick<AnnotationSidebarCommands, 'closed' | 'issue'>> &
     Omit<AnnotationSidebarCommands, 'closed' | 'issue'>;
@@ -218,24 +218,31 @@ export class AnnotationSidebarView extends ItemView {
     }
   }
 
-  applyInkSurfaceChanged(record: InkSurfaceRecord): void {
-    const summary = summarizeInkSurface(record);
-    if (this.currentCache?.filePath === record.filePath) {
+  applyInkSurfaceSummaries(filePath: string, summaries: readonly InkSurfaceSummary[]): void {
+    assertInkSummarySetForFile(filePath, summaries);
+    const authoritativeSummaries = [...summaries];
+    this.currentInkSummaryGenerations.set(
+      filePath,
+      (this.currentInkSummaryGenerations.get(filePath) ?? 0) + 1,
+    );
+
+    if (this.currentCache?.filePath === filePath) {
       this.currentCache = {
         ...this.currentCache,
-        inkSummaries: replaceInkSummary(this.currentCache.inkSummaries, summary),
+        inkSummaries: authoritativeSummaries,
       };
     }
     if (
       this.sidebarStore.scope.value !== 'current-file' ||
-      this.sidebarStore.current.filePath.value !== record.filePath
+      this.sidebarStore.current.filePath.value !== filePath
     ) {
       return;
     }
-    this.sidebarStore.current.inkSummaries.value = replaceInkSummary(
-      this.sidebarStore.current.inkSummaries.value,
-      summary,
-    );
+    this.sidebarStore.current.inkSummaries.value = authoritativeSummaries;
+    if (this.currentCache?.filePath !== filePath) {
+      this.currentFileStale = true;
+      if (this.currentComponent !== null) void this.refreshCurrentFile();
+    }
   }
 
   selectAnnotation(annotationIds: readonly string[]): boolean {
@@ -316,10 +323,18 @@ export class AnnotationSidebarView extends ItemView {
               const [record] = await this.service.getAnnotationsById(item.filePath, [item.id]);
               return record === undefined ? [] : [textRecordToIndexEntry(record)];
             }
-            const surface = await this.inkRepository.readSurface(item.filePath, item.id);
+            const [surface, loaded] = await Promise.all([
+              this.inkRepository.readSurface(item.filePath, item.id),
+              this.inkRepository.listSurfaces(item.filePath),
+            ]);
             return surface === null
               ? []
-              : [inkSummaryToIndexEntry(summarizeInkSurface(surface), surface.noteId)];
+              : [
+                  inkSummaryToIndexEntry(
+                    summarizeInkSurface(surface, { relatedRecords: loaded.records }),
+                    surface.noteId,
+                  ),
+                ];
           }),
         );
         this.commands.exportVaultEntries(entries.flat(), invoker);
@@ -432,6 +447,7 @@ export class AnnotationSidebarView extends ItemView {
       }
       return;
     }
+    const inkSummaryGeneration = this.currentInkSummaryGenerations.get(filePath) ?? 0;
     if (
       this.sidebarStore.current.status.peek() !== 'ready' ||
       this.currentCache?.filePath !== filePath
@@ -446,11 +462,19 @@ export class AnnotationSidebarView extends ItemView {
       if (this.currentComponent !== component || generation !== this.currentRefreshGeneration) {
         return;
       }
+      const projectedInkSummaries =
+        (this.currentInkSummaryGenerations.get(filePath) ?? 0) === inkSummaryGeneration
+          ? inkSummaries
+          : this.currentCache?.filePath === filePath
+            ? this.currentCache.inkSummaries
+            : this.sidebarStore.current.filePath.peek() === filePath
+              ? this.sidebarStore.current.inkSummaries.peek()
+              : inkSummaries;
       loaded.issues.forEach(this.commands.issue);
       const currentConflicts = loaded.conflicts.filter(
         (conflict) => conflict.kind === 'same-revision-divergence',
       );
-      const inkConflicts = inkSummaries.some((summary) => summary.conflict === true)
+      const inkConflicts = projectedInkSummaries.some((summary) => summary.conflict === true)
         ? (await this.inkRepository.listSurfaces(filePath)).conflicts.filter(
             (conflict) => conflict.kind === 'same-revision-divergence',
           )
@@ -463,9 +487,14 @@ export class AnnotationSidebarView extends ItemView {
         conflictCount: currentConflicts.length + inkConflicts.length,
         readIssueCount: loaded.issues.filter((issue) => issue.kind === 'corrupt-record').length,
       };
-      this.currentCache = { filePath, health, inkSummaries, model: loaded.model };
+      this.currentCache = {
+        filePath,
+        health,
+        inkSummaries: projectedInkSummaries,
+        model: loaded.model,
+      };
       this.currentFileStale = false;
-      component.render(loaded.model, health, inkSummaries);
+      component.render(loaded.model, health, projectedInkSummaries);
     } catch (error) {
       if (this.currentComponent !== component || generation !== this.currentRefreshGeneration) {
         return;
@@ -671,14 +700,21 @@ export class AnnotationSidebarView extends ItemView {
       ...inkConflicts.map((conflict) => ({
         annotationId: conflict.surfaceId,
         candidates: conflict.candidates.map(({ path, record }) => {
-          const summary = summarizeInkSurface(record);
+          let previewSvg: string | undefined;
+          try {
+            previewSvg = summarizeInkSurface(record).thumbnailSvg;
+          } catch {
+            // A conflict candidate is only one record, so linked physical Ink may be incomplete.
+            // Keep repair available without rendering a misleading capped fragment preview.
+          }
+          const strokeCount = record.strokes.filter((stroke) => stroke.tool !== 'eraser').length;
+          const headingPath = record.binding?.headingPath ?? [];
           return {
-            body: `${summary.strokeCount} ${summary.strokeCount === 1 ? 'stroke' : 'strokes'} · ${summary.status}`,
+            body: `${strokeCount} ${strokeCount === 1 ? 'stroke' : 'strokes'} · ${record.status}`,
             ...(record.deviceId === undefined ? {} : { deviceId: record.deviceId }),
             path,
-            previewSvg: summary.thumbnailSvg,
-            quote:
-              summary.headingPath.length === 0 ? 'Document Ink' : summary.headingPath.join(' › '),
+            ...(previewSvg === undefined ? {} : { previewSvg }),
+            quote: headingPath.length === 0 ? 'Document Ink' : headingPath.join(' › '),
             revision: record.revision,
             tags: [],
             updatedAt: record.updatedAt,
@@ -788,13 +824,22 @@ export class AnnotationSidebarView extends ItemView {
   }
 }
 
-function replaceInkSummary(
+function assertInkSummarySetForFile(
+  filePath: string,
   summaries: readonly InkSurfaceSummary[],
-  replacement: InkSurfaceSummary,
-): readonly InkSurfaceSummary[] {
-  const index = summaries.findIndex((summary) => summary.id === replacement.id);
-  if (index < 0) return [...summaries, replacement];
-  return summaries.map((summary, position) => (position === index ? replacement : summary));
+): void {
+  const ids = new Set<string>();
+  for (const summary of summaries) {
+    if (summary.filePath !== filePath) {
+      throw new Error(
+        `Ink sidebar summary for ${filePath} included another note: ${summary.filePath}.`,
+      );
+    }
+    if (ids.has(summary.id)) {
+      throw new Error(`Ink sidebar summary for ${filePath} contains duplicate ${summary.id}.`);
+    }
+    ids.add(summary.id);
+  }
 }
 
 function mergeDeletedItems(

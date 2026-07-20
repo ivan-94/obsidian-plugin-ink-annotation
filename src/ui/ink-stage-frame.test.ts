@@ -21,6 +21,27 @@ describe('Ink Stage Frame', () => {
     },
   );
 
+  it('writes the exact client conversion into one reusable target', () => {
+    const frame = createInkStageFrame({
+      actualScale: 0.87358,
+      canvasClientRect: { height: 891, left: 244, top: 70, width: 679 },
+      documentClientOrigin: { x: 276.125, y: 123.5 },
+    });
+    const target = { x: Number.NaN, y: Number.NaN };
+
+    for (const client of [
+      { x: -41.75, y: 153.4375 },
+      { x: 276.125, y: 123.5 },
+      { x: 923.25, y: 891.125 },
+    ]) {
+      const expected = frame.clientToLogical(client);
+      const result = frame.clientToLogicalInto(client, target);
+
+      expect(result).toBe(target);
+      expect(target).toEqual(expected);
+    }
+  });
+
   it.each([
     { label: '50%', scale: 0.5 },
     { label: '100%', scale: 1 },

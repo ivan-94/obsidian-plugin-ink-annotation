@@ -26,6 +26,59 @@ describe('ink surface session', () => {
     expect(session.snapshot().persistence).toEqual({ kind: 'saved-locally' });
   });
 
+  it('returns the cold persistence submit before canonical comparison or repository work starts', async () => {
+    const repository = new RecordingRepository();
+    const session = createSession(repository, 10_000);
+    session.addStroke(stroke('deferred-canonical'));
+
+    const background = session.background();
+
+    expect(repository.attempts).toEqual([]);
+    await background;
+    expect(repository.attempts).toMatchObject([
+      { record: { strokes: [{ id: 'deferred-canonical' }] } },
+    ]);
+  });
+
+  it('defers journal-protected canonical compaction until an explicit safe point', async () => {
+    vi.useFakeTimers();
+    const repository = new RecordingRepository();
+    const session = new InkSurfaceSession({
+      autoFlush: false,
+      debounceMs: 1,
+      now: () => '2026-07-14T09:00:00.000Z',
+      repository,
+      surface: surfaceFixture(),
+    });
+
+    session.addStroke(stroke('journal-protected'));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(repository.records).toEqual([]);
+    expect(session.snapshot().state).toMatchObject({ dirty: true, kind: 'ink-mode' });
+
+    await session.background();
+    expect(repository.records).toMatchObject([
+      { revision: 2, strokes: [{ id: 'journal-protected' }] },
+    ]);
+    expect(session.snapshot().persistence).toEqual({ kind: 'saved-locally' });
+  });
+
+  it('appends consecutive journal-protected strokes without copying growing history', () => {
+    const session = new InkSurfaceSession({
+      autoFlush: false,
+      repository: new RecordingRepository(),
+      surface: surfaceFixture(),
+    });
+
+    session.addStroke(stroke('one'));
+    const appendBuffer = session.snapshot().surface.strokes;
+    session.addStroke(stroke('two'));
+    session.addStroke(stroke('three'));
+
+    expect(session.snapshot().surface.strokes).toBe(appendBuffer);
+    expect(session.snapshot().surface.strokes.map(({ id }) => id)).toEqual(['one', 'two', 'three']);
+  });
+
   it('forces the latest strokes to disk before exit and background completion', async () => {
     vi.useFakeTimers();
     const repository = new RecordingRepository();
@@ -174,10 +227,10 @@ describe('ink surface session', () => {
       revision: 2,
       strokes: [{ id: 'concurrent-successor' }],
     });
-    expect(session.recoveryState()).toMatchObject({
-      expectedBase: { revision: 1 },
-      pendingAttempt: { revision: 2, strokes: [{ id: 'local-pending' }] },
-      record: { strokes: [{ id: 'local-pending' }] },
+    expect(session.snapshot()).toMatchObject({
+      persistence: { kind: 'error' },
+      state: { dirty: true, kind: 'ink-mode' },
+      surface: { strokes: [{ id: 'local-pending' }] },
     });
   });
 
@@ -202,26 +255,22 @@ describe('ink surface session', () => {
     ]);
   });
 
-  it('does not checkpoint a phantom next attempt after the canonical candidate succeeds', async () => {
+  it('does not schedule a phantom next attempt after the canonical candidate succeeds', async () => {
     const repository = new RecordingRepository();
-    const recoveryStates: ReturnType<InkSurfaceSession['recoveryState']>[] = [];
-    const holder: { session?: InkSurfaceSession } = {};
     const session = new InkSurfaceSession({
       debounceMs: 10_000,
-      onChange: () => {
-        if (holder.session !== undefined) recoveryStates.push(holder.session.recoveryState());
-      },
       repository,
       surface: surfaceFixture(),
     });
-    holder.session = session;
     session.addStroke(stroke('saved'));
 
     await session.background();
 
-    const completed = recoveryStates.filter(({ expectedBase }) => expectedBase.revision === 2);
-    expect(completed.length).toBeGreaterThan(0);
-    expect(completed.every(({ pendingAttempt }) => pendingAttempt === null)).toBe(true);
+    expect(repository.attempts).toHaveLength(1);
+    expect(session.snapshot()).toMatchObject({
+      persistence: { kind: 'saved-locally' },
+      surface: { revision: 2, strokes: [{ id: 'saved' }] },
+    });
   });
 
   it('replaces the live stroke set as one dirty mutation for undo and erasing', async () => {
