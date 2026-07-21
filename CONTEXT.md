@@ -39,9 +39,9 @@ measurement for an earlier generation.
 
 ## Logical Stroke
 
-One user-authored mark with one stable identity. A Logical Stroke may be persisted as linked
-fragments across bounded Ink surfaces while remaining one Undo, draft, selection, and render
-identity.
+One user-authored mark with one stable identity. The canonical document snapshot stores it directly
+in Note Logical World coordinates. Legacy bounded surfaces may decode it from linked fragments, but
+fragmentation is no longer part of the production write contract.
 
 ## Brush Control Trace
 
@@ -65,25 +65,80 @@ model.
 
 The mounted, incremental read-and-command model that presents stable logical-stroke references,
 viewport queries, exact changes, Undo/Redo, and persistence state without rebuilding a composite
-canonical snapshot on the input path.
+canonical snapshot on the input path. It is the sole active editor for a note and remains in memory
+until Done, Discard, or process loss.
+
+## Canonical Ink Snapshot
+
+The one complete logical document stored at the note's `ink.json`. Done blindly replaces this file;
+the latest successful Done wins. A snapshot has no expected base, revision chain, merge obligation,
+surface transaction, or render-cache dependency.
 
 ## Draft Buffer
 
-A best-effort, device-local queue of completed Add operations written asynchronously after a stroke
-is already usable. Draft v1 intentionally excludes relative editing commands that cannot be replayed
-idempotently after a sidecar-write/Draft-delete crash. It is neither a write-ahead log nor a commit
-prerequisite. Canonical sidecars remain authoritative; a canonical save of revision `N` permits
-deletion of draft operations through `N`. Draft failure leaves mounted Ink usable and visibly
-unsaved.
+A best-effort, device-local IndexedDB record containing the latest complete in-memory document. It
+is replaced only after a clear background or sustained no-interaction signal. There is exactly one
+record per note: no operation log, acknowledgement chain, compaction, or merge. A newer Draft may be
+restored when entering Ink Mode; Preview remains canonical-only. Draft failure never blocks drawing
+or Done.
 
 ## Legacy Recovery Journal
 
-The retired S26/S26R1 device-local write-ahead format. Production may read it only during a bounded,
-cold migration into the Live Document/Draft Buffer model. New input never arms, appends, leases,
-acknowledges, compacts, or garbage-collects a Recovery Journal. Stale or incompatible legacy bytes
-are preserved but cannot block the canonical document or create an Ink Retry workflow.
+The retired S26/S26R1 device-local write-ahead format. Production no longer opens, arms, appends,
+leases, acknowledges, compacts, garbage-collects, or restores it. Its codecs may remain temporarily
+for explicit offline migration and old tests, but it cannot block the canonical document or create
+an Ink Retry workflow.
 
 ## Stage Frame
 
 The existing single coordinate contract relating client, Canvas, and note-logical coordinates. Every
 Contact Batch uses exactly one complete Stage Frame epoch.
+
+## Note Logical World
+
+The existing stable per-note coordinate plane used by canonical Ink and the Ink Live Document. A
+Projection Identity names one exact content snapshot in this plane; it does not create another
+origin or coordinate formula. The origin is the Markdown display plane's logical top-left, and one
+logical unit is one unscaled CSS pixel at 100% presentation. Pane-wide Ink may use negative X or X
+beyond the 704 logical-px Markdown width. Existing schema positioning and Physical fragment
+provenance globalize surface-local points. Scroll, zoom, DPR, viewport bounds, and Canvas backing
+size project this world but never redefine it.
+
+## World Tile Coordinate
+
+The stable signed spatial `(LOD, column, row)` coordinate of one complete grid-aligned region in a
+Note Logical World. It never includes content revision, renderer, viewport-clipped edges,
+`scrollTop`, Canvas dimensions, or exact floating-point zoom.
+
+## Tile Content Key
+
+The exact disposable-pixel identity combining Projection Identity, Brush renderer/version, World
+Tile Coordinate, per-coordinate Tile Content Token, and Raster Variant. Edit Scene Revision fences
+work but does not globally invalidate unaffected coordinates whose Tile Content Token is inherited.
+
+## Raster Variant
+
+A disposable pixel representation of one World Tile Coordinate at a selected backing density,
+color-space, and alpha contract. DPR and zoom help select a suitable LOD/variant; they do not mutate
+Logical Stroke coordinates or Brush Geometry.
+
+## Retained Tile Scene
+
+A bounded historical-Ink presentation made from individually positioned reusable tiles under one
+Stage Frame Camera transform. Existing or lower-LOD tiles remain visible until complete current
+tiles replace them. The scene is neither one viewport bitmap nor an unbounded DOM/compositor layer
+tree.
+
+## Tile Residency
+
+The visibility-aware in-memory lifecycle of decoded tile pixels: building, ready, visible,
+near-visible, cold, dirty, stale, or disposed. Visible exact/fallback coverage is pinned; cold
+resources are evicted first under the plugin-wide disposable-memory budget.
+
+## Tile Build Worker
+
+An optional long-lived, cooperatively resumable Worker Adapter that synchronizes acknowledged,
+demand-first immutable projection slices, compiles Brush Geometry, rasters world tiles into a
+bounded Worker-local OffscreenCanvas scratch pool, and returns transferable complete results. Pencil
+input, Stage Frame/Camera updates, residency, scheduling policy, and DOM adoption remain on the main
+thread. A resumable main-thread Tile Builder is always required as fallback.

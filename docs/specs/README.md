@@ -18,6 +18,8 @@ Inkstone Annotations plugin.
 - [Ink iCloud-resilient persistence](2026-07-17-ink-icloud-resilient-persistence.md)
 - [Ink explicit-commit and Canvas presentation foundation](2026-07-20-ink-explicit-commit-session.md)
 - [Ink responsive commands, save, and Preview](2026-07-20-ink-responsive-commands-save-and-preview.md)
+- [Ink retained tile scene and Worker rasterization](2026-07-20-ink-retained-tile-scene-and-worker-rasterization.md)
+- [Ink simple snapshot persistence](2026-07-21-ink-simple-snapshot-persistence.md)
 - [Entire Vault demand-bounded local index and automated Gate](2026-07-19-entire-vault-demand-bounded-index.md)
 - [Preact UI architecture refactor specification](2026_07_15_refactor_to_preact.md)
 
@@ -67,6 +69,8 @@ are no longer valid sources of truth.
 - `docs/specs/2026-07-17-ink-icloud-resilient-persistence.md`
 - `docs/specs/2026-07-20-ink-explicit-commit-session.md`
 - `docs/specs/2026-07-20-ink-responsive-commands-save-and-preview.md`
+- `docs/specs/2026-07-20-ink-retained-tile-scene-and-worker-rasterization.md`
+- `docs/specs/2026-07-21-ink-simple-snapshot-persistence.md`
 - `docs/specs/2026-07-19-entire-vault-demand-bounded-index.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`
 - `docs/specs/2026-07-15-preact-execution-plan-update.md`
@@ -90,6 +94,9 @@ are no longer valid sources of truth.
   Preview budgets; requires one command-to-presentation transaction, feedback-first Done, exact
   read-only Preview projection, disposable device-local raster caching, and interactive/visible/cold
   scheduling lanes.
+- The 2026-07-21 simple-snapshot specification replaces concurrent multi-surface persistence with
+  memory-first editing, one Last-Done-Wins `ink.json`, and an optional one-record idle draft. Legacy
+  bounded surfaces become read-only migration input.
 - Supporting design images moved with the plan so all relative references remain repository-local.
 
 ### Verification evidence

@@ -209,12 +209,33 @@ describe('S27R6 Local Obsidian Performance Gate', () => {
     const first = capture.conditions[0];
     if (first === undefined) throw new Error('Missing local Gate condition fixture.');
     first.diagnostics.hangingSpanCount = 1;
+    first.diagnostics.hangingSpans = [
+      { count: 1, name: 'ink-command-to-submit', workPhase: 'command' },
+    ];
 
     expect(
       analyzeLocalObsidianCapture(capture).budgets.find(
         (budget) => budget.name === 'hanging-span-count',
       ),
     ).toMatchObject({ actual: 1, limit: 0, status: 'FAIL' });
+  });
+
+  it('allows Done to leave only best-effort Preview spans active', () => {
+    const capture = validCapture();
+    const done = capture.conditions.find(({ trace }) => trace === 'done-save');
+    if (done === undefined) throw new Error('Missing local Gate Done fixture.');
+    done.diagnostics.hangingSpanCount = 3;
+    done.diagnostics.hangingSpans = [
+      { count: 1, name: 'ink-preview-cache-lookup', workPhase: 'preview' },
+      { count: 1, name: 'ink-preview-first-ink', workPhase: 'preview' },
+      { count: 1, name: 'ink-preview-viewport-complete', workPhase: 'preview' },
+    ];
+
+    expect(
+      analyzeLocalObsidianCapture(capture).budgets.find(
+        (budget) => budget.name === 'hanging-span-count',
+      ),
+    ).toMatchObject({ actual: 0, limit: 0, status: 'PASS' });
   });
 
   it('fails closed when a measured input contact remains open', () => {
@@ -519,6 +540,34 @@ describe('S27R6 Local Obsidian Performance Gate', () => {
         (budget) => budget.name === 'active-contact-viewport-redraw-count',
       ),
     ).toMatchObject({ actual: 1, status: 'FAIL' });
+  });
+
+  it('requires one settled viewport redraw and rejects redraw churn', () => {
+    const capture = validCapture();
+    const viewport = capture.conditions.find(({ trace }) => trace === 'viewport');
+    if (viewport === undefined) throw new Error('Missing viewport condition fixture.');
+    viewport.diagnostics.recentSpans.push(
+      {
+        accepted: true,
+        durationMs: 1,
+        name: 'ink-viewport-redraw',
+        viewportResultCount: 1,
+        workPhase: 'viewport',
+      },
+      {
+        accepted: true,
+        durationMs: 1,
+        name: 'ink-viewport-redraw',
+        viewportResultCount: 1,
+        workPhase: 'viewport',
+      },
+    );
+
+    expect(
+      analyzeLocalObsidianCapture(capture).budgets.find(
+        ({ name }) => name === 'viewport-redraw-coalescing',
+      ),
+    ).toMatchObject({ status: 'FAIL' });
   });
 
   it('fails closed when capture provenance does not declare the explicit-commit architecture', () => {
@@ -913,7 +962,7 @@ function diagnostics(strokeCount: number, moveCount: number, viewport = false) {
     });
   }
   if (viewport) {
-    for (let index = 0; index < 5; index += 1) {
+    for (let index = 0; index < 1; index += 1) {
       recentSpans.push({
         accepted: true,
         durationMs: 8,
@@ -938,6 +987,7 @@ function diagnostics(strokeCount: number, moveCount: number, viewport = false) {
       idle: Array.from({ length: 120 }, () => 16.67),
     },
     hangingSpanCount: 0,
+    hangingSpans: [] as Array<{ count: number; name: string; workPhase: string }>,
     memory: {
       activeWorkingSetBytes: 1_000_000,
       backingStoreBytes: 8_000_000,

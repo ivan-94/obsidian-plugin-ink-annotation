@@ -62,6 +62,35 @@ function menuRecorder<Item extends { icon?: string; onClick?: () => void; title?
 }
 
 describe('Obsidian Ink Mode action', () => {
+  it('prefers the one-file snapshot and does not scan legacy surfaces when it exists', async () => {
+    const snapshot = inkSurface('Ink.md');
+    const listSurfaces = vi.fn(() => Promise.resolve({ conflicts: [], issues: [], records: [] }));
+    const read = vi.fn(() => Promise.resolve(snapshot));
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: { listSurfaces } as never,
+      inkSnapshotRepository: { read } as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+
+    const loaded = await (
+      manager as unknown as {
+        observeCanonicalSurfaces: (
+          filePath: string,
+          refresh: boolean,
+        ) => Promise<LoadedInkSurfacesForTest>;
+      }
+    ).observeCanonicalSurfaces('Ink.md', true);
+
+    expect(loaded.records).toEqual([snapshot]);
+    expect(read).toHaveBeenCalledWith('Ink.md');
+    expect(listSurfaces).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
   it('does not treat a transient window blur as a confirmed background-idle save signal', async () => {
     const manager = new ObsidianInkModeManager({
       app: { workspace: { getLeavesOfType: () => [] } } as never,
@@ -2838,6 +2867,38 @@ describe('Obsidian Ink Mode action', () => {
     manager.dispose();
   });
 
+  it('does not interrupt the active personal editor for an external sidecar event', async () => {
+    const view = { contentEl: document.createElement('div') } as unknown as MarkdownView;
+    const dispose = vi.fn();
+    const exit = vi.fn(() => Promise.resolve());
+    const manager = new ObsidianInkModeManager({
+      app: { workspace: { getActiveViewOfType: () => view, getLeavesOfType: () => [] } } as never,
+      deviceId: 'device-a',
+      document,
+      inkRepository: {} as never,
+      preferenceStore: {} as never,
+      textRepository: {} as never,
+    });
+    const privateManager = manager as unknown as {
+      activeView: MarkdownView | null;
+      mounted: Map<MarkdownView, unknown>;
+    };
+    privateManager.activeView = view;
+    privateManager.mounted.set(view, {
+      complete: true,
+      controller: { dispose, exit },
+      filePath: 'Ink.md',
+      session: {},
+    });
+
+    await manager.refreshFile('Ink.md');
+
+    expect(exit).not.toHaveBeenCalled();
+    expect(dispose).not.toHaveBeenCalled();
+    expect(privateManager.mounted.has(view)).toBe(true);
+    manager.dispose();
+  });
+
   it('recomputes the primary action from canonical Ink after a whole-surface deletion', async () => {
     const getContext = vi
       .spyOn(HTMLCanvasElement.prototype, 'getContext')
@@ -3601,6 +3662,7 @@ function canvasContext(): CanvasRenderingContext2D {
   return {
     beginPath: vi.fn(),
     clearRect: vi.fn(),
+    drawImage: vi.fn(),
     lineCap: 'round',
     lineJoin: 'round',
     lineTo: vi.fn(),

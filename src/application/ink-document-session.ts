@@ -20,11 +20,16 @@ import {
   type InkSurfaceWriter,
 } from './ink-surface-session';
 import type { InkDraftOperation } from './ink-draft-store';
+import type { InkDocumentDraftStore } from './ink-document-draft-store';
 
 const SHARED_INK_GEOMETRY = new SharedInkStrokeGeometry();
 const DEFAULT_INACTIVITY_MS = 60_000;
 const MINIMUM_INACTIVITY_MS = 30_000;
 const COLD_WORK_CHUNK_BUDGET_MS = 1;
+const IN_MEMORY_ONLY_SURFACE_WRITER: InkSurfaceWriter = Object.freeze({
+  updateSurface: (record: InkSurfaceRecord) => Promise.resolve(record),
+  updateSurfacesAtomically: (records: readonly InkSurfaceRecord[]) => Promise.resolve(records),
+});
 
 export interface InkColdWorkScheduler {
   now(): number;
@@ -149,6 +154,7 @@ export class InkLiveDocument {
   private readonly bounded: readonly BoundedSession[];
   private boundedMutationDepth = 0;
   private readonly coldWorkScheduler: InkColdWorkScheduler;
+  private readonly draftStore: InkDocumentDraftStore | undefined;
   private readonly committedCommands = new Map<string, InkDocumentApplyResult>();
   private readonly dirtyLogicalStrokeRevision = new Map<string, number>();
   private readonly instrumentation: InkLiveDocumentInstrumentation;
@@ -156,7 +162,16 @@ export class InkLiveDocument {
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly logicalRefsById = new Map<string, InkRenderableStrokeRef>();
   private readonly onChange: (read: InkDocumentReadView, change: InkDocumentChange | null) => void;
+  private readonly onPersistenceIssue: (error: unknown) => void;
   private readonly noteKey: string;
+  private readonly now: () => string;
+  private readonly persistencePolicy: 'explicit-exit' | 'legacy-idle-and-exit';
+  private readonly snapshotStore:
+    { readonly replace: (snapshot: InkSurfaceRecord) => Promise<void> } | undefined;
+  private explicitPersistence: InkPersistenceState = { kind: 'idle' };
+  private explicitSaveError: unknown = null;
+  private explicitState: InkModeState = { dirty: false, kind: 'ink-mode', saveError: null };
+  private lastSavedSnapshot: InkSurfaceRecord | null = null;
   private orderedProjectionCache: readonly InkRenderableStrokeRef[] = Object.freeze([]);
   private orderedProjectionCacheRevision = -1;
   private orderedProjectionRevision = 0;
@@ -169,7 +184,7 @@ export class InkLiveDocument {
   private liveDirtyRevision = 0;
   private liveFlushPromise: Promise<void> | null = null;
   private livePersistedRevision = 0;
-  private readonly persistenceWriter: CoalescingInkSurfaceWriter;
+  private readonly persistenceWriter: CoalescingInkSurfaceWriter | null;
   private readonly projectedSurfaceIdsByLogicalStrokeId = new Map<string, Set<string>>();
   private readView: InkDocumentReadView;
   private readonly redoStack: InkDocumentHistoryEntry[] = [];
@@ -184,18 +199,31 @@ export class InkLiveDocument {
     readonly coldWorkScheduler?: InkColdWorkScheduler;
     readonly debounceMs?: number;
     readonly draftOperations?: readonly InkDraftOperation[];
+    readonly draftStore?: InkDocumentDraftStore;
     readonly inactivityMs?: number;
+    readonly initialDraftRevision?: number;
     readonly instrumentation?: InkLiveDocumentInstrumentation;
     readonly now?: () => string;
     readonly onChange?: (read: InkDocumentReadView, change: InkDocumentChange | null) => void;
     readonly onPersistenceIssue?: (error: unknown) => void;
+    readonly persistencePolicy?: 'explicit-exit' | 'legacy-idle-and-exit';
+    readonly snapshotStore?: {
+      readonly replace: (snapshot: InkSurfaceRecord) => Promise<void>;
+    };
     readonly surfaces: readonly InkSurfaceRecord[];
-    readonly writer: InkSurfaceWriter;
+    readonly writer?: InkSurfaceWriter;
   }) {
     if (input.surfaces.length === 0) {
       throw new Error('A continuous Ink document requires at least one bounded surface.');
     }
-    if (input.surfaces.length > 1 && input.writer.updateSurfacesAtomically === undefined) {
+    if (input.snapshotStore === undefined && input.writer === undefined) {
+      throw new Error('An Ink document requires a snapshot store or a legacy surface writer.');
+    }
+    if (
+      input.snapshotStore === undefined &&
+      input.surfaces.length > 1 &&
+      input.writer?.updateSurfacesAtomically === undefined
+    ) {
       throw new Error('A multi-chunk Ink document requires an atomic persistence writer.');
     }
     const activeSchemaVersions = new Set(
@@ -221,19 +249,25 @@ export class InkLiveDocument {
       throw new Error('All bounded Ink surfaces must share one fixed logical width.');
     }
     this.onChange = input.onChange ?? (() => undefined);
+    this.onPersistenceIssue = input.onPersistenceIssue ?? (() => undefined);
     this.instrumentation = input.instrumentation ?? {};
     this.coldWorkScheduler = input.coldWorkScheduler ?? DEFAULT_COLD_WORK_SCHEDULER;
     this.inactivityMs = input.inactivityMs ?? DEFAULT_INACTIVITY_MS;
+    this.now = input.now ?? (() => new Date().toISOString());
+    this.persistencePolicy = input.persistencePolicy ?? 'legacy-idle-and-exit';
+    this.snapshotStore = input.snapshotStore;
+    this.draftStore = input.draftStore;
     if (!Number.isFinite(this.inactivityMs) || this.inactivityMs < MINIMUM_INACTIVITY_MS) {
       throw new Error(
         `Ink sustained inactivity must be at least ${MINIMUM_INACTIVITY_MS} milliseconds.`,
       );
     }
     this.instrumentation.onAuditGuard?.('canonical-cold-materialization');
-    this.persistenceWriter = new CoalescingInkSurfaceWriter(input.writer, () =>
-      this.waitForInteractionIdle(),
-    );
-    const writer = this.persistenceWriter;
+    this.persistenceWriter =
+      input.snapshotStore === undefined && input.writer !== undefined
+        ? new CoalescingInkSurfaceWriter(input.writer, () => this.waitForInteractionIdle())
+        : null;
+    const writer = this.persistenceWriter ?? IN_MEMORY_ONLY_SURFACE_WRITER;
     let startY = 0;
     this.bounded = surfaces.map((surface) => {
       if (surface.schemaVersion >= 2) startY = surface.layout.originY as number;
@@ -256,6 +290,8 @@ export class InkLiveDocument {
       return bounded;
     });
     const snapshots = this.bounded.map((bounded) => bounded.session.snapshot());
+    this.explicitPersistence = aggregatePersistence(snapshots);
+    this.explicitState = aggregateState(snapshots);
     this.rebuildProjectedSurfaceIndex(snapshots);
     const logicalStrokes = compositeSurface(this.bounded, snapshots).strokes.filter(
       (stroke) => stroke.tool !== 'eraser',
@@ -289,6 +325,14 @@ export class InkLiveDocument {
       strokes: this.orderedStrokeProjection,
     });
     this.replayDraftOperations(input.draftOperations ?? []);
+    if (input.initialDraftRevision !== undefined) {
+      if (!Number.isSafeInteger(input.initialDraftRevision) || input.initialDraftRevision <= 0) {
+        throw new Error('Ink recovered Draft revision must be a positive safe integer.');
+      }
+      this.liveDirtyRevision = Math.max(this.liveDirtyRevision, input.initialDraftRevision);
+      this.explicitState = { dirty: true, kind: 'ink-mode', saveError: null };
+      this.readView = Object.freeze({ ...this.readView, state: this.explicitState });
+    }
     this.scheduleSustainedInactivitySave();
   }
 
@@ -331,6 +375,16 @@ export class InkLiveDocument {
     }
     this.liveDirtyRevision += 1;
     this.markDirtyChange(change, this.liveDirtyRevision);
+    if (this.persistencePolicy === 'explicit-exit') {
+      this.explicitSaveError = null;
+      this.explicitPersistence = { kind: 'idle' };
+      this.explicitState = { dirty: true, kind: 'ink-mode', saveError: null };
+      this.readView = Object.freeze({
+        ...this.readView,
+        persistence: this.explicitPersistence,
+        state: this.explicitState,
+      });
+    }
     this.noteUserInteraction();
     const result = Object.freeze({ change, kind: 'committed' as const });
     this.committedCommands.set(normalized.id, result);
@@ -517,6 +571,9 @@ export class InkLiveDocument {
 
   /** Exact bounded canonical projection after Done; shares immutable records and owns no editor. */
   canonicalProjectionRecords(): readonly InkSurfaceRecord[] {
+    if (this.persistencePolicy === 'explicit-exit' && this.lastSavedSnapshot !== null) {
+      return Object.freeze([this.lastSavedSnapshot]);
+    }
     return Object.freeze(this.bounded.map(({ session }) => session.snapshot().surface));
   }
 
@@ -1168,11 +1225,94 @@ export class InkLiveDocument {
   }
 
   async background(): Promise<void> {
+    if (this.persistencePolicy === 'explicit-exit') {
+      await this.persistLatestDraft();
+      return;
+    }
     await this.flushLiveDocument('background', this.interactionEpoch);
   }
 
+  private async persistLatestDraft(): Promise<void> {
+    if (
+      this.draftStore === undefined ||
+      this.liveDirtyRevision <= this.livePersistedRevision ||
+      this.interactionActive
+    ) {
+      return;
+    }
+    await this.waitForInteractionIdle();
+    if (this.interactionActive || this.liveDirtyRevision <= this.livePersistedRevision) return;
+    try {
+      const snapshot = {
+        ...this.materializeColdSnapshot().surface,
+        updatedAt: this.now(),
+      };
+      await this.draftStore.replace({
+        noteKey: this.noteKey,
+        revision: this.liveDirtyRevision,
+        snapshot,
+      });
+    } catch (error) {
+      this.onPersistenceIssue(error);
+    }
+  }
+
   async exit(): Promise<void> {
+    if (this.persistencePolicy === 'explicit-exit' && this.snapshotStore !== undefined) {
+      await this.persistExplicitSnapshot();
+      return;
+    }
     await this.flushLiveDocument('exit', null);
+  }
+
+  private async persistExplicitSnapshot(): Promise<void> {
+    await this.waitForInteractionIdle();
+    this.clearInactivityTimer();
+    if (this.liveDirtyRevision <= this.livePersistedRevision) {
+      this.explicitState = { kind: 'reading' };
+      this.emit();
+      return;
+    }
+
+    this.explicitState = { intent: 'exit', kind: 'saving' };
+    this.explicitPersistence = { kind: 'saving' };
+    this.emit();
+    const finish = this.instrumentation.beginPersistenceSpan?.('canonical-submit');
+    try {
+      this.recordPersistenceWork('cold-snapshot');
+      const snapshot = {
+        ...this.materializeColdSnapshot().surface,
+        updatedAt: this.now(),
+      };
+      this.recordPersistenceWork('canonical-encode');
+      this.recordPersistenceWork('canonical-storage-write');
+      await this.snapshotStore?.replace(snapshot);
+      this.lastSavedSnapshot = snapshot;
+      this.livePersistedRevision = this.liveDirtyRevision;
+      this.dirtyLogicalStrokeRevision.clear();
+      this.explicitSaveError = null;
+      this.explicitState = { kind: 'reading' };
+      this.explicitPersistence = { kind: 'saved-locally' };
+      void this.draftStore?.discard(this.noteKey).catch(this.onPersistenceIssue);
+      finish?.(true);
+      this.emit();
+    } catch (error) {
+      this.explicitSaveError = error;
+      this.explicitState = {
+        dirty: true,
+        kind: 'ink-mode',
+        pendingIntent: 'exit',
+        saveError: "Couldn't save Ink locally. Retry.",
+      };
+      this.explicitPersistence = {
+        error,
+        kind: 'error',
+        message: "Couldn't save Ink locally. Retry.",
+      };
+      finish?.(false);
+      this.emit();
+      throw error;
+    }
   }
 
   private async flushLiveDocument(
@@ -1526,6 +1666,13 @@ export class InkLiveDocument {
   }
 
   private async retryPersistence(): Promise<void> {
+    if (this.persistencePolicy === 'explicit-exit' && this.snapshotStore !== undefined) {
+      if (this.explicitSaveError === null) {
+        throw new Error('There is no failed Ink snapshot save to retry.');
+      }
+      await this.persistExplicitSnapshot();
+      return;
+    }
     const failed = this.bounded.filter((bounded) => {
       const state = bounded.session.snapshot().state;
       return state.kind === 'ink-mode' && state.saveError !== null;
@@ -1564,7 +1711,8 @@ export class InkLiveDocument {
     const previous = this.readView;
     const snapshots = this.bounded.map((bounded) => bounded.session.snapshot());
     const persistence = this.effectivePersistence(snapshots);
-    const state = aggregateState(snapshots);
+    const state =
+      this.persistencePolicy === 'explicit-exit' ? this.explicitState : aggregateState(snapshots);
     const logicalHeight = this.bounded.at(-1)?.endY ?? previous.logicalHeight;
     const selection = Object.freeze([...this.selectedStrokeIdsSet]);
     if (
@@ -1604,6 +1752,7 @@ export class InkLiveDocument {
   private effectivePersistence(
     snapshots: readonly InkSurfaceSessionSnapshot[],
   ): InkPersistenceState {
+    if (this.persistencePolicy === 'explicit-exit') return this.explicitPersistence;
     const boundedPersistence = aggregatePersistence(snapshots);
     return boundedPersistence;
   }

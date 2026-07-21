@@ -117,6 +117,52 @@ describe('Ink canvas viewport rendering', () => {
     controller.dispose();
   });
 
+  it('coalesces a native scroll burst into one measured Camera projection frame', () => {
+    const scrollContainer = document.createElement('div');
+    const root = document.createElement('div');
+    scrollContainer.append(root);
+    document.body.append(scrollContainer);
+    let rootTop = 0;
+    vi.spyOn(scrollContainer, 'getBoundingClientRect').mockReturnValue(rect(0, 0, 960, 200));
+    const layoutMeasurement = vi
+      .spyOn(root, 'getBoundingClientRect')
+      .mockImplementation(() => rect(0, rootTop, 704, 1_200));
+    Object.defineProperties(scrollContainer, {
+      clientHeight: { value: 200 },
+      clientWidth: { value: 960 },
+    });
+    const controller = new InkCanvasController({
+      document,
+      root,
+      scrollContainer,
+      session: new ViewportSession(surface([stroke('history', 400)])),
+    });
+    const retainedScene = root.querySelector<HTMLElement>('[data-inkstone-committed-tile-scene]');
+    const projectionFrames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      projectionFrames.push(callback);
+      return projectionFrames.length;
+    });
+    vi.stubGlobal('cancelAnimationFrame', () => undefined);
+    layoutMeasurement.mockClear();
+
+    for (let offset = 1; offset <= 120; offset += 1) {
+      rootTop = -offset;
+      scrollContainer.dispatchEvent(new Event('scroll'));
+    }
+
+    expect(projectionFrames).toHaveLength(1);
+    expect(layoutMeasurement).not.toHaveBeenCalled();
+
+    projectionFrames.shift()?.(performance.now());
+
+    // The one Camera projection reads the layout box and its containing scale; raw scroll events
+    // must not multiply those reads.
+    expect(layoutMeasurement).toHaveBeenCalledTimes(2);
+    expect(retainedScene?.style.transform).toBe('matrix(1, 0, 0, 1, 0, -120)');
+    controller.dispose();
+  });
+
   it('does not clear or redraw Active geometry when the Stage Frame changes mid-contact', () => {
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
       callback(performance.now());

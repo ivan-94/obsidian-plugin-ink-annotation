@@ -21,6 +21,7 @@ import {
   waitForLocalPerformanceFrame,
   waitForLocalPerformanceSpansToSettle,
   waitForLocalCommandPresentationFrames,
+  waitForLocalResponsiveCommandScene,
   runLocalPerformanceHostHeartbeat,
   runLocalInitialFrameStringingCanary,
   runLocalReplayColdLaneYield,
@@ -180,6 +181,19 @@ describe('local Obsidian performance Gate request', () => {
     expect(frameCount).toBe(2);
   });
 
+  it('does not begin responsive command sampling before the first exact Edit scene', async () => {
+    let frameCount = 0;
+    await waitForLocalResponsiveCommandScene({
+      readVisibleRecoveryCount: () => (frameCount >= 3 ? 1 : 0),
+      waitForFrame: () => {
+        frameCount += 1;
+        return Promise.resolve();
+      },
+    });
+
+    expect(frameCount).toBe(3);
+  });
+
   it('uses the fixed replay size of each non-drawing condition', () => {
     const inputHandlers = Array.from({ length: 200 }, () => ({
       accepted: true,
@@ -210,13 +224,13 @@ describe('local Obsidian performance Gate request', () => {
     expect(
       localViewportSampleCounts({
         ...base,
-        recentSpans: [...base.recentSpans, ...viewport],
+        recentSpans: [...base.recentSpans, ...viewport.slice(0, 1)],
       }),
-    ).toEqual({ commits: 20, idle: 120, moves: 200, passed: true, viewport: 5 });
+    ).toEqual({ commits: 20, idle: 120, moves: 200, passed: true, viewport: 1 });
     expect(
       localViewportSampleCounts({
         ...base,
-        recentSpans: [...base.recentSpans, ...viewport.slice(1)],
+        recentSpans: base.recentSpans,
       }).passed,
     ).toBe(false);
     expect(
@@ -437,6 +451,27 @@ describe('local Obsidian performance Gate request', () => {
     });
 
     expect(yields).toBe(2);
+  });
+
+  it('does not make Done wait for an unrelated best-effort Preview span', async () => {
+    let yields = 0;
+    await waitForLocalPerformanceSpansToSettle({
+      isSettled: (snapshot) => localDoneSampleCounts(snapshot).passed,
+      snapshot: () => ({
+        frameIntervalsMs: { idle: Array.from({ length: 120 }, () => 8.3) },
+        hangingSpanCount: 1,
+        recentSpans: [
+          { accepted: true, name: 'ink-done-first-feedback' },
+          { accepted: true, name: 'ink-done-total' },
+        ],
+      }),
+      waitForSettlement: () => {
+        yields += 1;
+        return Promise.resolve();
+      },
+    });
+
+    expect(yields).toBe(0);
   });
 
   it('fails a Done condition whose asynchronous spans never settle', async () => {

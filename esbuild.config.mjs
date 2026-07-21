@@ -1,4 +1,5 @@
 import esbuild from 'esbuild';
+import { createHash } from 'node:crypto';
 import process from 'node:process';
 
 const production = process.argv[2] === 'production';
@@ -10,6 +11,21 @@ const unpublishedPhysicalInkHat =
     process.env.INKSTONE_UNPUBLISHED_PHYSICAL_INK_HAT === '1') ||
   localPerformanceGate;
 
+const tileWorkerBuild = await esbuild.build({
+  bundle: true,
+  entryPoints: ['src/runtime/ink-tile-worker-entry.ts'],
+  format: 'iife',
+  logLevel: 'silent',
+  minify: production,
+  platform: 'browser',
+  target: 'es2018',
+  write: false,
+});
+const tileWorkerSource = tileWorkerBuild.outputFiles[0]?.text;
+if (tileWorkerSource === undefined)
+  throw new Error('Ink Tile Worker artifact build produced no output.');
+const tileWorkerDigest = createHash('sha256').update(tileWorkerSource).digest('hex');
+
 const context = await esbuild.context({
   banner: {
     js: `/* Inkstone Annotations - generated bundle; unpublished-physical-ink-hat=${String(unpublishedPhysicalInkHat)}; local-performance-gate=${String(localPerformanceGate)} */`,
@@ -18,6 +34,8 @@ const context = await esbuild.context({
   define: {
     __INKSTONE_UNPUBLISHED_PHYSICAL_INK_HAT__: JSON.stringify(unpublishedPhysicalInkHat),
     __INKSTONE_LOCAL_PERFORMANCE_GATE__: JSON.stringify(localPerformanceGate),
+    __INKSTONE_TILE_WORKER_DIGEST__: JSON.stringify(tileWorkerDigest),
+    __INKSTONE_TILE_WORKER_SOURCE__: JSON.stringify(tileWorkerSource),
   },
   entryPoints: ['src/main.ts'],
   // Obsidian supplies its own CodeMirror instance. Externalizing these packages avoids

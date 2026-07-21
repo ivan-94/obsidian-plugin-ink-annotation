@@ -27,6 +27,7 @@ import {
   findInkSurfaceCanonicalProjectionBlock,
   type InkSurfaceRepository,
 } from '../../storage/ink-surface-repository';
+import type { InkDocumentSnapshotRepository } from '../../storage/ink-document-snapshot-repository';
 import { normalizeVaultPath, type SidecarRepository } from '../../storage/sidecar-repository';
 import { InkCanvasController } from '../../ui/ink-canvas-controller';
 import { InkGeometryCacheCoordinator } from '../../ui/ink-geometry-cache';
@@ -46,6 +47,7 @@ import type {
   InkWorkerPresentationRuntimeOptions,
 } from '../../ui/ink-render-runtime';
 import type { InkSurfaceSummary } from '../../domain/ink-surface-summary';
+import type { InkDocumentDraftStore } from '../../application/ink-document-draft-store';
 import type { LocalInkToolPreferenceStore } from '../../storage/local-ink-tool-preference';
 import {
   type InkLegacyRecoveryReader,
@@ -149,7 +151,9 @@ export class ObsidianInkModeManager {
       readonly document: Document;
       readonly exportUnsavedInk?: (surface: InkSurfaceRecord) => Promise<string>;
       readonly inkPerformance?: InkPerformanceRecorder;
+      readonly inkDraftStore?: InkDocumentDraftStore;
       readonly inkRepository: InkSurfaceRepository;
+      readonly inkSnapshotRepository?: InkDocumentSnapshotRepository;
       readonly onIssue?: (error: unknown) => void;
       readonly onWillEnter?: () => void;
       readonly preferenceStore: LocalInkToolPreferenceStore;
@@ -694,6 +698,14 @@ export class ObsidianInkModeManager {
   async refreshFile(filePath: string): Promise<void> {
     await this.scheduleLifecycle(async () => {
       this.canonicalObservations.delete(normalizeVaultPath(filePath));
+      const active = this.activeView === null ? undefined : this.mounted.get(this.activeView);
+      if (
+        active !== undefined &&
+        isEditableMount(active) &&
+        normalizeVaultPath(active.filePath) === normalizeVaultPath(filePath)
+      ) {
+        return;
+      }
       await this.prepareFileMutationNow(filePath);
       for (const [view, mounted] of this.mounted) {
         if (mounted.filePath === filePath) this.disposeMount(view);
@@ -1116,11 +1128,32 @@ export class ObsidianInkModeManager {
       sourceFingerprint: sourceRevision,
     });
     existing = [
-      ...(this.legacyRecoveryReader === undefined
+      ...(this.legacyRecoveryReader === undefined || this.input.inkSnapshotRepository !== undefined
         ? existing
         : await this.restoreLocalRecovery(filePath, existing)),
     ];
     existing = [...orderPositionedInkSurfaceRecords(existing)];
+    let recoveredDraftRevision: number | undefined;
+    if (this.input.inkSnapshotRepository !== undefined && this.input.inkDraftStore !== undefined) {
+      try {
+        const draft = await this.input.inkDraftStore.load(filePath);
+        const canonicalUpdatedAt =
+          existing
+            .map(({ updatedAt }) => updatedAt)
+            .sort()
+            .at(-1) ?? '';
+        if (
+          draft !== null &&
+          normalizeVaultPath(draft.snapshot.filePath) === normalizeVaultPath(filePath) &&
+          draft.snapshot.updatedAt > canonicalUpdatedAt
+        ) {
+          existing = [draft.snapshot];
+          recoveredDraftRevision = draft.revision;
+        }
+      } catch (error) {
+        console.warn('[Inkstone Annotations] Ignoring unavailable best-effort Ink Draft.', error);
+      }
+    }
 
     if (
       this.disposed ||
@@ -1162,8 +1195,10 @@ export class ObsidianInkModeManager {
     let canonicalSurfaces =
       existing.length > 0 ? baseSurfaces : ensureInkCanvasExtent(baseSurfaces, minimumTotalHeight);
     if (existing.length === 0) {
-      for (const created of canonicalSurfaces) {
-        await this.input.inkRepository.writeSurface(created);
+      if (this.input.inkSnapshotRepository === undefined) {
+        for (const created of canonicalSurfaces) {
+          await this.input.inkRepository.writeSurface(created);
+        }
       }
     }
     if (
@@ -1171,11 +1206,15 @@ export class ObsidianInkModeManager {
       canonicalSurfaces.some(({ schemaVersion }) => schemaVersion < 3)
     ) {
       const upgraded = upgradeInkSurfaceRecordsToV3(canonicalSurfaces, new Date().toISOString());
-      const committed = await this.input.inkRepository.upgradeSurfacesToSchemaV3(
-        upgraded,
-        canonicalSurfaces,
-      );
-      canonicalSurfaces = committed ?? upgraded;
+      if (this.input.inkSnapshotRepository === undefined) {
+        const committed = await this.input.inkRepository.upgradeSurfacesToSchemaV3(
+          upgraded,
+          canonicalSurfaces,
+        );
+        canonicalSurfaces = committed ?? upgraded;
+      } else {
+        canonicalSurfaces = upgraded;
+      }
     }
 
     if (
@@ -1207,6 +1246,7 @@ export class ObsidianInkModeManager {
 
     let controller: InkCanvasController | null = null;
     let releaseScheduledWorkInteraction: (() => void) | null = null;
+    const snapshotRepository = this.input.inkSnapshotRepository;
     const session = new InkLiveDocument({
       coldWorkScheduler: {
         now: () => performance.now(),
@@ -1244,8 +1284,14 @@ export class ObsidianInkModeManager {
           this.syncActions();
         }
       },
+      ...(snapshotRepository === undefined ? {} : { persistencePolicy: 'explicit-exit' as const }),
+      ...(snapshotRepository === undefined ? {} : { snapshotStore: snapshotRepository }),
+      ...(this.input.inkDraftStore === undefined ? {} : { draftStore: this.input.inkDraftStore }),
+      ...(recoveredDraftRevision === undefined
+        ? {}
+        : { initialDraftRevision: recoveredDraftRevision }),
       surfaces: canonicalSurfaces,
-      writer: this.input.inkRepository,
+      ...(snapshotRepository === undefined ? { writer: this.input.inkRepository } : {}),
     });
     session.ensureMinimumHeight(measureInkCanvasExtent(transientSurfaces));
     controller = new InkCanvasController({
@@ -1282,6 +1328,7 @@ export class ObsidianInkModeManager {
       root: scrollContainer,
       scrollContainer,
       session,
+      workScheduler: this.workScheduler,
       ...(this.input.unpublishedPhysicalInkHat === undefined
         ? {}
         : {
@@ -1532,7 +1579,16 @@ export class ObsidianInkModeManager {
     const span = this.inkPerformance.beginSpan('ink-preview-canonical-observation', {
       workPhase: 'preview',
     });
-    const observation = this.input.inkRepository.listSurfaces(filePath);
+    const observation =
+      this.input.inkSnapshotRepository === undefined
+        ? this.input.inkRepository.listSurfaces(filePath)
+        : this.input.inkSnapshotRepository
+            .read(filePath)
+            .then((snapshot) =>
+              snapshot === null
+                ? this.input.inkRepository.listSurfaces(filePath)
+                : { conflicts: [], issues: [], records: [snapshot] },
+            );
     this.canonicalObservations.set(fileKey, observation);
     void observation.catch(() => {
       if (this.canonicalObservations.get(fileKey) === observation) {

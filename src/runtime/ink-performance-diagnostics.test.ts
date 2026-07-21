@@ -149,6 +149,32 @@ describe('InkPerformanceDiagnostics', () => {
     ]);
   });
 
+  it('reports unfinished spans by privacy-safe name and work phase', () => {
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const firstInk = diagnostics.beginSpan('ink-preview-first-ink', {
+      workPhase: 'preview',
+    });
+    diagnostics.beginSpan('ink-preview-viewport-complete', { workPhase: 'preview' });
+    diagnostics.beginSpan('ink-preview-first-ink', { workPhase: 'preview' });
+
+    expect(diagnostics.snapshot()).toMatchObject({
+      hangingSpanCount: 3,
+      hangingSpans: [
+        { count: 2, name: 'ink-preview-first-ink', workPhase: 'preview' },
+        { count: 1, name: 'ink-preview-viewport-complete', workPhase: 'preview' },
+      ],
+    });
+
+    firstInk.cancel();
+    expect(diagnostics.snapshot()).toMatchObject({
+      hangingSpanCount: 2,
+      hangingSpans: [
+        { count: 1, name: 'ink-preview-first-ink', workPhase: 'preview' },
+        { count: 1, name: 'ink-preview-viewport-complete', workPhase: 'preview' },
+      ],
+    });
+  });
+
   it('keeps Preview canonical, cache, first-pixel, and viewport stages separate', () => {
     const diagnostics = new InkPerformanceDiagnostics(true);
 

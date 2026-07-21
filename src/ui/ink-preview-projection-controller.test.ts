@@ -6,7 +6,10 @@ import { InkPreviewProjection } from '../application/ink-preview-projection';
 import type { InkSurfaceRecord } from '../domain/ink-surface';
 import { InkPerformanceDiagnostics } from '../runtime/ink-performance-diagnostics';
 import { InkWorkScheduler } from '../runtime/ink-work-scheduler';
-import type { InkPreviewCacheKey } from '../storage/indexeddb-ink-preview-cache';
+import type {
+  InkPreviewCacheKey,
+  InkPreviewCacheTileCoordinate,
+} from '../storage/indexeddb-ink-preview-cache';
 import { InkGeometryCacheCoordinator } from './ink-geometry-cache';
 import { InkPreviewProjectionController } from './ink-preview-projection-controller';
 
@@ -29,7 +32,7 @@ describe('InkPreviewProjectionController', () => {
       document,
       projection: new InkPreviewProjection([surface()]),
       requestFrame: (callback) => {
-        callback(0);
+        queueMicrotask(() => callback(0));
         return 1;
       },
       root,
@@ -91,13 +94,6 @@ describe('InkPreviewProjectionController', () => {
     expect(overlay!.style.left).toBe('0px');
     expect(overlay!.style.top).toBe('52px');
     expect(overlay!.getBoundingClientRect().top).toBe(124);
-    expect(
-      (
-        context.setTransform as unknown as {
-          readonly mock: { readonly calls: readonly unknown[][] };
-        }
-      ).mock.calls.at(-1),
-    ).toEqual([1, 0, 0, 1, 24, -44]);
     controller.dispose();
   });
 
@@ -146,7 +142,7 @@ describe('InkPreviewProjectionController', () => {
     controller.dispose();
   });
 
-  it('retains the presented bitmap until a scrolled replacement is ready', async () => {
+  it('retains an adopted tile resource while newly exposed coverage settles', async () => {
     const contexts = new Map<HTMLCanvasElement, CanvasRenderingContext2D>();
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
       this: HTMLCanvasElement,
@@ -197,27 +193,26 @@ describe('InkPreviewProjectionController', () => {
     controller.showPreview();
     frames.shift()?.(0);
     await vi.waitFor(() => {
-      const visible = scroll.querySelector<HTMLCanvasElement>('[data-inkstone-ink-preview-canvas]');
+      const visible = scroll.querySelector<HTMLCanvasElement>('[data-inkstone-retained-tile]');
       const context = visible === null ? undefined : contexts.get(visible);
-      expect(context === undefined ? [] : canvasCalls(context, 'stroke')).not.toHaveLength(0);
+      expect(context === undefined ? [] : canvasCalls(context, 'drawImage')).not.toHaveLength(0);
     });
-    const presented = scroll.querySelector<HTMLCanvasElement>('[data-inkstone-ink-preview-canvas]');
-    if (presented === null) throw new Error('Missing presented Preview Canvas.');
+    const presented = scroll.querySelector<HTMLCanvasElement>('[data-inkstone-retained-tile]');
+    if (presented === null) throw new Error('Missing presented Preview tile.');
+    const initialTileCount = scroll.querySelectorAll('[data-inkstone-retained-tile]').length;
     const presentedContext = contexts.get(presented);
-    if (presentedContext === undefined) throw new Error('Missing presented Preview context.');
+    if (presentedContext === undefined) throw new Error('Missing presented Preview tile context.');
     const clearsBeforeScroll = (
       presentedContext.clearRect as unknown as { readonly mock: { readonly calls: unknown[][] } }
     ).mock.calls.length;
     const backingBeforeScroll = { height: presented.height, width: presented.width };
 
     stallVisibleWork = true;
-    documentTop = -80;
+    documentTop = -512;
     scroll.dispatchEvent(new Event('scroll'));
     frames.shift()?.(16);
 
-    expect(scroll.querySelector('[data-inkstone-ink-preview-canvas]')).toBe(presented);
-    expect(presented.hidden).toBe(false);
-    expect(presented.style.transform).toContain('translate3d(0px, -80px, 0)');
+    expect(scroll.querySelector('[data-inkstone-retained-tile]')).toBe(presented);
     expect(presented.width).toBe(backingBeforeScroll.width);
     expect(presented.height).toBe(backingBeforeScroll.height);
     expect(
@@ -230,10 +225,10 @@ describe('InkPreviewProjectionController', () => {
 
     stallVisibleWork = false;
     deferredYield.release?.();
-    await vi.waitFor(() =>
-      expect(scroll.querySelector('[data-inkstone-ink-preview-canvas]')).not.toBe(presented),
-    );
-    expect(presented.hidden).toBe(true);
+    await Promise.resolve();
+    expect(initialTileCount).toBeGreaterThan(0);
+    expect(scroll.querySelectorAll('[data-inkstone-retained-tile]').length).toBeGreaterThan(0);
+    expect(scroll.querySelector('[data-inkstone-retained-tile]')).toBe(presented);
     controller.dispose();
   });
 
@@ -279,22 +274,28 @@ describe('InkPreviewProjectionController', () => {
       surfaceSetDigest: 'exact',
       vaultIdentity: 'vault',
     };
-    const load = vi.fn(() =>
-      Promise.resolve({
-        generation: 'cached',
-        tiles: [{ byteLength: 1, bytes: Uint8Array.of(1).buffer, x: 0, y: 0 }],
-      }),
+    const cachedHit = {
+      generation: 'cached',
+      tiles: [{ byteLength: 1, bytes: Uint8Array.of(1).buffer, lod: 0, x: 0, y: 0 }],
+    };
+    const load = vi.fn(() => Promise.resolve(cachedHit));
+    const loadRegion = vi.fn(
+      (key: InkPreviewCacheKey, coordinates: readonly InkPreviewCacheTileCoordinate[]) => {
+        void key;
+        void coordinates;
+        return Promise.resolve(cachedHit);
+      },
     );
     const close = vi.fn();
     const bitmap = { close } as unknown as CanvasImageSource;
     const controller = new InkPreviewProjectionController({
-      cache: { load, publish: vi.fn(() => Promise.resolve(true)) },
+      cache: { load, loadRegion, publish: vi.fn(() => Promise.resolve(true)) },
       cacheKey,
       decodeTile: () => Promise.resolve(bitmap),
       document,
       projection: new InkPreviewProjection([surface()]),
       requestFrame: (callback) => {
-        callback(0);
+        queueMicrotask(() => callback(0));
         return 1;
       },
       root,
@@ -304,9 +305,332 @@ describe('InkPreviewProjectionController', () => {
     controller.showPreview();
     await vi.waitFor(() => expect(canvasCalls(context, 'drawImage')).not.toHaveLength(0));
 
-    expect(load).toHaveBeenCalledWith(cacheKey);
+    expect(loadRegion).toHaveBeenCalledOnce();
+    expect(loadRegion.mock.calls[0]?.[0]).toBe(cacheKey);
+    expect(loadRegion.mock.calls[0]?.[1]?.[0]).toEqual({ lod: 0, x: 0, y: 0 });
+    expect(loadRegion.mock.calls[0]?.[1]?.filter(({ lod }) => lod === 0)).toHaveLength(9);
+    expect(loadRegion.mock.calls[0]?.[1]?.filter(({ lod }) => lod === -1)).toHaveLength(4);
+    expect(load).not.toHaveBeenCalled();
     expect(canvasCalls(context, 'stroke')).toHaveLength(0);
     expect(close).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
+  it('isolates a corrupt near-visible cache tile without discarding an exact visible hit', async () => {
+    const context = canvasContext();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context);
+    const root = document.createElement('div');
+    document.body.append(root);
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 512, 512));
+    const cacheKey: InkPreviewCacheKey = {
+      alphaContract: 'premultiplied-transparent-v1',
+      colorSpace: 'srgb',
+      devicePixelRatio: 1,
+      logicalTileSize: 512,
+      noteIdentity: 'note',
+      rendererVersion: 'renderer',
+      scaleBucket: 1,
+      surfaceSetDigest: 'exact',
+      vaultIdentity: 'vault',
+    };
+    const controller = new InkPreviewProjectionController({
+      cache: {
+        loadRegion: () =>
+          Promise.resolve({
+            generation: 'cached',
+            tiles: [
+              { byteLength: 1, bytes: Uint8Array.of(1).buffer, lod: 0, x: 0, y: 0 },
+              { byteLength: 1, bytes: Uint8Array.of(2).buffer, lod: 0, x: 1, y: 0 },
+            ],
+          }),
+        publish: () => Promise.resolve(true),
+      },
+      cacheKey,
+      decodeTile: (bytes) =>
+        new Uint8Array(bytes)[0] === 2
+          ? Promise.reject(new Error('corrupt near tile'))
+          : Promise.resolve({ close: vi.fn() } as unknown as CanvasImageSource),
+      document,
+      projection: new InkPreviewProjection([surface()]),
+      requestFrame: (callback) => {
+        queueMicrotask(() => callback(0));
+        return 1;
+      },
+      root,
+    });
+
+    controller.showPreview();
+    await vi.waitFor(() =>
+      expect(root.querySelectorAll('[data-inkstone-retained-tile]')).toHaveLength(1),
+    );
+
+    expect(canvasCalls(context, 'stroke')).toHaveLength(0);
+    controller.dispose();
+  });
+
+  it('presents one compatible parent tile before scheduling exact visible refinement', async () => {
+    const context = canvasContext();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context);
+    const root = document.createElement('div');
+    document.body.append(root);
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 960, 900));
+    const projection = new InkPreviewProjection([surface()]);
+    const prepareQuery = vi.spyOn(projection, 'prepareQuery');
+    const frames: FrameRequestCallback[] = [];
+    const loadRegion = vi.fn(
+      (_key: InkPreviewCacheKey, coordinates: readonly InkPreviewCacheTileCoordinate[]) => {
+        expect(coordinates).toContainEqual({ lod: -1, x: 0, y: 0 });
+        return Promise.resolve({
+          generation: 'cached',
+          tiles: [{ byteLength: 1, bytes: Uint8Array.of(1).buffer, lod: -1, x: 0, y: 0 }],
+        });
+      },
+    );
+    const controller = new InkPreviewProjectionController({
+      cache: { loadRegion, publish: () => Promise.resolve(true) },
+      cacheKey: {
+        alphaContract: 'premultiplied-transparent-v1',
+        colorSpace: 'srgb',
+        devicePixelRatio: 1,
+        logicalTileSize: 512,
+        noteIdentity: 'note',
+        rendererVersion: 'renderer',
+        scaleBucket: 1,
+        surfaceSetDigest: 'exact',
+        vaultIdentity: 'vault',
+      },
+      decodeTile: () => Promise.resolve({ close: vi.fn() } as unknown as CanvasImageSource),
+      document,
+      projection,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+      root,
+    });
+
+    controller.showPreview();
+    await vi.waitFor(() =>
+      expect(root.querySelector('[data-inkstone-retained-tile="cached:-1:0:0"]')).not.toBeNull(),
+    );
+
+    expect(prepareQuery).not.toHaveBeenCalled();
+    expect(frames.length).toBeGreaterThan(0);
+    controller.dispose();
+  });
+
+  it('demand-loads newly exposed cached coordinates on scroll without compiling canonical Geometry', async () => {
+    const context = canvasContext();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context);
+    const scroll = document.createElement('div');
+    const root = document.createElement('div');
+    scroll.append(root);
+    document.body.append(scroll);
+    Object.defineProperties(scroll, {
+      clientHeight: { configurable: true, value: 512 },
+      clientWidth: { configurable: true, value: 512 },
+    });
+    vi.spyOn(scroll, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 512, 512));
+    let documentTop = 0;
+    vi.spyOn(root, 'getBoundingClientRect').mockImplementation(
+      () => new DOMRect(0, documentTop, 960, 1_500),
+    );
+    const cacheKey: InkPreviewCacheKey = {
+      alphaContract: 'premultiplied-transparent-v1',
+      colorSpace: 'srgb',
+      devicePixelRatio: 1,
+      logicalTileSize: 512,
+      noteIdentity: 'note',
+      rendererVersion: 'renderer',
+      scaleBucket: 1,
+      surfaceSetDigest: 'exact',
+      vaultIdentity: 'vault',
+    };
+    const loadRegion = vi.fn(
+      (_key: InkPreviewCacheKey, coordinates: readonly InkPreviewCacheTileCoordinate[]) =>
+        Promise.resolve({
+          generation: 'cached',
+          tiles: coordinates.map(({ lod, x, y }) => ({
+            byteLength: 1,
+            bytes: Uint8Array.of(1).buffer,
+            lod,
+            x,
+            y,
+          })),
+        }),
+    );
+    const bitmap = { close: vi.fn() } as unknown as CanvasImageSource;
+    const controller = new InkPreviewProjectionController({
+      cache: {
+        loadRegion,
+        publish: vi.fn(() => Promise.resolve(true)),
+      },
+      cacheKey,
+      decodeTile: () => Promise.resolve(bitmap),
+      document,
+      projection: new InkPreviewProjection([surface()]),
+      requestFrame: (callback) => {
+        queueMicrotask(() => callback(0));
+        return 1;
+      },
+      root,
+      scrollContainer: scroll,
+    });
+
+    controller.showPreview();
+    await vi.waitFor(() => expect(loadRegion).toHaveBeenCalledTimes(1));
+    expect(loadRegion.mock.calls[0]?.[1]?.filter(({ lod }) => lod === 0)).toHaveLength(9);
+    expect(loadRegion.mock.calls[0]?.[1]?.filter(({ lod }) => lod === -1)).toHaveLength(4);
+    expect(loadRegion.mock.calls[0]?.[1]).toContainEqual({ lod: 0, x: -1, y: -1 });
+    expect(loadRegion.mock.calls[0]?.[1]).toContainEqual({ lod: 0, x: 1, y: 1 });
+    await vi.waitFor(() =>
+      expect(root.querySelectorAll('[data-inkstone-retained-tile]')).toHaveLength(13),
+    );
+    const initialNodeCount = root.querySelectorAll('[data-inkstone-retained-tile]').length;
+    const retained = root.querySelector('[data-inkstone-retained-tile]');
+    documentTop = -512;
+    scroll.dispatchEvent(new Event('scroll'));
+
+    await vi.waitFor(() => expect(loadRegion).toHaveBeenCalledTimes(2));
+    expect(loadRegion.mock.calls[1]?.[1]).toContainEqual({ lod: 0, x: 0, y: 1 });
+    expect(loadRegion.mock.calls[1]?.[1]).toContainEqual({ lod: 0, x: -1, y: 3 });
+    await vi.waitFor(() =>
+      expect(canvasCalls(context, 'drawImage').length).toBeGreaterThan(initialNodeCount),
+    );
+    await vi.waitFor(() =>
+      expect(root.querySelectorAll('[data-inkstone-retained-tile]').length).toBeGreaterThan(
+        initialNodeCount,
+      ),
+    );
+    expect(root.querySelector('[data-inkstone-retained-tile="cached:0:0:0"]')).toBe(retained);
+    expect(canvasCalls(context, 'stroke')).toHaveLength(0);
+    controller.dispose();
+  });
+
+  it('builds visible canonical Preview first, then retains bounded cold near tiles for scroll', async () => {
+    const context = canvasContext();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context);
+    const scroll = document.createElement('div');
+    const root = document.createElement('div');
+    scroll.append(root);
+    document.body.append(scroll);
+    Object.defineProperties(scroll, {
+      clientHeight: { configurable: true, value: 512 },
+      clientWidth: { configurable: true, value: 512 },
+    });
+    vi.spyOn(scroll, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 512, 512));
+    let documentTop = 0;
+    vi.spyOn(root, 'getBoundingClientRect').mockImplementation(
+      () => new DOMRect(0, documentTop, 960, 1_500),
+    );
+    const projection = new InkPreviewProjection([surface()]);
+    const prepareQuery = vi.spyOn(projection, 'prepareQuery');
+    const controller = new InkPreviewProjectionController({
+      document,
+      projection,
+      requestFrame: (callback) => {
+        queueMicrotask(() => callback(0));
+        return 1;
+      },
+      root,
+      scrollContainer: scroll,
+    });
+
+    controller.showPreview();
+    await vi.waitFor(() =>
+      expect(root.querySelectorAll('[data-inkstone-retained-tile]').length).toBeGreaterThan(1),
+    );
+    const first = root.querySelector('[data-inkstone-retained-tile]');
+    expect(first).not.toBeNull();
+    expect(
+      root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-preview-canvas]')?.hidden,
+    ).toBe(true);
+
+    documentTop = -512;
+    scroll.dispatchEvent(new Event('scroll'));
+
+    await vi.waitFor(() =>
+      expect(root.querySelectorAll('[data-inkstone-retained-tile]').length).toBeGreaterThan(2),
+    );
+    expect(root.querySelector('[data-inkstone-retained-tile]')).toBe(first);
+    expect(prepareQuery.mock.calls.length).toBeGreaterThan(2);
+    expect(root.querySelectorAll('[data-inkstone-retained-tile]').length).toBeLessThanOrEqual(64);
+    controller.dispose();
+  });
+
+  it('does not let a stalled scroll-region cache read block canonical replacement pixels', async () => {
+    const context = canvasContext();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context);
+    const scroll = document.createElement('div');
+    const root = document.createElement('div');
+    scroll.append(root);
+    document.body.append(scroll);
+    Object.defineProperties(scroll, {
+      clientHeight: { configurable: true, value: 512 },
+      clientWidth: { configurable: true, value: 512 },
+    });
+    vi.spyOn(scroll, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 512, 512));
+    let documentTop = 0;
+    vi.spyOn(root, 'getBoundingClientRect').mockImplementation(
+      () => new DOMRect(0, documentTop, 960, 1_500),
+    );
+    const cacheKey: InkPreviewCacheKey = {
+      alphaContract: 'premultiplied-transparent-v1',
+      colorSpace: 'srgb',
+      devicePixelRatio: 1,
+      logicalTileSize: 512,
+      noteIdentity: 'note',
+      rendererVersion: 'renderer',
+      scaleBucket: 1,
+      surfaceSetDigest: 'exact',
+      vaultIdentity: 'vault',
+    };
+    let lookup = 0;
+    const loadRegion = vi.fn(() => {
+      lookup += 1;
+      return lookup === 1
+        ? Promise.resolve({
+            generation: 'cached',
+            tiles: [{ byteLength: 1, bytes: Uint8Array.of(1).buffer, lod: 0, x: 0, y: 0 }],
+          })
+        : new Promise<null>(() => undefined);
+    });
+    const canonical = surface();
+    const controller = new InkPreviewProjectionController({
+      cache: { loadRegion, publish: vi.fn(() => Promise.resolve(true)) },
+      cacheKey,
+      decodeTile: () => Promise.resolve({ close: vi.fn() } as unknown as CanvasImageSource),
+      document,
+      projection: new InkPreviewProjection([
+        {
+          ...canonical,
+          strokes: [
+            {
+              ...canonical.strokes[0]!,
+              points: [
+                { pressure: 0.5, time: 1, x: 20, y: 600 },
+                { pressure: 0.5, time: 2, x: 80, y: 640 },
+              ],
+            },
+          ],
+        },
+      ]),
+      requestFrame: (callback) => {
+        callback(0);
+        return 1;
+      },
+      root,
+      scrollContainer: scroll,
+    });
+    controller.showPreview();
+    await vi.waitFor(() => expect(canvasCalls(context, 'drawImage')).not.toHaveLength(0));
+    expect(canvasCalls(context, 'stroke')).toHaveLength(0);
+
+    documentTop = -512;
+    scroll.dispatchEvent(new Event('scroll'));
+
+    await vi.waitFor(() => expect(canvasCalls(context, 'stroke')).not.toHaveLength(0));
+    expect(loadRegion).toHaveBeenCalledTimes(2);
     controller.dispose();
   });
 
@@ -324,7 +648,7 @@ describe('InkPreviewProjectionController', () => {
         load: () =>
           Promise.resolve({
             generation: 'corrupt',
-            tiles: [{ byteLength: 1, bytes: Uint8Array.of(1).buffer, x: 0, y: 0 }],
+            tiles: [{ byteLength: 1, bytes: Uint8Array.of(1).buffer, lod: 0, x: 0, y: 0 }],
           }),
         publish: () => Promise.resolve(false),
       },
@@ -352,7 +676,8 @@ describe('InkPreviewProjectionController', () => {
     controller.showPreview();
     await vi.waitFor(() => expect(canvasCalls(context, 'stroke')).not.toHaveLength(0));
 
-    expect(canvasCalls(context, 'drawImage')).toHaveLength(0);
+    expect(canvasCalls(context, 'drawImage')).toHaveLength(1);
+    expect(root.querySelector('[data-inkstone-retained-tile]')).not.toBeNull();
     controller.dispose();
   });
 
@@ -395,6 +720,88 @@ describe('InkPreviewProjectionController', () => {
     controller.dispose();
   });
 
+  it('still adopts and records an exact region hit that settles after the fallback deadline', async () => {
+    const context = canvasContext();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context);
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const frames: FrameRequestCallback[] = [];
+    let resolveRegion!: (hit: {
+      readonly generation: string;
+      readonly tiles: readonly [
+        {
+          readonly byteLength: number;
+          readonly bytes: ArrayBuffer;
+          readonly lod: number;
+          readonly x: number;
+          readonly y: number;
+        },
+      ];
+    }) => void;
+    const pendingRegion = new Promise<Parameters<typeof resolveRegion>[0]>((resolve) => {
+      resolveRegion = resolve;
+    });
+    let releaseVisibleWork: (() => void) | undefined;
+    const root = document.createElement('div');
+    document.body.append(root);
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 512, 512));
+    const controller = new InkPreviewProjectionController({
+      cache: {
+        loadRegion: () => pendingRegion,
+        publish: () => Promise.resolve(true),
+      },
+      cacheKey: {
+        alphaContract: 'premultiplied-transparent-v1',
+        colorSpace: 'srgb',
+        devicePixelRatio: 1,
+        logicalTileSize: 512,
+        noteIdentity: 'note',
+        rendererVersion: 'renderer',
+        scaleBucket: 1,
+        surfaceSetDigest: 'exact',
+        vaultIdentity: 'vault',
+      },
+      decodeTile: () => Promise.resolve({ close: vi.fn() } as unknown as CanvasImageSource),
+      document,
+      inkPerformance: diagnostics,
+      projection: new InkPreviewProjection([surface()]),
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+      root,
+      workScheduler: new InkWorkScheduler({
+        yieldToHost: () =>
+          new Promise<void>((resolve) => {
+            releaseVisibleWork = resolve;
+          }),
+      }),
+    });
+
+    controller.showPreview();
+    await Promise.resolve();
+    await Promise.resolve();
+    frames.shift()?.(0); // Cache deadline: begin canonical fallback.
+    frames.shift()?.(16); // Stall canonical Tile Builder after it has begun.
+    resolveRegion({
+      generation: 'late-exact',
+      tiles: [{ byteLength: 1, bytes: Uint8Array.of(1).buffer, lod: 0, x: 0, y: 0 }],
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        diagnostics
+          .snapshot()
+          .recentSpans.some(
+            ({ accepted, name }) => name === 'ink-preview-cache-lookup' && accepted !== false,
+          ),
+      ).toBe(true),
+    );
+    expect(root.querySelector('[data-inkstone-retained-tile="late-exact:0:0:0"]')).not.toBeNull();
+
+    controller.dispose();
+    releaseVisibleWork?.();
+  });
+
   it('publishes stable visible tiles as best-effort cold work after a cache miss', async () => {
     const diagnostics = new InkPerformanceDiagnostics(true);
     const context = canvasContext();
@@ -422,6 +829,7 @@ describe('InkPreviewProjectionController', () => {
     vi.spyOn(scroll, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 512, 512));
     vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 960, 900));
     const publish = vi.fn(() => Promise.resolve(true));
+    const publishCompleteTiles = vi.fn(() => Promise.resolve(true));
     const cacheKey: InkPreviewCacheKey = {
       alphaContract: 'premultiplied-transparent-v1',
       colorSpace: 'srgb',
@@ -434,7 +842,11 @@ describe('InkPreviewProjectionController', () => {
       vaultIdentity: 'vault',
     };
     const controller = new InkPreviewProjectionController({
-      cache: { load: () => Promise.resolve(null), publish },
+      cache: {
+        loadRegion: () => Promise.resolve(null),
+        publish,
+        publishCompleteTiles,
+      },
       cacheKey,
       document,
       inkPerformance: diagnostics,
@@ -450,11 +862,12 @@ describe('InkPreviewProjectionController', () => {
 
     controller.showPreview();
 
-    await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(publishCompleteTiles).toHaveBeenCalledOnce());
     expect(encode).toHaveBeenCalled();
-    expect(publish).toHaveBeenCalledWith(cacheKey, [
-      expect.objectContaining({ byteLength: 3, x: 0, y: 0 }),
+    expect(publishCompleteTiles).toHaveBeenCalledWith(cacheKey, [
+      expect.objectContaining({ byteLength: 3, lod: 0, x: 0, y: 0 }),
     ]);
+    expect(publish).not.toHaveBeenCalled();
     expect(diagnostics.snapshot().recentSpans).toContainEqual(
       expect.objectContaining({ accepted: true, name: 'ink-preview-cache-publish' }),
     );
@@ -472,20 +885,14 @@ describe('InkPreviewProjectionController', () => {
       document,
       memoryCoordinator: coordinator,
       projection: firstProjection,
-      requestFrame: (callback) => {
-        callback(0);
-        return 1;
-      },
+      requestFrame: () => 1,
       root: firstRoot,
     });
     const second = new InkPreviewProjectionController({
       document,
       memoryCoordinator: coordinator,
       projection: secondProjection,
-      requestFrame: (callback) => {
-        callback(0);
-        return 1;
-      },
+      requestFrame: () => 1,
       root: secondRoot,
     });
 

@@ -13,6 +13,7 @@ import type {
 import { InkLiveDocument } from '../application/ink-document-session';
 import { UNPUBLISHED_INK_HIGHLIGHTER_CHISEL_PROFILE } from '../domain/ink-highlighter-physical-geometry';
 import { InkPerformanceDiagnostics } from '../runtime/ink-performance-diagnostics';
+import { InkWorkScheduler } from '../runtime/ink-work-scheduler';
 import {
   createTestInkReadView,
   queryTestInkReadView,
@@ -1857,7 +1858,9 @@ describe('Ink canvas controller', () => {
       root.dispatchEvent(new Event('scroll'));
 
       expect(query).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(16);
       expect(committed.style.transform).toContain('matrix');
+      expect(query).not.toHaveBeenCalled();
 
       await vi.runAllTimersAsync();
 
@@ -2611,6 +2614,24 @@ describe('Ink canvas controller', () => {
     ]);
   });
 
+  it('commits a same-extent stroke without remeasuring the Stage Frame', () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const session = new FakeSession(surface());
+    const controller = new InkCanvasController({ document, root, session });
+    controller.enter();
+    const measure = vi.spyOn(root, 'getBoundingClientRect');
+    measure.mockClear();
+
+    root.dispatchEvent(pointer('pointerdown', 10, 20, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 20, 25, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 30, 30, 'pen'));
+
+    expect(session.read().strokes).toHaveLength(1);
+    expect(measure).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+
   it('measures viewport redraws with only a result count', () => {
     const diagnostics = new InkPerformanceDiagnostics(true);
     const root = document.createElement('div');
@@ -2886,6 +2907,15 @@ describe('Ink canvas controller', () => {
   });
 
   it('presents linked document undo and redo without a full recovery rebuild', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      return {
+        ...contextFixture(),
+        canvas: this,
+        drawImage: vi.fn(),
+      };
+    });
     const diagnostics = new InkPerformanceDiagnostics(true);
     const source: InkSurfaceRecord = {
       ...surface([v3LegacyStroke('history')]),
@@ -2903,15 +2933,33 @@ describe('Ink canvas controller', () => {
     session.apply({ id: 'add-command-stroke', kind: 'add', stroke: v3LegacyStroke('command') });
     const root = document.createElement('div');
     document.body.append(root);
-    controller = new InkCanvasController({ document, inkPerformance: diagnostics, root, session });
+    controller = new InkCanvasController({
+      document,
+      inkPerformance: diagnostics,
+      root,
+      session,
+      workScheduler: new InkWorkScheduler(),
+    });
     controller.enter();
+    await vi.waitFor(() =>
+      expect(root.querySelector('[data-inkstone-committed-tile]:not([hidden])')).not.toBeNull(),
+    );
+    const visibleTiles = [
+      ...root.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]:not([hidden])'),
+    ];
     const recoveryRebuildsBeforeCommand = controller.renderRuntimeStats.visibleRecoveryRebuildCount;
+    const rasterRebuildsBeforeCommand = controller.renderRuntimeStats.rasterTileRebuildCount;
     diagnostics.reset();
 
     root.querySelector<HTMLButtonElement>('[data-inkstone-ink-undo]')?.click();
     expect(session.read().strokes.map(({ id }) => id)).toEqual(['history']);
     expect(controller.renderRuntimeStats.visibleRecoveryRebuildCount).toBe(
       recoveryRebuildsBeforeCommand,
+    );
+    expect(controller.renderRuntimeStats.rasterTileRebuildCount).toBe(rasterRebuildsBeforeCommand);
+    expect(visibleTiles.every((tile) => tile.isConnected && !tile.hidden)).toBe(true);
+    expect(root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]')?.hidden).toBe(
+      true,
     );
     expect(
       diagnostics.snapshot().recentSpans.filter(({ name }) => name.startsWith('ink-command-')),
@@ -2931,6 +2979,11 @@ describe('Ink canvas controller', () => {
     expect(session.read().strokes.map(({ id }) => id)).toEqual(['history', 'command']);
     expect(controller.renderRuntimeStats.visibleRecoveryRebuildCount).toBe(
       recoveryRebuildsBeforeCommand,
+    );
+    expect(controller.renderRuntimeStats.rasterTileRebuildCount).toBe(rasterRebuildsBeforeCommand);
+    expect(visibleTiles.every((tile) => tile.isConnected && !tile.hidden)).toBe(true);
+    expect(root.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]')?.hidden).toBe(
+      true,
     );
     expect(
       diagnostics.snapshot().recentSpans.filter(({ name }) => name.startsWith('ink-command-')),
@@ -3377,11 +3430,22 @@ describe('Ink canvas controller', () => {
     controller.dispose();
   });
 
-  it('cancels capture ownership on lostpointercapture and accepts the next clean contact', () => {
+  it('seals the confirmed prefix on lostpointercapture without duplicating the later pointerup', () => {
+    const canvasContext = contextFixture();
+    canvasContext.closePath = vi.fn();
+    canvasContext.fill = vi.fn();
+    canvasContext.globalAlpha = 1;
+    canvasContext.globalCompositeOperation = 'source-over';
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
     const root = document.createElement('div');
     document.body.append(root);
     const session = new FakeSession(surface());
-    const controller = new InkCanvasController({ document, root, session });
+    const controller = new InkCanvasController({
+      document,
+      root,
+      session,
+      unpublishedPhysicalInkHat: { session },
+    });
     controller.enter();
 
     root.dispatchEvent(pointer('pointerdown', 10, 10, 'pen'));
@@ -3390,11 +3454,37 @@ describe('Ink canvas controller', () => {
     root.dispatchEvent(pointer('pointerup', 30, 30, 'pen'));
     root.dispatchEvent(pointer('pointerdown', 40, 40, 'pen'));
     root.dispatchEvent(pointer('pointerup', 50, 50, 'pen'));
+    root.dispatchEvent(pointer('pointerdown', 70, 70, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 80, 80, 'pen'));
+    root.dispatchEvent(pointer('lostpointercapture', 80, 80, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 90, 90, 'pen'));
+    root.dispatchEvent(pointer('pointerdown', 100, 100, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 110, 110, 'pen'));
+    root.dispatchEvent(pointer('pointerdown', 130, 130, 'pen'));
+    root.dispatchEvent(pointer('pointermove', 140, 140, 'pen'));
+    root.dispatchEvent(pointer('lostpointercapture', 140, 140, 'pen'));
+    root.dispatchEvent(pointer('pointerup', 150, 150, 'pen'));
 
-    expect(session.strokes).toHaveLength(1);
+    expect(session.strokes).toHaveLength(5);
     expect(session.strokes[0]?.points).toMatchObject([
+      { x: 10, y: 10 },
+      { x: 20, y: 20 },
+    ]);
+    expect(session.strokes[1]?.points).toMatchObject([
       { x: 40, y: 40 },
       { x: 50, y: 50 },
+    ]);
+    expect(session.strokes[2]?.points).toMatchObject([
+      { x: 70, y: 70 },
+      { x: 80, y: 80 },
+    ]);
+    expect(session.strokes[3]?.points).toMatchObject([
+      { x: 100, y: 100 },
+      { x: 110, y: 110 },
+    ]);
+    expect(session.strokes[4]?.points).toMatchObject([
+      { x: 130, y: 130 },
+      { x: 140, y: 140 },
     ]);
     controller.dispose();
   });
@@ -4773,11 +4863,13 @@ function contextFixture(
   return {
     arc: previewSpies.arc ?? vi.fn(),
     beginPath: vi.fn(),
+    clip: vi.fn(),
     clearRect: clearRectSpy,
     lineCap: 'round',
     lineJoin: 'round',
     lineTo: vi.fn(),
     moveTo: vi.fn(),
+    rect: vi.fn(),
     restore: vi.fn(),
     save: vi.fn(),
     scale: vi.fn(),

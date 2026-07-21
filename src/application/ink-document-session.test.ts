@@ -739,6 +739,126 @@ describe('continuous Ink document session', () => {
     expect(writer.records).toMatchObject([{ strokes: [{ id: 'done-save' }] }]);
   });
 
+  it('keeps background and sustained inactivity memory-only under explicit-exit persistence', async () => {
+    vi.useFakeTimers();
+    const writer = new RecordingWriter();
+    const session = new InkDocumentSession({
+      inactivityMs: 30_000,
+      persistencePolicy: 'explicit-exit',
+      surfaces: [v3Surface('physical', 0, 600)],
+      writer,
+    });
+
+    session.addStroke(physicalStroke('memory-only', 100, 120));
+    await session.background();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(writer.records).toEqual([]);
+
+    const exit = session.exit();
+    await vi.runAllTimersAsync();
+    await exit;
+    expect(writer.records).toMatchObject([{ strokes: [{ id: 'memory-only' }] }]);
+  });
+
+  it('writes one logical snapshot on explicit exit without bounded materialization', async () => {
+    const writer = new RecordingWriter();
+    const replace = vi.fn<(snapshot: InkSurfaceRecord) => Promise<void>>().mockResolvedValue();
+    const session = new InkDocumentSession({
+      persistencePolicy: 'explicit-exit',
+      snapshotStore: { replace },
+      surfaces: [v3Surface('top', 0, 600), v3Surface('bottom', 600, 400)],
+      writer,
+    });
+
+    session.addStroke(physicalStroke('one-document-save', 550, 650));
+    await session.exit();
+
+    expect(writer.records).toEqual([]);
+    expect(writer.atomicBatches).toEqual([]);
+    expect(replace).toHaveBeenCalledTimes(1);
+    const saved = replace.mock.calls[0]?.[0];
+    expect(saved?.layout).toMatchObject({ logicalHeight: 1000, originY: 0 });
+    expect(saved?.strokes.map(({ id }) => id)).toEqual(['one-document-save']);
+    expect(session.read()).toMatchObject({
+      persistence: { kind: 'saved-locally' },
+      state: { kind: 'reading' },
+    });
+  });
+
+  it('retains the logical document after snapshot failure and retries the same in-memory content', async () => {
+    const replace = vi
+      .fn<(snapshot: InkSurfaceRecord) => Promise<void>>()
+      .mockRejectedValueOnce(new Error('disk unavailable'))
+      .mockResolvedValueOnce();
+    const session = new InkDocumentSession({
+      persistencePolicy: 'explicit-exit',
+      snapshotStore: { replace },
+      surfaces: [v3Surface('physical', 0, 600)],
+    });
+    session.addStroke(physicalStroke('retained-after-failure', 100, 120));
+
+    await expect(session.exit()).rejects.toThrow('disk unavailable');
+    expect(session.read()).toMatchObject({
+      persistence: { kind: 'error' },
+      state: { dirty: true, kind: 'ink-mode', pendingIntent: 'exit' },
+    });
+    expect(session.read().strokes.map(({ id }) => id)).toEqual(['retained-after-failure']);
+
+    await session.retry();
+    expect(replace).toHaveBeenCalledTimes(2);
+    expect(replace.mock.calls[1]?.[0].strokes).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'retained-after-failure' })]),
+    );
+    expect(session.read()).toMatchObject({
+      persistence: { kind: 'saved-locally' },
+      state: { kind: 'reading' },
+    });
+  });
+
+  it('uses background only to replace one best-effort draft and keeps canonical save for Done', async () => {
+    const draftReplace = vi.fn(() => Promise.resolve());
+    const discard = vi.fn(() => Promise.resolve());
+    const canonicalReplace = vi.fn(() => Promise.resolve());
+    const session = new InkDocumentSession({
+      draftStore: { discard, load: vi.fn(), replace: draftReplace },
+      persistencePolicy: 'explicit-exit',
+      snapshotStore: { replace: canonicalReplace },
+      surfaces: [v3Surface('physical', 0, 600)],
+    });
+    session.addStroke(physicalStroke('idle-draft-only', 100, 120));
+
+    await session.background();
+
+    expect(draftReplace).toHaveBeenCalledTimes(1);
+    expect(canonicalReplace).not.toHaveBeenCalled();
+    expect(session.read().state).toMatchObject({ dirty: true, kind: 'ink-mode' });
+
+    await session.exit();
+    expect(canonicalReplace).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(discard).toHaveBeenCalledWith('Ink.md'));
+  });
+
+  it('treats a recovered latest draft as dirty even before another stroke is drawn', async () => {
+    const replace = vi.fn(() => Promise.resolve());
+    const recovered = v3Surface('document:note-1', 0, 600, [
+      physicalStroke('recovered-draft', 100, 120),
+    ]);
+    const session = new InkDocumentSession({
+      initialDraftRevision: 7,
+      persistencePolicy: 'explicit-exit',
+      snapshotStore: { replace },
+      surfaces: [recovered],
+    });
+
+    expect(session.read().state).toMatchObject({ dirty: true, kind: 'ink-mode' });
+    await session.exit();
+    expect(replace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        strokes: [expect.objectContaining({ id: 'recovered-draft' })],
+      }),
+    );
+  });
+
   it('best-effort saves only after one complete sustained-inactivity window', async () => {
     vi.useFakeTimers();
     const writer = new RecordingWriter();

@@ -12,12 +12,19 @@ export interface InkPreviewCacheKey {
 
 export interface InkPreviewCacheTileInput {
   readonly bytes: ArrayBuffer;
+  readonly lod: number;
   readonly x: number;
   readonly y: number;
 }
 
 export interface InkPreviewCacheTile extends InkPreviewCacheTileInput {
   readonly byteLength: number;
+}
+
+export interface InkPreviewCacheTileCoordinate {
+  readonly lod: number;
+  readonly x: number;
+  readonly y: number;
 }
 
 export interface InkPreviewCacheHit {
@@ -29,6 +36,7 @@ interface InkPreviewTileRecord {
   readonly bytes: ArrayBuffer;
   readonly generation: string;
   readonly id: string;
+  readonly lod: number;
   readonly x: number;
   readonly y: number;
 }
@@ -46,6 +54,7 @@ const TILE_STORE = 'tiles';
 const GENERATION_STORE = 'generations';
 const DEFAULT_PER_NOTE_BYTE_LIMIT = 32 * 1024 * 1024;
 const DEFAULT_GLOBAL_BYTE_LIMIT = 128 * 1024 * 1024;
+const DATABASE_VERSION = 2;
 let nextFallbackGeneration = 0;
 
 /** Disposable exact-revision Preview bytes. Every failure is deliberately reduced to a miss. */
@@ -97,7 +106,10 @@ export class IndexedDbInkPreviewCache {
       await transactionDone(transaction);
       if (
         records.some(
-          (record) => record === undefined || record.generation !== generation.generation,
+          (record) =>
+            record === undefined ||
+            record.generation !== generation.generation ||
+            !validTileRecord(record),
         )
       ) {
         return null;
@@ -106,16 +118,58 @@ export class IndexedDbInkPreviewCache {
       return Object.freeze({
         generation: generation.generation,
         tiles: Object.freeze(
-          records.map((record) => {
-            const tile = record as InkPreviewTileRecord;
-            return Object.freeze({
-              byteLength: tile.bytes.byteLength,
-              bytes: tile.bytes,
-              x: tile.x,
-              y: tile.y,
-            });
-          }),
+          records.map((record) => toPreviewCacheTile(record as InkPreviewTileRecord)),
         ),
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  async loadRegion(
+    key: InkPreviewCacheKey,
+    coordinates: readonly InkPreviewCacheTileCoordinate[],
+  ): Promise<InkPreviewCacheHit | null> {
+    if (
+      coordinates.some(
+        ({ lod, x, y }) =>
+          !Number.isSafeInteger(lod) || !Number.isSafeInteger(x) || !Number.isSafeInteger(y),
+      )
+    ) {
+      return null;
+    }
+    try {
+      const database = await this.open();
+      const identity = exactIdentity(key);
+      const generation = await requestResult<InkPreviewGenerationRecord | undefined>(
+        database
+          .transaction(GENERATION_STORE, 'readonly')
+          .objectStore(GENERATION_STORE)
+          .get(identity) as IDBRequest<InkPreviewGenerationRecord | undefined>,
+      );
+      if (generation === undefined) return null;
+      const transaction = database.transaction(TILE_STORE, 'readonly');
+      const store = transaction.objectStore(TILE_STORE);
+      const records = await Promise.all(
+        coordinates.map(({ lod, x, y }) =>
+          requestResult<InkPreviewTileRecord | undefined>(
+            store.get(tileRecordId(generation.generation, lod, x, y)) as IDBRequest<
+              InkPreviewTileRecord | undefined
+            >,
+          ),
+        ),
+      );
+      await transactionDone(transaction);
+      const available = records.filter(
+        (record): record is InkPreviewTileRecord =>
+          record !== undefined &&
+          record.generation === generation.generation &&
+          validTileRecord(record),
+      );
+      void this.touch(identity, generation).catch(() => undefined);
+      return Object.freeze({
+        generation: generation.generation,
+        tiles: Object.freeze(available.map(toPreviewCacheTile)),
       });
     } catch {
       return null;
@@ -132,7 +186,8 @@ export class IndexedDbInkPreviewCache {
     const tileRecords = tiles.map((tile): InkPreviewTileRecord => ({
       bytes: tile.bytes.slice(0),
       generation,
-      id: `${generation}\u0000${tile.x}\u0000${tile.y}`,
+      id: tileRecordId(generation, tile.lod, tile.x, tile.y),
+      lod: tile.lod,
       x: tile.x,
       y: tile.y,
     }));
@@ -166,6 +221,59 @@ export class IndexedDbInkPreviewCache {
       return await this.enforceBudgets(identity);
     } catch {
       await this.discardTiles(tileRecords.map(({ id }) => id));
+      return false;
+    }
+  }
+
+  /** Atomically appends/replaces complete coordinates inside one immutable projection catalog. */
+  async publishCompleteTiles(
+    key: InkPreviewCacheKey,
+    tiles: readonly InkPreviewCacheTileInput[],
+  ): Promise<boolean> {
+    if (tiles.length === 0 || tiles.some((tile) => !validTile(tile))) return false;
+    const identity = exactIdentity(key);
+    try {
+      this.beforeWriteBytes();
+      this.beforePublishToken();
+      const database = await this.open();
+      const transaction = database.transaction([GENERATION_STORE, TILE_STORE], 'readwrite');
+      const generationStore = transaction.objectStore(GENERATION_STORE);
+      const tileStore = transaction.objectStore(TILE_STORE);
+      const current = await requestResult<InkPreviewGenerationRecord | undefined>(
+        generationStore.get(identity) as IDBRequest<InkPreviewGenerationRecord | undefined>,
+      );
+      const generation = current?.generation ?? createGeneration();
+      const tileIds = new Set(current?.tileIds ?? []);
+      let byteLength = current?.byteLength ?? 0;
+      for (const tile of tiles) {
+        const id = tileRecordId(generation, tile.lod, tile.x, tile.y);
+        const previous = await requestResult<InkPreviewTileRecord | undefined>(
+          tileStore.get(id) as IDBRequest<InkPreviewTileRecord | undefined>,
+        );
+        if (previous !== undefined) byteLength -= previous.bytes.byteLength;
+        const record: InkPreviewTileRecord = {
+          bytes: tile.bytes.slice(0),
+          generation,
+          id,
+          lod: tile.lod,
+          x: tile.x,
+          y: tile.y,
+        };
+        tileStore.put(record);
+        tileIds.add(id);
+        byteLength += record.bytes.byteLength;
+      }
+      generationStore.put({
+        byteLength,
+        generation,
+        id: identity,
+        lastAccessedAt: Date.now(),
+        noteKey: noteIdentity(key),
+        tileIds: Object.freeze([...tileIds]),
+      } satisfies InkPreviewGenerationRecord);
+      await transactionDone(transaction);
+      return await this.enforceBudgets(identity);
+    } catch {
       return false;
     }
   }
@@ -271,15 +379,17 @@ export class IndexedDbInkPreviewCache {
   private open(): Promise<IDBDatabase> {
     if (this.database !== null) return this.database;
     this.database = new Promise((resolve, reject) => {
-      const request = this.factory.open(this.databaseName, 1);
+      const request = this.factory.open(this.databaseName, DATABASE_VERSION);
       request.onupgradeneeded = () => {
         const database = request.result;
-        if (!database.objectStoreNames.contains(TILE_STORE)) {
-          database.createObjectStore(TILE_STORE, { keyPath: 'id' });
+        // Preview bytes are disposable. Recreate the stores on schema upgrades so an old
+        // coordinate identity can never masquerade as an exact LOD-aware tile.
+        if (database.objectStoreNames.contains(TILE_STORE)) database.deleteObjectStore(TILE_STORE);
+        if (database.objectStoreNames.contains(GENERATION_STORE)) {
+          database.deleteObjectStore(GENERATION_STORE);
         }
-        if (!database.objectStoreNames.contains(GENERATION_STORE)) {
-          database.createObjectStore(GENERATION_STORE, { keyPath: 'id' });
-        }
+        database.createObjectStore(TILE_STORE, { keyPath: 'id' });
+        database.createObjectStore(GENERATION_STORE, { keyPath: 'id' });
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error ?? new Error('Ink Preview cache open failed.'));
@@ -316,13 +426,36 @@ function createGeneration(): string {
   return `preview-generation-${nextFallbackGeneration}`;
 }
 
+function tileRecordId(generation: string, lod: number, x: number, y: number): string {
+  return `${generation}\u0000${lod}\u0000${x}\u0000${y}`;
+}
+
+function toPreviewCacheTile(tile: InkPreviewTileRecord): InkPreviewCacheTile {
+  return Object.freeze({
+    byteLength: tile.bytes.byteLength,
+    bytes: tile.bytes,
+    lod: tile.lod,
+    x: tile.x,
+    y: tile.y,
+  });
+}
+
 function validTile(tile: InkPreviewCacheTileInput): boolean {
   return (
     tile.bytes.byteLength > 0 &&
+    Number.isSafeInteger(tile.lod) &&
     Number.isSafeInteger(tile.x) &&
-    Number.isSafeInteger(tile.y) &&
-    tile.x >= 0 &&
-    tile.y >= 0
+    Number.isSafeInteger(tile.y)
+  );
+}
+
+function validTileRecord(tile: InkPreviewTileRecord): boolean {
+  return (
+    tile.bytes instanceof ArrayBuffer &&
+    tile.bytes.byteLength > 0 &&
+    Number.isSafeInteger(tile.lod) &&
+    Number.isSafeInteger(tile.x) &&
+    Number.isSafeInteger(tile.y)
   );
 }
 

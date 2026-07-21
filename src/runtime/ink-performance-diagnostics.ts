@@ -166,7 +166,10 @@ export const NOOP_INK_PERFORMANCE_RECORDER: InkPerformanceRecorder = Object.free
 /** Keeps opt-in Ink timing local, bounded, and free of authored geometry. */
 export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
   private readonly armedAuditGuards = new Set<InkPerformanceAuditGuard>();
-  private readonly activeSpans = new Set<number>();
+  private readonly activeSpans = new Map<
+    number,
+    { readonly name: InkPerformanceSpanName; readonly workPhase: InkPerformanceWorkPhase }
+  >();
   private epoch = 0;
   private nextContactSequence = 0;
   private nextSpanSequence = 0;
@@ -348,7 +351,7 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
     const startedEpoch = this.epoch;
     this.nextSpanSequence += 1;
     const spanSequence = this.nextSpanSequence;
-    this.activeSpans.add(spanSequence);
+    this.activeSpans.set(spanSequence, { name, workPhase: input.workPhase });
     let finished = false;
     const complete = (): boolean => {
       if (finished) return false;
@@ -478,6 +481,11 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
       readonly phase: InkPerformanceWorkPhase;
     }[];
     readonly hangingSpanCount: number;
+    readonly hangingSpans: readonly {
+      readonly count: number;
+      readonly name: InkPerformanceSpanName;
+      readonly workPhase: InkPerformanceWorkPhase;
+    }[];
     readonly frameIntervalsMs: {
       readonly activeWriting: readonly number[];
       readonly hostGaps: readonly number[];
@@ -497,6 +505,23 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
     }[];
     readonly schedulerUnitCount: number;
   } {
+    const hangingSpans = new Map<
+      string,
+      {
+        count: number;
+        readonly name: InkPerformanceSpanName;
+        readonly workPhase: InkPerformanceWorkPhase;
+      }
+    >();
+    for (const span of this.activeSpans.values()) {
+      const key = `${span.name}\u0000${span.workPhase}`;
+      const existing = hangingSpans.get(key);
+      if (existing === undefined) {
+        hangingSpans.set(key, { ...span, count: 1 });
+      } else {
+        existing.count += 1;
+      }
+    }
     return {
       armedAuditGuards: [...this.armedAuditGuards],
       auditedWork: [...this.auditedWork.values()].map((counter) => ({ ...counter })),
@@ -509,6 +534,11 @@ export class InkPerformanceDiagnostics implements InkPerformanceRecorder {
         idle: [...this.frameIntervalsMs.idle],
       },
       hangingSpanCount: this.activeSpans.size,
+      hangingSpans: [...hangingSpans.values()].sort((left, right) =>
+        `${left.name}\u0000${left.workPhase}`.localeCompare(
+          `${right.name}\u0000${right.workPhase}`,
+        ),
+      ),
       memory: { ...this.memory },
       openContactCount: this.openContacts.size,
       recentSpans: this.recentSpans.map((sample) => ({ ...sample })),

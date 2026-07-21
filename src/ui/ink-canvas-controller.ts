@@ -19,6 +19,7 @@ import {
   type InkPerformanceWorkPhase,
 } from '../runtime/ink-performance-diagnostics';
 import { InkPresentationGenerationLedger } from '../runtime/ink-presentation-generation-ledger';
+import type { InkWorkScheduler } from '../runtime/ink-work-scheduler';
 import {
   fitInkWorkspaceScale,
   INK_DOCUMENT_LOGICAL_WIDTH,
@@ -242,6 +243,8 @@ export class InkCanvasController {
   private readonly toolStyles: InkToolStyles;
   private readonly touchInkAdapter = new WebKitStylusTouchAdapter();
   private viewMode: 'raw' | 'preview' | 'edit' = 'raw';
+  private viewportProjectionFrame: number | null = null;
+  private viewportProjectionPending = false;
   private viewportSettleTimer: number | null = null;
   private readonly viewportHost: HTMLElement | null;
 
@@ -309,6 +312,7 @@ export class InkCanvasController {
     readonly scrollContainer?: HTMLElement;
     readonly session: InkSessionLike;
     readonly viewportHost?: HTMLElement;
+    readonly workScheduler?: InkWorkScheduler;
     readonly workerPresentation?: InkWorkerPresentationRuntimeOptions;
     readonly unpublishedPhysicalInkHat?: InkUnpublishedPhysicalInkHatControllerOptions;
   }) {
@@ -388,6 +392,7 @@ export class InkCanvasController {
       onOverlayPresented: this.onOverlayPresented,
       query: (viewport) => this.session.query(viewport),
       read: () => this.session.read(),
+      ...(input.workScheduler === undefined ? {} : { workScheduler: input.workScheduler }),
       ...(input.workerPresentation === undefined
         ? {}
         : { workerPresentation: input.workerPresentation }),
@@ -672,6 +677,7 @@ export class InkCanvasController {
     if (change !== null && this.currentRead === read && this.lastSynchronizedChange === change) {
       return;
     }
+    const previousRead = this.currentRead;
     this.currentRead = read;
     this.lastSynchronizedChange = change;
     if (this.active && this.physicalCandidate !== null) {
@@ -684,13 +690,18 @@ export class InkCanvasController {
         });
       });
     }
-    const logicalHeight = read.logicalHeight;
-    if (this.scrollContainer === null) this.overlay.style.height = `${logicalHeight}px`;
-    if (this.viewMode !== 'raw') {
-      this.layoutRoot.style.setProperty('--inkstone-ink-logical-height', `${logicalHeight}px`);
+    const extentChanged =
+      previousRead.logicalHeight !== read.logicalHeight ||
+      previousRead.logicalWidth !== read.logicalWidth;
+    if (change === null || extentChanged) {
+      const logicalHeight = read.logicalHeight;
+      if (this.scrollContainer === null) this.overlay.style.height = `${logicalHeight}px`;
+      if (this.viewMode !== 'raw') {
+        this.layoutRoot.style.setProperty('--inkstone-ink-logical-height', `${logicalHeight}px`);
+        this.positionOverlay();
+      }
+      this.updateViewport(false);
     }
-    if (this.viewMode !== 'raw') this.positionOverlay();
-    this.updateViewport(false);
     if (change === null) {
       if (this.selectionCommittedStrokes === null) this.renderRuntime.installDocument(read);
     } else {
@@ -763,6 +774,7 @@ export class InkCanvasController {
       this.document.defaultView?.clearTimeout(this.viewportSettleTimer);
       this.viewportSettleTimer = null;
     }
+    this.cancelViewportProjection();
     this.overlay.remove();
     this.toolbarIsland.unmount();
     this.toolbarHost.remove();
@@ -1033,7 +1045,11 @@ export class InkCanvasController {
 
   private readonly onLostPointerCapture = (event: PointerEvent): void => {
     if (event.pointerId !== this.activePointerId) return;
-    this.finishStroke(false);
+    // WebKit/Electron can release pointer capture as part of a normal pen-up or host-layer
+    // replacement before the matching pointerup reaches this controller. The already-confirmed
+    // trace is valid user input, so treat capture loss as an implicit termination. Only an
+    // explicit pointercancel is allowed to discard the contact.
+    this.sealActiveContactForForcedStageFrame();
   };
 
   private readonly onPointerEnd = (event: PointerEvent): void => {
@@ -1918,9 +1934,29 @@ export class InkCanvasController {
     if (this.disposed) return;
     if (this.active) this.session.noteUserInteraction?.();
     this.cancelReadingContextRestore();
+    this.viewportProjectionPending = true;
+    this.scheduleViewportProjection();
+    this.scheduleViewportSettle();
+  };
+
+  private scheduleViewportProjection(): void {
+    if (this.viewportProjectionFrame !== null || !this.viewportProjectionPending) return;
+    let completedSynchronously = false;
+    const handle = requestAnimationFrame(() => {
+      completedSynchronously = true;
+      this.viewportProjectionFrame = null;
+      this.flushViewportProjection();
+    });
+    if (!completedSynchronously) this.viewportProjectionFrame = handle;
+  }
+
+  private flushViewportProjection(): void {
+    if (this.disposed || !this.viewportProjectionPending) return;
+    this.viewportProjectionPending = false;
     // Native scrolling changes only the client-space projection of the immutable document.
     // The pane-fixed Canvas rect and CSS zoom stay unchanged; only the document origin moves.
-    // Recalibrating the fixed overlay here would create a write/read/write layout feedback loop.
+    // Measure once on the browser's presentation frame, never once per raw scroll event. This
+    // keeps WebKit's asynchronous scroller from being forced into repeated layout flushes.
     const layout = this.measureLayoutPresentation();
     const scale = layout.scale;
     const inset = this.documentOriginInset ?? { x: 0, y: 0 };
@@ -1935,8 +1971,13 @@ export class InkCanvasController {
       }),
     );
     this.renderRuntime.projectFrame(this.stageFrame);
-    this.scheduleViewportSettle();
-  };
+  }
+
+  private cancelViewportProjection(): void {
+    if (this.viewportProjectionFrame !== null) cancelAnimationFrame(this.viewportProjectionFrame);
+    this.viewportProjectionFrame = null;
+    this.viewportProjectionPending = false;
+  }
 
   private readonly onNativeNavigationIntent = (): void => {
     if (this.active) this.session.noteUserInteraction?.();
@@ -2002,6 +2043,11 @@ export class InkCanvasController {
     if (this.viewportSettleTimer !== null) window.clearTimeout(this.viewportSettleTimer);
     this.viewportSettleTimer = window.setTimeout(() => {
       this.viewportSettleTimer = null;
+      if (this.viewportProjectionFrame !== null) {
+        cancelAnimationFrame(this.viewportProjectionFrame);
+        this.viewportProjectionFrame = null;
+      }
+      this.flushViewportProjection();
       this.updateViewport(true);
     }, VIEWPORT_SETTLE_DELAY_MS);
   }
@@ -2579,6 +2625,14 @@ export class InkCanvasController {
   }
 
   private updateToolbar(update: Partial<InkToolbarState>, render = true): void {
+    const current = this.toolbarStore.state.value;
+    if (
+      Object.entries(update).every(([key, value]) =>
+        Object.is(current[key as keyof InkToolbarState], value),
+      )
+    ) {
+      return;
+    }
     this.toolbarStore.state.value = { ...this.toolbarStore.state.value, ...update };
     if (render) this.toolbarIsland.update(this.toolbarProps());
   }

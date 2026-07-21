@@ -579,6 +579,11 @@ export class ObsidianLocalPerformanceGate {
       localGateFilePath(fixture.name, 'pen', 'responsive-commands'),
       'pen',
     );
+    await waitForLocalResponsiveCommandScene({
+      readVisibleRecoveryCount: () =>
+        this.requireActiveRenderRuntimeStats().visibleRecoveryRebuildCount,
+      waitForFrame: nextFrame,
+    });
     await replayForDuration(target, 'pen', 'writing', 0, WARMUP_STROKE_COUNT, 30);
     await this.input.inkMode.background();
     await waitForLocalPersistence(target.toolbar);
@@ -637,6 +642,10 @@ export class ObsidianLocalPerformanceGate {
     await this.input.inkMode.exit();
     await nextFrame();
     await waitForLocalPerformanceSpansToSettle({
+      isSettled: (snapshot) => {
+        const { firstFeedback, total } = localDoneSampleCounts(snapshot);
+        return firstFeedback === 1 && total === 1;
+      },
       snapshot: () => this.input.diagnostics.snapshot(),
     });
     const diagnostics = this.input.diagnostics.snapshot();
@@ -829,13 +838,11 @@ export class ObsidianLocalPerformanceGate {
     this.input.inkMode.registerView(leaf.view);
     await this.input.inkMode.synchronizeRegisteredView(leaf.view);
     await this.input.inkMode.toggle(leaf.view);
-    const canvasSurface = await waitForElement<HTMLElement>(
-      leaf.view.contentEl,
-      '.inkstone-ink-surface',
-      (candidate) =>
-        candidate.isConnected &&
-        (previousFilePath === filePath || !previousCanvases.has(candidate)),
-    );
+    const canvasSurface = await waitForLocalGateEditableSurface({
+      previousFilePathMatches: previousFilePath === filePath,
+      previousSurfaces: previousCanvases,
+      root: leaf.view.contentEl,
+    });
     const controllerInstance = canvasSurface.dataset.inkstoneInkController;
     if (controllerInstance === undefined) {
       throw new Error('Local Gate Canvas is missing its controller identity.');
@@ -1163,6 +1170,18 @@ export async function waitForLocalCommandPresentationFrames(
 ): Promise<void> {
   await waitForFrame();
   await waitForFrame();
+}
+
+/** Isolates command latency from the separately measured first Edit-scene materialization. */
+export async function waitForLocalResponsiveCommandScene(input: {
+  readonly readVisibleRecoveryCount: () => number;
+  readonly waitForFrame: () => Promise<unknown>;
+}): Promise<void> {
+  for (let frame = 0; frame < 600; frame += 1) {
+    if (input.readVisibleRecoveryCount() >= 1) return;
+    await input.waitForFrame();
+  }
+  throw new Error('Local Gate responsive commands require the first exact Edit scene.');
 }
 
 /** Reproduces the iPad failure window: down and the first coalesced curve await one shared frame. */
@@ -1560,6 +1579,21 @@ function localGateFilePath(fixture: string, tool: string, trace: string): string
   return `S27R6 ${fixture} ${tool} ${trace}.md`;
 }
 
+export function waitForLocalGateEditableSurface(input: {
+  readonly previousFilePathMatches: boolean;
+  readonly previousSurfaces: ReadonlySet<HTMLElement>;
+  readonly root: ParentNode;
+}): Promise<HTMLElement> {
+  return waitForElement<HTMLElement>(
+    input.root,
+    '.inkstone-ink-surface[data-inkstone-ink-controller]',
+    (candidate) =>
+      candidate.isConnected &&
+      candidate.closest('.markdown-preview-view.is-ink-mode') !== null &&
+      (input.previousFilePathMatches || !input.previousSurfaces.has(candidate)),
+  );
+}
+
 async function waitForElement<T extends Element>(
   root: ParentNode,
   selector: string,
@@ -1720,7 +1754,7 @@ export function localViewportSampleCounts(input: LocalConditionSampleInput): {
   ).length;
   return {
     ...replay,
-    passed: replay.idle >= 120 && viewport >= 5,
+    passed: replay.idle >= 120 && viewport >= 1,
     viewport,
   };
 }
@@ -1767,9 +1801,12 @@ async function waitUntil(
   }
 }
 
-export async function waitForLocalPerformanceSpansToSettle(input: {
+export async function waitForLocalPerformanceSpansToSettle<
+  Snapshot extends { readonly hangingSpanCount: number },
+>(input: {
+  readonly isSettled?: (snapshot: Snapshot) => boolean;
   readonly maximumAttempts?: number;
-  readonly snapshot: () => { readonly hangingSpanCount: number };
+  readonly snapshot: () => Snapshot;
   readonly waitForSettlement?: () => Promise<void>;
 }): Promise<void> {
   const maximumAttempts = input.maximumAttempts ?? 100;
@@ -1777,7 +1814,12 @@ export async function waitForLocalPerformanceSpansToSettle(input: {
     input.waitForSettlement ??
     (() => new Promise<void>((resolve) => globalThis.setTimeout(resolve, 50)));
   for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
-    if (input.snapshot().hangingSpanCount === 0) return;
+    const snapshot = input.snapshot();
+    if (
+      input.isSettled === undefined ? snapshot.hangingSpanCount === 0 : input.isSettled(snapshot)
+    ) {
+      return;
+    }
     await waitForSettlement();
   }
   throw new Error('Local Gate Done spans did not settle before the condition snapshot.');

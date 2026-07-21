@@ -13,16 +13,25 @@ export interface InkRasterTileCacheStats {
   readonly missCount: number;
 }
 
+export type InkRasterTileResidency =
+  'building' | 'cold' | 'dirty' | 'near-visible' | 'ready' | 'stale' | 'visible';
+
+interface InkRasterTileInvalidationOptions {
+  readonly evictPresented?: boolean;
+}
+
 interface InkRasterTileEntry<Value> {
   readonly bounds: InkRasterTileBounds;
   readonly byteSize: number;
   lastAccess: number;
+  residency: InkRasterTileResidency;
   readonly value: Value;
 }
 
 /** Bounded non-DOM LRU for disposable committed raster tiles. */
 export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant {
   private bytes = 0;
+  private disposed = false;
   private readonly entries = new Map<string, InkRasterTileEntry<Value>>();
   private evictionCount = 0;
   private hitCount = 0;
@@ -42,6 +51,7 @@ export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant
   }
 
   get(key: string): Value | null {
+    this.assertUsable();
     const entry = this.entries.get(key);
     if (entry === undefined) {
       this.missCount += 1;
@@ -52,7 +62,24 @@ export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant
     return entry.value;
   }
 
-  put(key: string, value: Value, bounds: InkRasterTileBounds, byteSize: number): boolean {
+  /** Transfers one retained value to another owner without disposing its backing resource. */
+  take(key: string): Value | null {
+    this.assertUsable();
+    const entry = this.entries.get(key);
+    if (entry === undefined) return null;
+    this.entries.delete(key);
+    this.bytes -= entry.byteSize;
+    return entry.value;
+  }
+
+  put(
+    key: string,
+    value: Value,
+    bounds: InkRasterTileBounds,
+    byteSize: number,
+    residency: InkRasterTileResidency = 'cold',
+  ): boolean {
+    this.assertUsable();
     assertBounds(bounds);
     if (!Number.isSafeInteger(byteSize) || byteSize < 0) {
       throw new Error('Ink raster tile byte size must be a non-negative safe integer.');
@@ -66,6 +93,7 @@ export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant
       bounds,
       byteSize,
       lastAccess: this.coordinator.nextUse(),
+      residency,
       value,
     });
     this.bytes += byteSize;
@@ -75,15 +103,60 @@ export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant
   }
 
   setMaxBytes(maxBytes: number): void {
+    this.assertUsable();
     assertBudget(maxBytes);
     this.maxBytes = maxBytes;
     this.evictToBudget();
   }
 
-  invalidate(bounds: InkRasterTileBounds): void {
+  setResidency(key: string, residency: InkRasterTileResidency): boolean {
+    this.assertUsable();
+    const entry = this.entries.get(key);
+    if (entry === undefined) return false;
+    entry.residency = residency;
+    entry.lastAccess = this.coordinator.nextUse();
+    return true;
+  }
+
+  invalidate(bounds: InkRasterTileBounds, options: InkRasterTileInvalidationOptions = {}): void {
+    this.assertUsable();
     assertBounds(bounds);
     for (const [key, entry] of this.entries) {
-      if (intersects(entry.bounds, bounds)) this.delete(key, false);
+      if (!intersects(entry.bounds, bounds)) continue;
+      if (
+        options.evictPresented !== true &&
+        (entry.residency === 'visible' || entry.residency === 'dirty')
+      ) {
+        entry.residency = 'dirty';
+        entry.lastAccess = this.coordinator.nextUse();
+        continue;
+      }
+      this.delete(key, false);
+    }
+  }
+
+  invalidateAll(options: InkRasterTileInvalidationOptions = {}): void {
+    this.assertUsable();
+    for (const [key, entry] of this.entries) {
+      if (
+        options.evictPresented !== true &&
+        (entry.residency === 'visible' || entry.residency === 'dirty')
+      ) {
+        entry.residency = 'dirty';
+        entry.lastAccess = this.coordinator.nextUse();
+        continue;
+      }
+      this.delete(key, false);
+    }
+  }
+
+  markResidency(bounds: InkRasterTileBounds, residency: InkRasterTileResidency): void {
+    this.assertUsable();
+    assertBounds(bounds);
+    for (const entry of this.entries.values()) {
+      if (!intersects(entry.bounds, bounds)) continue;
+      entry.residency = residency;
+      entry.lastAccess = this.coordinator.nextUse();
     }
   }
 
@@ -92,7 +165,9 @@ export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant
   }
 
   dispose(): void {
+    if (this.disposed) return;
     this.clear();
+    this.disposed = true;
     this.coordinator.unregister(this);
   }
 
@@ -107,10 +182,19 @@ export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant
   }
 
   evictionCandidate(): InkDisposableMemoryEvictionCandidate | null {
+    if (this.disposed) return null;
     let selectedKey: string | null = null;
     let selected: InkRasterTileEntry<Value> | null = null;
     for (const [key, entry] of this.entries) {
-      if (selected === null || entry.lastAccess < selected.lastAccess) {
+      // These entries are the pixels currently preserving presentation continuity. Their byte
+      // budget is a lease, not an eviction hint: temporary over-budget retention is preferable
+      // to exposing a blank tile while the replacement is being built.
+      if (entry.residency === 'visible' || entry.residency === 'dirty') continue;
+      if (
+        selected === null ||
+        residencyEvictionRank(entry.residency) < residencyEvictionRank(selected.residency) ||
+        (entry.residency === selected.residency && entry.lastAccess < selected.lastAccess)
+      ) {
         selectedKey = key;
         selected = entry;
       }
@@ -120,22 +204,15 @@ export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant
       : {
           evict: () => this.delete(selectedKey, true),
           lastUsed: selected.lastAccess,
-          visible: false,
+          visible: selected.residency === 'visible',
         };
   }
 
   private evictToBudget(): void {
     while (this.bytes > this.maxBytes && this.entries.size > 0) {
-      let oldestKey: string | null = null;
-      let oldestAccess = Number.POSITIVE_INFINITY;
-      for (const [key, entry] of this.entries) {
-        if (entry.lastAccess < oldestAccess) {
-          oldestAccess = entry.lastAccess;
-          oldestKey = key;
-        }
-      }
-      if (oldestKey === null) return;
-      this.delete(oldestKey, true);
+      const candidate = this.evictionCandidate();
+      if (candidate === null) return;
+      candidate.evict();
     }
   }
 
@@ -146,6 +223,28 @@ export class InkRasterTileCache<Value> implements InkDisposableMemoryParticipant
     this.bytes -= entry.byteSize;
     if (eviction) this.evictionCount += 1;
     this.disposeValue(entry.value);
+  }
+
+  private assertUsable(): void {
+    if (this.disposed) throw new Error('Ink raster tile cache has been disposed.');
+  }
+}
+
+function residencyEvictionRank(residency: InkRasterTileResidency): number {
+  switch (residency) {
+    case 'stale':
+      return 0;
+    case 'cold':
+      return 1;
+    case 'ready':
+    case 'building':
+      return 2;
+    case 'near-visible':
+      return 3;
+    case 'dirty':
+      return 4;
+    case 'visible':
+      return 5;
   }
 }
 

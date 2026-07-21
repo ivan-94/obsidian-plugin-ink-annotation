@@ -114,10 +114,12 @@ export function analyzeLocalObsidianCapture(capture) {
   const drawingRenderRuntime = conditions.filter((condition) =>
     DRAWING_TRACES.includes(condition.trace),
   );
-  const hangingSpanCount = auditedDiagnostics.reduce(
-    (total, diagnostics) => total + diagnostics.hangingSpanCount,
-    0,
-  );
+  const hangingSpanCount =
+    conditions.reduce(
+      (total, condition) =>
+        total + criticalHangingSpanCount(condition.diagnostics, condition.trace === 'done-save'),
+      0,
+    ) + criticalHangingSpanCount(capture.soak.diagnostics, false);
   const openContactCount = auditedDiagnostics.reduce(
     (total, diagnostics) => total + diagnostics.openContactCount,
     0,
@@ -173,7 +175,7 @@ export function analyzeLocalObsidianCapture(capture) {
     }),
     budget('sample-minimums', hasSampleMinimums(conditions), {
       actual: minimumSamples(conditions),
-      limit: { idle: 120, move: 1_000, strokeCommit: 100, viewport: 5 },
+      limit: { idle: 120, move: 1_000, strokeCommit: 100, viewport: 1 },
     }),
     budget('hanging-span-count', hangingSpanCount === 0, {
       actual: hangingSpanCount,
@@ -374,7 +376,7 @@ export function analyzeLocalObsidianCapture(capture) {
     ),
     budget('viewport-redraw-coalescing', viewportRedrawsAreCoalesced(conditions), {
       actual: viewportRedrawCounts(conditions),
-      limit: '5..8 redraws per 120-scroll viewport condition',
+      limit: '1..2 settled redraws per 120-scroll viewport condition',
     }),
     budget('forbidden-hot-path-work', forbiddenHotPathWork.length === 0, {
       actual: forbiddenHotPathWork,
@@ -1070,6 +1072,7 @@ function assertDiagnostics(diagnostics) {
   if (
     !Array.isArray(diagnostics.armedAuditGuards) ||
     !Array.isArray(diagnostics.auditedWork) ||
+    !Array.isArray(diagnostics.hangingSpans) ||
     !Array.isArray(diagnostics.recentSpans) ||
     !Array.isArray(diagnostics.forbiddenWork) ||
     !isRecord(diagnostics.frameIntervalsMs) ||
@@ -1085,6 +1088,17 @@ function assertDiagnostics(diagnostics) {
   }
   if (!Number.isSafeInteger(diagnostics.droppedSpanCount) || diagnostics.droppedSpanCount < 0) {
     throw new Error('Local Obsidian diagnostics require a non-negative dropped span count.');
+  }
+  for (const span of diagnostics.hangingSpans) {
+    if (
+      !isRecord(span) ||
+      !Number.isSafeInteger(span.count) ||
+      span.count <= 0 ||
+      typeof span.name !== 'string' ||
+      typeof span.workPhase !== 'string'
+    ) {
+      throw new Error('Local Obsidian hanging span diagnostics are malformed.');
+    }
   }
   for (const key of ['activeWriting', 'hostGaps', 'idle']) {
     if (!Array.isArray(diagnostics.frameIntervalsMs[key])) {
@@ -1277,7 +1291,7 @@ function hasSampleMinimums(conditions) {
       const viewport = acceptedSpans(spans, 'ink-viewport-redraw').length;
       if (idle < 120) return false;
       if (DRAWING_TRACES.includes(condition.trace)) return moves >= 1_000 && commits >= 100;
-      if (condition.trace === 'viewport') return viewport >= 5;
+      if (condition.trace === 'viewport') return viewport >= 1;
       if (condition.trace === 'responsive-commands') {
         return responsiveCommandSampleCounts(spans).passed;
       }
@@ -1299,7 +1313,7 @@ function viewportRedrawCounts(conditions) {
 
 function viewportRedrawsAreCoalesced(conditions) {
   const counts = viewportRedrawCounts(conditions);
-  return counts.length === 2 && counts.every(({ count }) => count >= 5 && count <= 8);
+  return counts.length === 2 && counts.every(({ count }) => count >= 1 && count <= 2);
 }
 
 function minimumSamples(conditions) {
@@ -1568,6 +1582,18 @@ function finiteNumbers(values, name) {
   if (values.some((value) => typeof value !== 'number' || !Number.isFinite(value) || value < 0)) {
     throw new Error(`Local Obsidian capture has invalid ${name}.`);
   }
+}
+
+function criticalHangingSpanCount(diagnostics, allowBestEffortPreview) {
+  if (!allowBestEffortPreview) return diagnostics.hangingSpanCount;
+  const allowed = diagnostics.hangingSpans.reduce(
+    (total, span) =>
+      span.workPhase === 'preview' && span.name.startsWith('ink-preview-')
+        ? total + span.count
+        : total,
+    0,
+  );
+  return Math.max(0, diagnostics.hangingSpanCount - allowed);
 }
 
 function finiteNonNegative(value) {

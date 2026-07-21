@@ -34,23 +34,46 @@ import {
 } from '../domain/ink-brush-geometry-contract';
 import { SharedInkStrokeGeometry } from '../domain/ink-shared-stroke-geometry';
 import type { InkPoint, InkStroke } from '../domain/ink-surface';
+import { InkEditTileContentIndex } from '../domain/ink-edit-tile-content-index';
+import { InkTileContentKeyFactory } from '../domain/ink-tile-content-key';
+import {
+  createInkVersionedRenderOutset,
+  InkTileDamageProjector,
+} from '../domain/ink-tile-damage-projector';
+import {
+  createInkNoteLogicalRect,
+  type InkNoteLogicalRect,
+  InkWorldTileGrid,
+  type InkWorldTileCoordinate,
+} from '../domain/ink-world-tile-grid';
+import { InkViewportDemandPlanner } from '../domain/ink-viewport-demand-planner';
 import {
   NOOP_INK_PERFORMANCE_RECORDER,
   type InkPerformanceContact,
   type InkPerformanceRecorder,
 } from '../runtime/ink-performance-diagnostics';
+import type { InkWorkScheduler } from '../runtime/ink-work-scheduler';
 import {
   INK_GEOMETRY_CACHE_BYTES_PER_MOUNT,
+  InkDisposableMemoryReservation,
   InkGeometryCache,
   type InkGeometryCacheCoordinator,
 } from './ink-geometry-cache';
-import { InkRasterTileCache, type InkRasterTileBounds } from './ink-raster-tile-cache';
+import {
+  InkRasterTileCache,
+  type InkRasterTileBounds,
+  type InkRasterTileResidency,
+} from './ink-raster-tile-cache';
 import {
   drawInkBrushGeometryToCanvas,
   drawInkBrushSelectionChromeToCanvas,
 } from './ink-brush-canvas-adapter';
 import type { InkBorrowedProvisionalTail } from './ink-capture-pipeline';
 import { sameInkStageFrame, type InkStageFrame } from './ink-stage-frame';
+import {
+  InkViewportPresentationTransaction,
+  type InkViewportCameraMotion,
+} from './ink-viewport-presentation-transaction';
 import {
   prepareInkWorkerOffscreenPresentationAdapter,
   type InkWorkerPresentationAck,
@@ -115,6 +138,7 @@ export interface InkRenderRuntimeStats {
   readonly cacheEntries: number;
   readonly committedCompileCount: number;
   readonly compositorLayerCount: 3;
+  readonly editSceneRevision: number;
   readonly indexBytes: number;
   readonly lastActiveSubmittedSegmentCount: number;
   readonly queuedFrameCount: 0 | 1;
@@ -295,6 +319,32 @@ interface CommittedRasterTile {
   readonly digests: ReadonlyArray<readonly [strokeId: string, digest: string]>;
 }
 
+interface CommittedRasterRegion {
+  readonly bounds: InkRasterTileBounds;
+  readonly coordinate: InkWorldTileCoordinate;
+  readonly key: string;
+  readonly rasterDensity: number;
+}
+
+interface CommittedRasterVisiblePlan {
+  readonly devicePixelRatio: number;
+  readonly frame: InkStageFrame;
+  readonly generation: number;
+  readonly regions: readonly CommittedRasterRegion[];
+}
+
+interface CommittedRasterTileBuildState {
+  readonly bounds: InkRasterTileBounds;
+  readonly canvas: HTMLCanvasElement;
+  readonly context: CanvasRenderingContext2D;
+  readonly digests: Array<readonly [strokeId: string, digest: string]>;
+  readonly key: string;
+  nextRef: number;
+  pendingGeometry: CompiledInkStroke | null;
+  readonly residency: InkRasterTileResidency;
+  readonly refs: readonly InkRenderableStrokeRef[];
+}
+
 export interface InkRenderOverlay {
   readonly hovered: readonly InkRenderableStrokeRef[];
   readonly selected: readonly InkRenderableStrokeRef[];
@@ -325,13 +375,31 @@ type ActiveNumericPathEncoding = 'legacy-ink-point' | 'raw-spherical-sample';
 
 const DEFAULT_DPR = (): number => Math.max(1, globalThis.devicePixelRatio || 1);
 const DEFAULT_WORKER_REFRESH_INTERVAL_MS = 1_000 / 60;
-const COMMITTED_RASTER_TILE_CSS_SIZE = 128;
-const COMMITTED_RASTER_TILES_PER_FRAME = 2;
+const COMMITTED_RASTER_TILE_CSS_SIZE = 120;
 const COMMITTED_RASTER_VIEWPORT_MULTIPLIER = 1.5;
+const COMMITTED_RASTER_TILE_GRID = new InkWorldTileGrid({
+  baseWorldSpan: COMMITTED_RASTER_TILE_CSS_SIZE,
+});
+const COMMITTED_RASTER_DEMAND_PLANNER = new InkViewportDemandPlanner({
+  grid: COMMITTED_RASTER_TILE_GRID,
+  lookAheadRings: 1,
+  nearVisibleRings: 1,
+});
+const COMMITTED_RASTER_DAMAGE_PROJECTOR = new InkTileDamageProjector(COMMITTED_RASTER_TILE_GRID);
+const COMMITTED_RASTER_RENDER_OUTSET = createInkVersionedRenderOutset({
+  bottom: 64,
+  left: 64,
+  rendererVersion: 'ink-retained-tile-v1-outset-64',
+  right: 64,
+  top: 64,
+});
+const COMMITTED_RASTER_TILE_KEY_FACTORY = new InkTileContentKeyFactory();
+const COMMITTED_RASTER_TILE_RENDERER_VERSION = 'ink-retained-tile-v1';
 const DEFAULT_WORKER_DEADLINE_SCHEDULER: InkWorkerPresentationDeadlineScheduler = Object.freeze({
   cancel: (handle: unknown) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
   schedule: (callback: () => void, delayMs: number) => globalThis.setTimeout(callback, delayMs),
 });
+let nextEditTileSession = 0;
 
 export class InkRenderRuntime {
   private active: ActiveRenderState | null = null;
@@ -344,6 +412,17 @@ export class InkRenderRuntime {
   private readonly cancelFrame: (handle: number) => void;
   private readonly committedCanvas: HTMLCanvasElement;
   private readonly committedContext: CanvasRenderingContext2D;
+  private readonly committedTileScene: HTMLElement;
+  private readonly committedRasterBuildMemory: InkDisposableMemoryReservation;
+  private committedRasterBuild: CommittedRasterTileBuildState | null = null;
+  private committedRasterBudget = -1;
+  private committedRasterPrefetchAdmissionBlocked = false;
+  private committedRasterPrefetchGeneration = 0;
+  private committedRasterPrefetchScheduledGeneration: number | null = null;
+  private committedRasterMotionDemandKey: string | null = null;
+  private committedRasterVisibleBuildGeneration = 0;
+  private committedRasterVisibleBuildScheduledGeneration: number | null = null;
+  private committedRasterVisiblePlan: CommittedRasterVisiblePlan | null = null;
   private committedRasterPreparationIncomplete = false;
   private readonly committedRasterTiles: InkRasterTileCache<CommittedRasterTile>;
   private backingStoreDimensionMutationCount = 0;
@@ -351,6 +430,16 @@ export class InkRenderRuntime {
   private disposed = false;
   private readonly dpr: () => number;
   private readonly document: Document;
+  private readonly editProjectionIdentity = `mounted-edit-v1:${++nextEditTileSession}`;
+  private readonly editTileContentIndex = new InkEditTileContentIndex({
+    grid: COMMITTED_RASTER_TILE_GRID,
+    projectionIdentity: this.editProjectionIdentity,
+  });
+  private readonly viewportTransaction = new InkViewportPresentationTransaction({
+    hysteresisRatio: 0.1,
+    maximumLod: 8,
+    minimumLod: -8,
+  });
   private deferredFrame: InkStageFrame | null = null;
   private deferredViewportInvalidation = false;
   private frame: InkStageFrame | null = null;
@@ -361,6 +450,7 @@ export class InkRenderRuntime {
   private readonly sharedGeometry = new SharedInkStrokeGeometry();
   private readonly host: HTMLElement;
   private readonly inkPerformance: InkPerformanceRecorder;
+  private readonly workScheduler: InkWorkScheduler | null;
   private lastActiveSubmittedSegmentCount = 0;
   private readonly now: () => number;
   private readonly onDiagnostic: (message: string) => void;
@@ -402,12 +492,18 @@ export class InkRenderRuntime {
   private pendingDocumentInstall = false;
   private pendingVisibleRecoveryReason: InkVisibleRecoveryRebuildReason | null = null;
   private pendingActiveFrameRequestedAt: number | null = null;
+  private pendingCommittedPrefetchRegions: readonly CommittedRasterRegion[] = [];
   private pendingPresentationGeneration: number | null = null;
+  private readonly presentedPromotionDigests = new Map<string, string>();
+  private prefetchedCommittedLod: number | null = null;
+  private readonly prefetchedCommittedTileKeys = new Set<string>();
+  private readonly presentedCommittedTileKeys = new Set<string>();
   private readonly pendingPromotions = new Map<string, string>();
   private pendingWorkerAck: PendingWorkerPresentationAck | null = null;
   private preparedWorker: PreparedWorkerPresentation | null = null;
   private presentationFrameEpoch = -1;
   private projectedFrame: InkStageFrame | null = null;
+  private lastCommittedViewport: InkNoteLogicalRect | null = null;
   private readonly query: (viewport: InkLogicalRect) => readonly InkRenderableStrokeRef[];
   private readonly read: () => InkDocumentReadView;
   private readonly requestFrame: (callback: FrameRequestCallback) => number;
@@ -471,6 +567,7 @@ export class InkRenderRuntime {
     readonly query: (viewport: InkLogicalRect) => readonly InkRenderableStrokeRef[];
     readonly read: () => InkDocumentReadView;
     readonly requestFrame?: (callback: FrameRequestCallback) => number;
+    readonly workScheduler?: InkWorkScheduler;
     readonly workerPresentation?: InkWorkerPresentationRuntimeOptions;
   }) {
     this.document = input.document;
@@ -483,10 +580,14 @@ export class InkRenderRuntime {
       (input.memoryCoordinator === undefined
         ? new InkGeometryCache()
         : new InkGeometryCache({ coordinator: input.memoryCoordinator }));
+    this.committedRasterBuildMemory = new InkDisposableMemoryReservation(
+      this.cache.memoryCoordinator,
+    );
     this.requestFrame = input.requestFrame ?? ((callback) => requestAnimationFrame(callback));
     this.cancelFrame = input.cancelFrame ?? ((handle) => cancelAnimationFrame(handle));
     this.dpr = input.devicePixelRatio ?? DEFAULT_DPR;
     this.inkPerformance = input.inkPerformance ?? NOOP_INK_PERFORMANCE_RECORDER;
+    this.workScheduler = input.workScheduler ?? null;
     this.inkPerformance.armAuditGuard('physical-finalize-no-recompile');
     this.now = input.now ?? (() => performance.now());
     this.onDiagnostic = input.onDiagnostic ?? (() => undefined);
@@ -497,6 +598,7 @@ export class InkRenderRuntime {
     this.requestedPresentationAdapter =
       input.workerPresentation?.enabled === true ? 'worker-offscreen-2d' : 'main-canvas-2d';
     this.committedCanvas = createCanvas(input.document, 'committed');
+    this.committedTileScene = createCommittedTileScene(input.document);
     this.activeStack = createActiveStack(input.document);
     this.committedContext = requireContext(this.committedCanvas);
     this.supportsCommittedRasterTiles =
@@ -505,6 +607,12 @@ export class InkRenderRuntime {
     this.committedRasterTiles = new InkRasterTileCache(
       0,
       (tile) => {
+        const key = tile.canvas.dataset.inkstoneCommittedTile;
+        if (key !== undefined) {
+          this.prefetchedCommittedTileKeys.delete(key);
+          this.presentedCommittedTileKeys.delete(key);
+        }
+        tile.canvas.remove();
         tile.canvas.width = 0;
         tile.canvas.height = 0;
       },
@@ -517,7 +625,7 @@ export class InkRenderRuntime {
     this.committedCanvas.addEventListener('contextrestored', this.onContextRestored);
     this.attachMainActivePairListeners(activePair);
     this.activeStack.append(this.activeStableCanvas, this.activeCanvas);
-    this.host.append(this.committedCanvas, this.activeStack);
+    this.host.append(this.committedTileScene, this.committedCanvas, this.activeStack);
     if (input.workerPresentation?.enabled === true) {
       this.workerAckDeadlineMs = boundedWorkerAckDeadline(input.workerPresentation);
       this.workerDeadlineScheduler =
@@ -854,7 +962,10 @@ export class InkRenderRuntime {
 
   setFrame(frame: InkStageFrame): void {
     if (this.disposed) return;
-    if (this.active !== null) {
+    if (
+      this.activePerformanceContact !== null ||
+      (this.active !== null && this.active.finalized === null)
+    ) {
       if (sameInkStageFrame(this.deferredFrame ?? this.frame, frame)) return;
       this.deferredFrame = sameInkStageFrame(this.frame, frame) ? null : frame;
       return;
@@ -864,7 +975,14 @@ export class InkRenderRuntime {
 
   /** Compositor-only preview used while a scroll/zoom gesture is still changing the viewport. */
   projectFrame(frame: InkStageFrame): void {
-    if (this.disposed || this.frame === null || this.active !== null) return;
+    if (
+      this.disposed ||
+      this.frame === null ||
+      this.activePerformanceContact !== null ||
+      (this.active !== null && this.active.finalized === null)
+    ) {
+      return;
+    }
     if (sameInkStageFrame(this.frame, frame)) {
       this.clearBitmapProjection();
       return;
@@ -880,6 +998,14 @@ export class InkRenderRuntime {
       frame.canvasClientRect.top -
       scale * (base.documentClientOrigin.y - base.canvasClientRect.top);
     const transform = `matrix(${scale}, 0, 0, ${scale}, ${translateX}, ${translateY})`;
+    this.projectCommittedTileScene(
+      frame,
+      frame.actualScale === base.actualScale ? 'scroll' : 'zoom',
+      this.presentationFrameEpoch + 1,
+    );
+    if (frame.actualScale === base.actualScale) {
+      this.planCommittedRasterMotionPrefetch(frame, this.viewportTransaction.snapshot()?.targetLod);
+    }
     for (const layer of [this.committedCanvas, this.activeStack]) {
       layer.style.transformOrigin = '0 0';
       layer.style.transform = transform;
@@ -893,6 +1019,7 @@ export class InkRenderRuntime {
     const previousFrame = this.frame;
     this.clearActivePrediction();
     this.presentationFrameEpoch += 1;
+    this.invalidateCommittedRasterVisibleBuild();
     this.frame = frame;
     if (this.activePair.kind === 'worker-activating') {
       this.fallbackActivatingWorkerPairToMain(this.activePair);
@@ -903,13 +1030,16 @@ export class InkRenderRuntime {
     this.frameReplacementPending = true;
     this.pendingVisibleRecoveryReason =
       previousFrame === null ? 'initial-document-install' : 'backing-replacement';
-    if (this.active !== null) this.active.pendingFullRedraw = true;
+    if (this.active?.finalized === null) this.active.pendingFullRedraw = true;
     this.schedule();
   }
 
   invalidateViewport(): void {
     if (this.disposed || this.frame === null) return;
-    if (this.active !== null) {
+    if (
+      this.activePerformanceContact !== null ||
+      (this.active !== null && this.active.finalized === null)
+    ) {
       this.deferredViewportInvalidation = true;
       return;
     }
@@ -918,6 +1048,7 @@ export class InkRenderRuntime {
 
   private invalidateViewportNow(): void {
     this.clearActivePrediction();
+    this.invalidateCommittedRasterVisibleBuild();
     if (this.activePair.kind === 'worker-activating') {
       this.fallbackActivatingWorkerPairToMain(this.activePair);
     } else if (this.active !== null && this.activePair.kind === 'worker-offscreen-2d') {
@@ -925,7 +1056,7 @@ export class InkRenderRuntime {
       this.fallbackWorkerPairToMain(this.activePair);
     }
     this.frameReplacementPending = true;
-    if (this.active !== null) this.active.pendingFullRedraw = true;
+    if (this.active?.finalized === null) this.active.pendingFullRedraw = true;
     this.schedule();
   }
 
@@ -943,8 +1074,11 @@ export class InkRenderRuntime {
 
   installDocument(read: InkDocumentReadView): void {
     if (this.disposed) return;
+    this.invalidateCommittedRasterVisibleBuild();
     this.cache.setIndexBytes(read.indexBytes);
-    this.committedRasterTiles.dispose();
+    this.cancelCommittedRasterBuild();
+    this.resetCommittedRasterPrefetch(true);
+    this.committedRasterTiles.clear();
     this.pendingDocumentInstall = true;
     this.pendingVisibleRecoveryReason = 'initial-document-install';
     this.schedule();
@@ -963,9 +1097,42 @@ export class InkRenderRuntime {
     const changeKey = `${change.generation}:${change.commandId}`;
     if (this.seenDocumentChanges.has(changeKey)) return;
     this.seenDocumentChanges.add(changeKey);
+    this.invalidateCommittedRasterVisibleBuild();
+    this.cancelCommittedRasterBuild();
+    this.resetCommittedRasterPrefetch(false);
     const dirtyBounds = changeBounds(change);
-    if (dirtyBounds === null) this.committedRasterTiles.clear();
-    else this.committedRasterTiles.invalidate(dirtyBounds);
+    const damage =
+      dirtyBounds === null
+        ? Object.freeze({
+            kind: 'untileable-range' as const,
+            rendererVersion: COMMITTED_RASTER_RENDER_OUTSET.rendererVersion,
+          })
+        : COMMITTED_RASTER_DAMAGE_PROJECTOR.project(
+            change.bounds.flatMap(({ newBounds, oldBounds }) =>
+              [newBounds, oldBounds].flatMap((bounds) =>
+                bounds === null || bounds === undefined
+                  ? []
+                  : [
+                      createInkNoteLogicalRect({
+                        height: bounds.height,
+                        width: bounds.width,
+                        x: bounds.x,
+                        y: bounds.y,
+                      }),
+                    ],
+              ),
+            ),
+            COMMITTED_RASTER_RENDER_OUTSET,
+            this.viewportTransaction.snapshot()?.targetLod ?? 0,
+          );
+    this.editTileContentIndex.applyDamage(damage);
+    if (dirtyBounds === null) {
+      this.committedRasterTiles.invalidateAll();
+      this.pendingDocumentInstall = true;
+      this.pendingVisibleRecoveryReason = 'unclassified-document-change';
+    } else {
+      this.committedRasterTiles.markResidency(dirtyBounds, 'dirty');
+    }
     const replaced = [...change.updatedIds, ...change.removedIds];
     this.cache.invalidateStrokeIds(replaced);
     for (const id of replaced) {
@@ -1006,8 +1173,10 @@ export class InkRenderRuntime {
         throw new Error('InkRenderRuntime already owns another active stroke.');
       }
       // The prior Logical Stroke is already in the Live Document and is only waiting for the
-      // committed promotion frame. Retire its Active pixels so a rapid next contact never blocks;
-      // the pending digest remains fenced until that committed frame is actually drawn.
+      // committed promotion frame. Stage its already-compiled geometry on the committed overlay
+      // before retiring the shared Active pair, so a rapid next contact cannot make it disappear
+      // while committed tile work is correctly paused for that new contact.
+      this.presentPromotingActive(this.active);
       this.retirePromotingActive();
     }
     const beginsContact = this.active === null;
@@ -1334,7 +1503,17 @@ export class InkRenderRuntime {
       this.pendingActiveFrameRequestedAt = null;
     }
     this.activePerformanceContact = contact;
-    if (contact === null && contactWasActive && this.hasPendingCommittedWork()) this.schedule();
+    if (contact === null && contactWasActive) {
+      if (
+        this.active !== null &&
+        this.active.finalized !== null &&
+        (this.deferredFrame !== null || this.deferredViewportInvalidation)
+      ) {
+        this.applyDeferredViewportMutation();
+      }
+      if (this.hasPendingCommittedWork()) this.schedule();
+      this.scheduleCommittedRasterPrefetch();
+    }
   }
 
   setCommittedExclusions(strokeIds: readonly string[]): void {
@@ -1353,12 +1532,33 @@ export class InkRenderRuntime {
         .strokes.filter(({ id }) => changedIds.has(id))
         .map(({ bounds }) => bounds),
     );
+    this.invalidateCommittedRasterVisibleBuild();
     this.excludedCommittedIds = next;
+    this.cancelCommittedRasterBuild();
+    this.resetCommittedRasterPrefetch(false);
     if (dirty === null) {
-      this.committedRasterTiles.clear();
+      this.editTileContentIndex.applyDamage({
+        kind: 'untileable-range',
+        rendererVersion: COMMITTED_RASTER_RENDER_OUTSET.rendererVersion,
+      });
+      this.committedRasterTiles.invalidateAll();
       this.pendingDocumentInstall = true;
       this.pendingVisibleRecoveryReason = 'unclassified-document-change';
     } else {
+      this.editTileContentIndex.applyDamage(
+        COMMITTED_RASTER_DAMAGE_PROJECTOR.project(
+          [
+            createInkNoteLogicalRect({
+              height: dirty.height,
+              width: dirty.width,
+              x: dirty.x,
+              y: dirty.y,
+            }),
+          ],
+          COMMITTED_RASTER_RENDER_OUTSET,
+          this.viewportTransaction.snapshot()?.targetLod ?? 0,
+        ),
+      );
       this.committedRasterTiles.invalidate(dirty);
       this.pendingCommittedDamage.push(dirty);
     }
@@ -1423,12 +1623,15 @@ export class InkRenderRuntime {
 
   restoreContexts(): void {
     if (this.disposed) return;
+    this.invalidateCommittedRasterVisibleBuild();
     this.clearActivePrediction();
     this.lostContexts.clear();
     this.frameReplacementPending = true;
     this.pendingDocumentInstall = true;
     if (this.active !== null) this.active.pendingFullRedraw = true;
     this.cache.clear();
+    this.cancelCommittedRasterBuild();
+    this.resetCommittedRasterPrefetch(true);
     this.committedRasterTiles.clear();
     this.pendingVisibleRecoveryReason = 'canvas-context-restoration';
     this.schedule();
@@ -1467,6 +1670,7 @@ export class InkRenderRuntime {
       cacheEntries: cache.entryCount,
       committedCompileCount: this.committedCompileCount,
       compositorLayerCount: 3,
+      editSceneRevision: this.editTileContentIndex.sceneRevision,
       indexBytes: cache.indexBytes,
       lastActiveSubmittedSegmentCount: this.lastActiveSubmittedSegmentCount,
       queuedFrameCount: this.frameHandle === null ? 0 : 1,
@@ -1492,6 +1696,7 @@ export class InkRenderRuntime {
     if (this.disposed) return;
     this.clearActivePrediction();
     this.disposed = true;
+    this.invalidateCommittedRasterVisibleBuild();
     this.activePresentationAdapterSnapshot = null;
     if (this.frameHandle !== null) this.cancelFrame(this.frameHandle);
     this.frameHandle = null;
@@ -1502,8 +1707,11 @@ export class InkRenderRuntime {
     this.preparedWorker?.prepared.dispose();
     this.preparedWorker = null;
     this.lostContexts.clear();
+    this.cancelCommittedRasterBuild();
+    this.resetCommittedRasterPrefetch(true);
+    this.committedRasterBuildMemory.dispose();
     this.cache.dispose();
-    this.committedRasterTiles.clear();
+    this.committedRasterTiles.dispose();
     this.committedCanvas.removeEventListener('contextlost', this.onContextLost);
     this.committedCanvas.removeEventListener('contextrestored', this.onContextRestored);
     if (this.activePair.kind === 'main-2d') {
@@ -1515,6 +1723,7 @@ export class InkRenderRuntime {
     }
     this.activeStack.remove();
     this.committedCanvas.remove();
+    this.committedTileScene.remove();
   }
 
   private schedule(): void {
@@ -1577,6 +1786,7 @@ export class InkRenderRuntime {
     let activeDraw: ActiveDrawResult = 'none';
     let frameBackingReady = true;
     let presentedChanges: readonly InkDocumentChange[] = [];
+    let commandPatchPresented = false;
     let overlayPresented = false;
     let submittedThroughGeneration: number | null = null;
     let succeeded = false;
@@ -1594,7 +1804,7 @@ export class InkRenderRuntime {
         const targetHeight = Math.max(1, Math.round(frame.canvasClientRect.height * ratio));
         if (this.prepareCommittedRasterTiles(frame, targetWidth, targetHeight) === 'pending') {
           frameBackingReady = false;
-          this.schedule();
+          if (!this.scheduleCommittedRasterVisibleBuild(frame)) this.schedule();
         }
       }
       if (this.frameReplacementPending && frameBackingReady) {
@@ -1609,38 +1819,64 @@ export class InkRenderRuntime {
             frame,
             this.pendingVisibleRecoveryReason ?? 'settled-projection',
           );
-        } else if (
-          this.supportsCommittedRasterTiles &&
-          (this.pendingChanges.length > 0 || this.pendingCommittedDamage.length > 0)
-        ) {
-          for (const change of this.pendingChanges) {
-            if (isAddedOnlyDocumentChange(change)) {
-              viewportResultCount += this.drawDocumentChange(frame, change);
-              continue;
+        } else {
+          if (
+            this.supportsCommittedRasterTiles &&
+            !this.committedTileScene.hidden &&
+            this.pendingChanges.length > 0 &&
+            (this.pendingCommittedDamage.length > 0 ||
+              this.pendingChanges.some(
+                (change) =>
+                  !isAddedOnlyDocumentChange(change) || !this.hasMatchingActivePromotion(change),
+              ))
+          ) {
+            const dirty = unionBounds(...this.pendingChanges.map((change) => changeBounds(change)));
+            const patched = dirty === null ? null : this.presentCommittedCommandPatch(frame, dirty);
+            if (patched !== null && dirty !== null) {
+              viewportResultCount += patched;
+              presentedChanges = this.pendingChanges;
+              this.pendingChanges = [];
+              commandPatchPresented = true;
             }
-            const dirty = changeBounds(change);
-            viewportResultCount +=
-              dirty === null
-                ? this.redrawCommittedViewport(frame, 'unclassified-document-change')
-                : this.redrawCommittedRasterDamage(frame, dirty);
-            if (this.committedRasterPreparationIncomplete) break;
           }
-          if (!this.committedRasterPreparationIncomplete) {
-            for (const dirty of this.pendingCommittedDamage) {
-              viewportResultCount += this.redrawCommittedRasterDamage(frame, dirty);
+
+          if (
+            !commandPatchPresented &&
+            this.supportsCommittedRasterTiles &&
+            (this.pendingChanges.length > 0 || this.pendingCommittedDamage.length > 0)
+          ) {
+            for (const change of this.pendingChanges) {
+              if (isAddedOnlyDocumentChange(change)) {
+                viewportResultCount += this.drawDocumentChange(frame, change);
+                continue;
+              }
+              const dirty = changeBounds(change);
+              viewportResultCount +=
+                dirty === null
+                  ? this.redrawCommittedViewport(frame, 'unclassified-document-change')
+                  : this.redrawCommittedRasterDamage(frame, dirty);
               if (this.committedRasterPreparationIncomplete) break;
             }
-          }
-        } else {
-          for (const change of this.pendingChanges) {
-            viewportResultCount += this.drawDocumentChange(frame, change);
-          }
-          for (const dirty of this.pendingCommittedDamage) {
-            viewportResultCount += this.redrawCommittedBounds(frame, dirty);
+            if (!this.committedRasterPreparationIncomplete) {
+              for (const dirty of this.pendingCommittedDamage) {
+                viewportResultCount += this.redrawCommittedRasterDamage(frame, dirty);
+                if (this.committedRasterPreparationIncomplete) break;
+              }
+            }
+          } else if (!commandPatchPresented) {
+            for (const change of this.pendingChanges) {
+              viewportResultCount += this.drawDocumentChange(frame, change);
+            }
+            for (const dirty of this.pendingCommittedDamage) {
+              viewportResultCount += this.redrawCommittedBounds(frame, dirty);
+            }
           }
         }
-        if (this.committedRasterPreparationIncomplete) {
-          this.schedule();
+        if (commandPatchPresented) {
+          // The copy-on-write patch is the matching command presentation. Exact replacement tiles
+          // continue in the visible lane without delaying this command generation.
+        } else if (this.committedRasterPreparationIncomplete) {
+          if (!this.scheduleCommittedRasterVisibleBuild(frame)) this.schedule();
         } else {
           presentedChanges = this.pendingChanges;
           this.pendingChanges = [];
@@ -1700,6 +1936,82 @@ export class InkRenderRuntime {
       this.pendingCommittedDamage.length > 0 ||
       this.pendingChanges.length > 0
     );
+  }
+
+  private scheduleCommittedRasterVisibleBuild(frame: InkStageFrame): boolean {
+    const scheduler = this.workScheduler;
+    if (scheduler === null) return false;
+    if (
+      this.disposed ||
+      (this.active !== null && this.active.finalized === null) ||
+      this.activePerformanceContact !== null ||
+      this.committedRasterVisibleBuildScheduledGeneration !== null
+    ) {
+      return true;
+    }
+    const generation = this.committedRasterVisibleBuildGeneration;
+    let preparation: CommittedRasterPreparation = 'pending';
+    this.committedRasterVisibleBuildScheduledGeneration = generation;
+    void scheduler
+      .schedule({
+        isCurrent: () =>
+          !this.disposed &&
+          generation === this.committedRasterVisibleBuildGeneration &&
+          this.frame === frame &&
+          (this.active === null || this.active.finalized !== null) &&
+          this.activePerformanceContact === null,
+        lane: 'visible',
+        unitKinds: ['edit-visible-tile-build-unit'],
+        units: [
+          () => {
+            this.committedRasterPreparationIncomplete = false;
+            const ratio = Math.max(1, this.dpr());
+            preparation = this.prepareCommittedRasterTiles(
+              frame,
+              Math.max(1, Math.round(frame.canvasClientRect.width * ratio)),
+              Math.max(1, Math.round(frame.canvasClientRect.height * ratio)),
+            );
+          },
+        ],
+      })
+      .then(
+        (outcome) => {
+          if (this.committedRasterVisibleBuildScheduledGeneration !== generation) return;
+          this.committedRasterVisibleBuildScheduledGeneration = null;
+          if (
+            this.disposed ||
+            generation !== this.committedRasterVisibleBuildGeneration ||
+            this.frame !== frame
+          ) {
+            return;
+          }
+          if (outcome === 'completed' && preparation !== 'pending') {
+            this.schedule();
+            return;
+          }
+          this.scheduleCommittedRasterVisibleBuild(frame);
+        },
+        (error: unknown) => {
+          if (this.committedRasterVisibleBuildScheduledGeneration === generation) {
+            this.committedRasterVisibleBuildScheduledGeneration = null;
+          }
+          this.onDiagnostic(
+            `Visible committed raster build stopped after a scheduled failure: ${
+              error instanceof Error ? error.message : 'unknown failure'
+            }`,
+          );
+          if (!this.disposed && generation === this.committedRasterVisibleBuildGeneration) {
+            this.schedule();
+          }
+        },
+      );
+    return true;
+  }
+
+  private invalidateCommittedRasterVisibleBuild(): void {
+    this.committedRasterVisibleBuildGeneration += 1;
+    this.committedRasterVisibleBuildScheduledGeneration = null;
+    this.committedRasterVisiblePlan = null;
   }
 
   private configureCanvases(frame: InkStageFrame): void {
@@ -1770,12 +2082,41 @@ export class InkRenderRuntime {
 
   private clearBitmapProjection(): void {
     if (this.projectedFrame === null) return;
+    if (this.frame === null || !sameInkStageFrame(this.frame, this.projectedFrame)) return;
     this.projectedFrame = null;
     for (const layer of [this.committedCanvas, this.activeStack]) {
       layer.style.transform = '';
       layer.style.transformOrigin = '';
       layer.style.willChange = '';
     }
+    if (this.frame !== null) this.projectCommittedTileScene(this.frame);
+  }
+
+  private projectCommittedTileScene(
+    frame: InkStageFrame,
+    motion: InkViewportCameraMotion = 'settled',
+    stageFrameEpoch = Math.max(0, this.presentationFrameEpoch),
+  ): void {
+    const { transform } = this.requestViewportPresentation(frame, motion, stageFrameEpoch);
+    this.committedTileScene.style.transform = `matrix(${transform.a}, 0, 0, ${transform.d}, ${transform.e}, ${transform.f})`;
+  }
+
+  private requestViewportPresentation(
+    frame: InkStageFrame,
+    motion: InkViewportCameraMotion,
+    stageFrameEpoch = Math.max(0, this.presentationFrameEpoch),
+  ) {
+    return this.viewportTransaction.request({
+      camera: {
+        devicePixelRatio: Math.max(1, this.dpr()),
+        logicalLeft: frame.logicalViewport.left,
+        logicalTop: frame.logicalViewport.top,
+        scale: frame.actualScale,
+      },
+      motion,
+      projectionIdentity: this.editProjectionIdentity,
+      stageFrameEpoch,
+    });
   }
 
   private redrawCommittedViewport(
@@ -1793,7 +2134,10 @@ export class InkRenderRuntime {
   }
 
   private redrawCommittedViewportDirect(frame: InkStageFrame): number {
+    this.committedTileScene.hidden = true;
+    this.committedCanvas.hidden = false;
     clearCanvas(this.committedCanvas, this.committedContext);
+    this.presentedPromotionDigests.clear();
     this.renderedDigests.clear();
     const refs = ordered(this.query(logicalViewport(frame))).filter(
       ({ id }) => !this.excludedCommittedIds.has(id),
@@ -1801,6 +2145,40 @@ export class InkRenderRuntime {
     this.cache.setVisibleStrokeIds(new Set(refs.map(({ id }) => id)));
     for (const ref of refs) this.drawCommittedRef(ref, true);
     return refs.length;
+  }
+
+  private committedRasterRegions(
+    frame: InkStageFrame,
+    devicePixelRatio: number,
+  ): readonly CommittedRasterRegion[] {
+    const cached = this.committedRasterVisiblePlan;
+    if (
+      cached !== null &&
+      cached.devicePixelRatio === devicePixelRatio &&
+      cached.frame === frame &&
+      cached.generation === this.committedRasterVisibleBuildGeneration
+    ) {
+      return cached.regions;
+    }
+    const lod = this.viewportTransaction.request({
+      camera: {
+        devicePixelRatio,
+        logicalLeft: frame.logicalViewport.left,
+        logicalTop: frame.logicalViewport.top,
+        scale: frame.actualScale,
+      },
+      motion: 'settled',
+      projectionIdentity: this.editProjectionIdentity,
+      stageFrameEpoch: Math.max(0, this.presentationFrameEpoch),
+    }).targetLod;
+    const regions = committedRasterRegions(frame, lod, this.editTileContentIndex);
+    this.committedRasterVisiblePlan = Object.freeze({
+      devicePixelRatio,
+      frame,
+      generation: this.committedRasterVisibleBuildGeneration,
+      regions,
+    });
+    return regions;
   }
 
   /** Composites bounded non-DOM raster tiles; unchanged history is never rerasterized. */
@@ -1813,30 +2191,245 @@ export class InkRenderRuntime {
     );
     if (preparation === 'fallback') return this.redrawCommittedViewportDirect(frame);
     if (preparation === 'pending') return 0;
-    const regions = committedRasterRegions(frame);
-    clearCanvas(this.committedCanvas, this.committedContext);
+    const regions = this.committedRasterRegions(frame, ratio);
+    const visibleStrokeIds = this.presentCommittedRasterRegions(frame, regions);
+    if (visibleStrokeIds === null) return this.redrawCommittedViewportDirect(frame);
+    this.cache.setVisibleStrokeIds(visibleStrokeIds);
+    return visibleStrokeIds.size;
+  }
+
+  private presentCommittedRasterRegions(
+    frame: InkStageFrame,
+    regions: readonly CommittedRasterRegion[],
+  ): Set<string> | null {
+    const tiles: Array<readonly [CommittedRasterRegion, CommittedRasterTile]> = [];
+    for (const region of regions) {
+      const tile = this.committedRasterTiles.get(region.key);
+      if (tile === null) return null;
+      tiles.push([region, tile]);
+    }
+    const previouslyPresentedKeys = new Set(this.presentedCommittedTileKeys);
+    const presentedLod =
+      regions[0]?.coordinate.lod ?? this.viewportTransaction.snapshot()?.targetLod;
+    if (presentedLod !== undefined && this.prefetchedCommittedLod !== presentedLod) {
+      this.resetCommittedRasterPrefetch(false);
+      this.prefetchedCommittedLod = presentedLod;
+    }
+    const nextKeys = new Set(regions.map(({ key }) => key));
+    for (const key of this.prefetchedCommittedTileKeys) nextKeys.add(key);
+    for (const child of this.committedTileScene.children) {
+      if (child instanceof HTMLCanvasElement) {
+        child.hidden = !nextKeys.has(child.dataset.inkstoneCommittedTile ?? '');
+      }
+    }
     this.renderedDigests.clear();
     const visibleStrokeIds = new Set<string>();
-
-    this.committedContext.save();
-    this.committedContext.setTransform(1, 0, 0, 1, 0, 0);
-    for (const bounds of regions) {
-      const key = committedRasterTileKey(frame.actualScale, ratio, bounds);
-      const tile = this.committedRasterTiles.get(key);
-      if (tile === null) {
-        this.committedContext.restore();
-        return this.redrawCommittedViewportDirect(frame);
-      }
-      const destination = frame.logicalToCanvasCss({ x: bounds.x, y: bounds.y });
-      this.committedContext.drawImage(tile.canvas, destination.x * ratio, destination.y * ratio);
+    for (const [region, tile] of tiles) {
+      tile.canvas.hidden = false;
+      this.committedRasterTiles.setResidency(region.key, 'visible');
       for (const [strokeId, digest] of tile.digests) {
         visibleStrokeIds.add(strokeId);
         this.renderedDigests.set(strokeId, digest);
       }
     }
-    this.committedContext.restore();
-    this.cache.setVisibleStrokeIds(visibleStrokeIds);
-    return visibleStrokeIds.size;
+    this.presentedCommittedTileKeys.clear();
+    for (const key of nextKeys) this.presentedCommittedTileKeys.add(key);
+    // Only after complete replacement coverage is visible may the previous scene lose its
+    // presentation lease and re-enter the disposable LRU. This keeps damage adoption atomic while
+    // returning temporary over-budget bytes as soon as continuity no longer depends on them.
+    for (const key of previouslyPresentedKeys) {
+      if (!nextKeys.has(key)) this.committedRasterTiles.setResidency(key, 'stale');
+    }
+    if (this.committedRasterBudget >= 0) {
+      this.committedRasterTiles.setMaxBytes(this.committedRasterBudget);
+    }
+    this.committedTileScene.hidden = false;
+    this.projectCommittedTileScene(frame);
+    this.viewportTransaction.accept({
+      cameraEpoch: Math.max(0, this.presentationFrameEpoch),
+      coverage: 'exact',
+      projectionIdentity: this.editProjectionIdentity,
+    });
+    this.planCommittedRasterPrefetch(frame, presentedLod);
+    if (!this.committedCanvas.hidden) clearCanvas(this.committedCanvas, this.committedContext);
+    this.presentedPromotionDigests.clear();
+    this.committedCanvas.hidden = true;
+    return visibleStrokeIds;
+  }
+
+  /**
+   * Presents an exact, bounded command result into the already-composited visible tile backing.
+   * Keeping the Canvas node stable avoids a blank WebKit compositor frame between replacements.
+   */
+  private presentCommittedCommandPatch(
+    frame: InkStageFrame,
+    dirty: InkGeometryBounds,
+  ): number | null {
+    const patchBounds = expandGeometryBounds(dirty, 2);
+    const targetRegions = this.committedRasterRegions(frame, Math.max(1, this.dpr()));
+    const changedIds = new Set(
+      this.pendingChanges.flatMap((change) => [...change.updatedIds, ...change.removedIds]),
+    );
+    const prepared: Array<{
+      readonly bounds: InkRasterTileBounds;
+      readonly destinationX: number;
+      readonly destinationY: number;
+      readonly digests: readonly (readonly [string, string])[];
+      readonly key: string;
+      readonly patch: HTMLCanvasElement;
+      readonly sourceCanvas: HTMLCanvasElement;
+      readonly targetKey: string;
+    }> = [];
+    let resultCount = 0;
+
+    for (const child of [...this.committedTileScene.children]) {
+      if (!(child instanceof HTMLCanvasElement) || child.hidden) continue;
+      const key = child.dataset.inkstoneCommittedTile;
+      if (key === undefined) continue;
+      const source = this.committedRasterTiles.get(key);
+      if (source === null || !intersects(source.bounds, patchBounds)) continue;
+      const targetRegion = targetRegions.find(({ bounds }) =>
+        sameRasterBounds(bounds, source.bounds),
+      );
+      if (targetRegion === undefined) continue;
+      const intersection = intersectBounds(source.bounds, patchBounds);
+      if (intersection === null) continue;
+
+      const rasterDensity = child.width / source.bounds.width;
+      const destinationX = Math.max(
+        0,
+        Math.floor((intersection.x - source.bounds.x) * rasterDensity),
+      );
+      const destinationY = Math.max(
+        0,
+        Math.floor((intersection.y - source.bounds.y) * rasterDensity),
+      );
+      const destinationRight = Math.min(
+        child.width,
+        Math.ceil((intersection.x + intersection.width - source.bounds.x) * rasterDensity),
+      );
+      const destinationBottom = Math.min(
+        child.height,
+        Math.ceil((intersection.y + intersection.height - source.bounds.y) * rasterDensity),
+      );
+      if (destinationRight <= destinationX || destinationBottom <= destinationY) continue;
+      const exactPatchBounds = Object.freeze({
+        height: (destinationBottom - destinationY) / rasterDensity,
+        width: (destinationRight - destinationX) / rasterDensity,
+        x: source.bounds.x + destinationX / rasterDensity,
+        y: source.bounds.y + destinationY / rasterDensity,
+      });
+      const patch = this.document.createElement('canvas');
+      patch.width = destinationRight - destinationX;
+      patch.height = destinationBottom - destinationY;
+      const context = patch.getContext('2d');
+      if (context === null || typeof context.drawImage !== 'function') {
+        patch.width = 0;
+        patch.height = 0;
+        for (const entry of prepared) {
+          entry.patch.width = 0;
+          entry.patch.height = 0;
+        }
+        return null;
+      }
+      context.lineCap = 'round';
+      context.lineJoin = 'round';
+      context.save();
+      context.setTransform(
+        rasterDensity,
+        0,
+        0,
+        rasterDensity,
+        -exactPatchBounds.x * rasterDensity,
+        -exactPatchBounds.y * rasterDensity,
+      );
+
+      const digests = new Map(source.digests.filter(([strokeId]) => !changedIds.has(strokeId)));
+      const refs = ordered(this.query(exactPatchBounds)).filter(
+        ({ bounds, id, stroke }) =>
+          stroke.tool !== 'eraser' &&
+          !this.excludedCommittedIds.has(id) &&
+          intersects(bounds, exactPatchBounds),
+      );
+      for (const ref of refs) {
+        const geometry = this.compileRef(ref, true);
+        drawCompiled(context, geometry, false);
+        digests.set(ref.id, geometry.digest);
+        this.renderedDigests.set(ref.id, geometry.digest);
+      }
+      context.restore();
+
+      prepared.push({
+        bounds: source.bounds,
+        destinationX,
+        destinationY,
+        digests: Object.freeze([...digests]),
+        key,
+        patch,
+        sourceCanvas: child,
+        targetKey: targetRegion.key,
+      });
+      resultCount += refs.length;
+    }
+
+    if (prepared.length === 0) return null;
+    const scratchBytes = prepared.reduce(
+      (bytes, { patch }) => bytes + patch.width * patch.height * 4,
+      0,
+    );
+    const targetContexts = prepared.map(({ sourceCanvas }) => sourceCanvas.getContext('2d'));
+    if (
+      this.committedRasterBudget < 0 ||
+      scratchBytes > this.committedRasterBudget ||
+      targetContexts.some((context) => context === null || typeof context.drawImage !== 'function')
+    ) {
+      for (const { patch } of prepared) {
+        patch.width = 0;
+        patch.height = 0;
+      }
+      return null;
+    }
+
+    for (const [
+      index,
+      { bounds, destinationX, destinationY, digests, key, patch, sourceCanvas, targetKey },
+    ] of prepared.entries()) {
+      const targetContext = targetContexts[index];
+      if (targetContext === null || targetContext === undefined) {
+        throw new Error(`Committed command patch lost its visible Canvas context ${key}.`);
+      }
+      const previousAlpha = targetContext.globalAlpha;
+      const previousComposite = targetContext.globalCompositeOperation;
+      targetContext.save();
+      targetContext.setTransform(1, 0, 0, 1, 0, 0);
+      targetContext.globalAlpha = 1;
+      targetContext.globalCompositeOperation = 'copy';
+      targetContext.drawImage(patch, destinationX, destinationY);
+      targetContext.globalAlpha = previousAlpha;
+      targetContext.globalCompositeOperation = previousComposite;
+      targetContext.restore();
+      patch.width = 0;
+      patch.height = 0;
+      if (this.committedRasterTiles.take(key) === null) {
+        throw new Error(`Committed command patch lost its retained source tile ${key}.`);
+      }
+      sourceCanvas.dataset.inkstoneCommittedTile = targetKey;
+      const adopted = Object.freeze({
+        bounds,
+        canvas: sourceCanvas,
+        digests,
+      });
+      const byteSize = sourceCanvas.width * sourceCanvas.height * 4;
+      if (!this.committedRasterTiles.put(targetKey, adopted, bounds, byteSize, 'visible')) {
+        throw new Error(`Committed command patch could not retain its exact tile ${targetKey}.`);
+      }
+      this.presentedCommittedTileKeys.delete(key);
+      this.presentedCommittedTileKeys.add(targetKey);
+      if (this.prefetchedCommittedTileKeys.delete(key)) {
+        this.prefetchedCommittedTileKeys.add(targetKey);
+      }
+    }
+    return resultCount;
   }
 
   private prepareCommittedRasterTiles(
@@ -1854,57 +2447,82 @@ export class InkRenderRuntime {
       requiredVisibleBytes * COMMITTED_RASTER_VIEWPORT_MULTIPLIER,
     );
     const rasterBudget = Math.min(remainingDisposableBudget, viewportRasterBudget);
+    if (rasterBudget !== this.committedRasterBudget) {
+      this.committedRasterBudget = rasterBudget;
+      this.committedRasterPrefetchAdmissionBlocked = false;
+    }
     this.committedRasterTiles.setMaxBytes(rasterBudget);
     if (rasterBudget < requiredVisibleBytes) return 'fallback';
 
     const ratio = Math.max(1, this.dpr());
-    let preparedThisFrame = 0;
-    for (const bounds of committedRasterRegions(frame)) {
-      const key = committedRasterTileKey(frame.actualScale, ratio, bounds);
-      if (this.committedRasterTiles.get(key) !== null) continue;
-      if (preparedThisFrame >= COMMITTED_RASTER_TILES_PER_FRAME) {
-        this.committedRasterPreparationIncomplete = true;
-        return 'pending';
+    for (const region of this.committedRasterRegions(frame, ratio)) {
+      const { bounds, key, rasterDensity } = region;
+      if (this.committedRasterBuild?.key !== key && this.committedRasterTiles.get(key) !== null) {
+        this.committedRasterTiles.setResidency(key, 'visible');
+        continue;
       }
-      if (this.buildCommittedRasterTile(key, bounds, frame.actualScale, ratio) === null) {
+      const build = this.advanceCommittedRasterTile(key, bounds, rasterDensity);
+      if (build === 'fallback') {
         return 'fallback';
       }
-      preparedThisFrame += 1;
+      this.committedRasterPreparationIncomplete = true;
+      return 'pending';
     }
     return 'ready';
   }
 
   private redrawCommittedRasterDamage(frame: InkStageFrame, dirty: InkRasterTileBounds): number {
     const ratio = Math.max(1, this.dpr());
-    const regions = committedRasterRegions(frame).filter((bounds) => intersects(bounds, dirty));
-    let preparedThisFrame = 0;
-    for (const bounds of regions) {
-      const key = committedRasterTileKey(frame.actualScale, ratio, bounds);
-      if (this.committedRasterTiles.get(key) !== null) continue;
-      if (preparedThisFrame >= COMMITTED_RASTER_TILES_PER_FRAME) {
-        this.committedRasterPreparationIncomplete = true;
-        return 0;
+    const regions = this.committedRasterRegions(frame, ratio).filter(({ bounds }) =>
+      intersects(bounds, dirty),
+    );
+    for (const region of regions) {
+      const { bounds, key, rasterDensity } = region;
+      if (this.committedRasterBuild?.key !== key && this.committedRasterTiles.get(key) !== null) {
+        continue;
       }
-      if (this.buildCommittedRasterTile(key, bounds, frame.actualScale, ratio) === null) {
+      const build = this.advanceCommittedRasterTile(key, bounds, rasterDensity);
+      if (build === 'fallback') {
         return this.redrawCommittedBounds(frame, dirty);
       }
-      preparedThisFrame += 1;
+      this.committedRasterPreparationIncomplete = true;
+      return 0;
+    }
+
+    if (!this.committedTileScene.hidden) {
+      const presented = this.presentCommittedRasterRegions(
+        frame,
+        this.committedRasterRegions(frame, ratio),
+      );
+      if (presented !== null) {
+        this.cache.setVisibleStrokeIds(presented);
+        return presented.size;
+      }
     }
 
     const visibleStrokeIds = new Set<string>();
     this.committedContext.save();
     this.committedContext.setTransform(1, 0, 0, 1, 0, 0);
-    for (const bounds of regions) {
-      const key = committedRasterTileKey(frame.actualScale, ratio, bounds);
+    for (const region of regions) {
+      const { bounds, key } = region;
       const tile = this.committedRasterTiles.get(key);
       if (tile === null) continue;
       const destination = frame.logicalToCanvasCss({ x: bounds.x, y: bounds.y });
       const left = Math.floor(destination.x * ratio);
       const top = Math.floor(destination.y * ratio);
-      const right = Math.ceil(destination.x * ratio + tile.canvas.width);
-      const bottom = Math.ceil(destination.y * ratio + tile.canvas.height);
+      const destinationWidth = bounds.width * frame.actualScale * ratio;
+      const destinationHeight = bounds.height * frame.actualScale * ratio;
+      const right = Math.ceil(destination.x * ratio + destinationWidth);
+      const bottom = Math.ceil(destination.y * ratio + destinationHeight);
       this.committedContext.clearRect(left, top, right - left, bottom - top);
-      this.committedContext.drawImage(tile.canvas, destination.x * ratio, destination.y * ratio);
+      this.committedContext.drawImage(
+        tile.canvas,
+        destination.x * ratio,
+        destination.y * ratio,
+        destinationWidth,
+        destinationHeight,
+      );
+      this.committedRasterTiles.setResidency(key, 'visible');
       for (const [strokeId, digest] of tile.digests) {
         visibleStrokeIds.add(strokeId);
         this.renderedDigests.set(strokeId, digest);
@@ -1914,55 +2532,329 @@ export class InkRenderRuntime {
     return visibleStrokeIds.size;
   }
 
-  private buildCommittedRasterTile(
+  private advanceCommittedRasterTile(
     key: string,
     bounds: InkRasterTileBounds,
-    scale: number,
-    ratio: number,
-  ): CommittedRasterTile | null {
+    rasterDensity: number,
+    residency: InkRasterTileResidency = 'visible',
+  ): 'fallback' | 'pending' {
+    const pending = this.committedRasterBuild;
+    if (pending !== null && pending.key !== key) this.cancelCommittedRasterBuild();
+    const current = this.committedRasterBuild;
+    if (current === null) {
+      return this.startCommittedRasterTile(key, bounds, rasterDensity, residency);
+    }
+    try {
+      if (current.pendingGeometry !== null) {
+        drawCompiled(current.context, current.pendingGeometry, false);
+        current.digests.push([current.pendingGeometry.strokeId, current.pendingGeometry.digest]);
+        current.pendingGeometry = null;
+        current.nextRef += 1;
+        return 'pending';
+      }
+      const ref = current.refs[current.nextRef];
+      if (ref !== undefined) {
+        current.pendingGeometry = this.compileRef(ref, true);
+        return 'pending';
+      }
+      return this.finishCommittedRasterTile(current);
+    } catch (error) {
+      this.cancelCommittedRasterBuild();
+      throw error;
+    }
+  }
+
+  private startCommittedRasterTile(
+    key: string,
+    bounds: InkRasterTileBounds,
+    rasterDensity: number,
+    residency: InkRasterTileResidency,
+  ): 'fallback' | 'pending' {
     const canvas = this.document.createElement('canvas');
-    canvas.width = Math.max(1, Math.ceil(bounds.width * scale * ratio));
-    canvas.height = Math.max(1, Math.ceil(bounds.height * scale * ratio));
+    canvas.width = Math.max(1, Math.ceil(bounds.width * rasterDensity));
+    canvas.height = Math.max(1, Math.ceil(bounds.height * rasterDensity));
     const context = canvas.getContext('2d');
     if (context === null) {
       canvas.width = 0;
       canvas.height = 0;
-      return null;
+      return 'fallback';
     }
-    this.rasterTileRebuildCount += 1;
     context.lineCap = 'round';
     context.lineJoin = 'round';
     context.setTransform(
-      scale * ratio,
+      rasterDensity,
       0,
       0,
-      scale * ratio,
-      -bounds.x * scale * ratio,
-      -bounds.y * scale * ratio,
+      rasterDensity,
+      -bounds.x * rasterDensity,
+      -bounds.y * rasterDensity,
     );
     const refs = ordered(this.query(bounds)).filter(
       ({ bounds: strokeBounds, id }) =>
         !this.excludedCommittedIds.has(id) && intersects(strokeBounds, bounds),
     );
-    const digests: Array<readonly [strokeId: string, digest: string]> = [];
-    for (const ref of refs) {
-      if (ref.stroke.tool === 'eraser') continue;
-      const geometry = this.compileRef(ref, true);
-      drawCompiled(context, geometry, false);
-      digests.push([ref.id, geometry.digest]);
+    const drawableRefs = refs.filter(({ stroke }) => stroke.tool !== 'eraser');
+    try {
+      this.committedRasterBuildMemory.setBytes(canvas.width * canvas.height * 4);
+    } catch {
+      canvas.width = 0;
+      canvas.height = 0;
+      return 'fallback';
     }
-    const tile: CommittedRasterTile = Object.freeze({
+    this.rasterTileRebuildCount += 1;
+    this.committedRasterBuild = {
       bounds: Object.freeze({ ...bounds }),
       canvas,
-      digests: Object.freeze(digests),
+      context,
+      digests: [],
+      key,
+      nextRef: 0,
+      pendingGeometry: null,
+      residency,
+      refs: drawableRefs,
+    };
+    return 'pending';
+  }
+
+  private finishCommittedRasterTile(build: CommittedRasterTileBuildState): 'fallback' | 'pending' {
+    const tile: CommittedRasterTile = Object.freeze({
+      bounds: build.bounds,
+      canvas: build.canvas,
+      digests: Object.freeze(build.digests),
     });
-    const byteSize = canvas.width * canvas.height * 4;
-    return this.committedRasterTiles.put(key, tile, bounds, byteSize) ? tile : null;
+    const byteSize = build.canvas.width * build.canvas.height * 4;
+    this.committedRasterBuild = null;
+    this.committedRasterBuildMemory.setBytes(0);
+    if (!this.committedRasterTiles.put(build.key, tile, build.bounds, byteSize, build.residency)) {
+      return 'fallback';
+    }
+    build.canvas.className = 'inkstone-ink-committed-tile';
+    build.canvas.dataset.inkstoneCommittedTile = build.key;
+    build.canvas.hidden = true;
+    build.canvas.style.height = `${build.bounds.height}px`;
+    build.canvas.style.position = 'absolute';
+    build.canvas.style.transform = `translate3d(${build.bounds.x}px, ${build.bounds.y}px, 0)`;
+    build.canvas.style.transformOrigin = '0 0';
+    build.canvas.style.width = `${build.bounds.width}px`;
+    this.committedTileScene.append(build.canvas);
+    return 'pending';
+  }
+
+  private cancelCommittedRasterBuild(): void {
+    const build = this.committedRasterBuild;
+    if (build === null) return;
+    this.committedRasterBuild = null;
+    this.committedRasterBuildMemory.setBytes(0);
+    build.canvas.width = 0;
+    build.canvas.height = 0;
+  }
+
+  private planCommittedRasterPrefetch(frame: InkStageFrame, lod: number | undefined): void {
+    this.planCommittedRasterPrefetchDemand(frame, lod, false);
+  }
+
+  private planCommittedRasterMotionPrefetch(frame: InkStageFrame, lod: number | undefined): void {
+    if (
+      lod === undefined ||
+      this.workScheduler === null ||
+      this.committedTileScene.hidden ||
+      this.active !== null ||
+      this.activePerformanceContact !== null
+    ) {
+      return;
+    }
+    const viewport = createInkNoteLogicalRect({
+      height: frame.logicalViewport.height,
+      width: frame.logicalViewport.width,
+      x: frame.logicalViewport.left,
+      y: frame.logicalViewport.top,
+    });
+    const addressed = COMMITTED_RASTER_TILE_GRID.addresses(viewport, lod);
+    if (addressed.kind === 'untileable-range') return;
+    const first = addressed.coordinates[0];
+    const last = addressed.coordinates.at(-1);
+    const demandKey =
+      first === undefined || last === undefined
+        ? `${lod}:empty`
+        : `${lod}:${first.column}:${first.row}:${last.column}:${last.row}`;
+    if (demandKey === this.committedRasterMotionDemandKey) return;
+    this.committedRasterMotionDemandKey = demandKey;
+    this.planCommittedRasterPrefetchDemand(frame, lod, true);
+  }
+
+  private planCommittedRasterPrefetchDemand(
+    frame: InkStageFrame,
+    lod: number | undefined,
+    includeVisible: boolean,
+  ): void {
+    this.invalidateCommittedRasterPrefetchTask();
+    if (lod === undefined) {
+      this.pendingCommittedPrefetchRegions = [];
+      return;
+    }
+    if (this.committedRasterPrefetchAdmissionBlocked) {
+      this.pendingCommittedPrefetchRegions = [];
+      return;
+    }
+    const viewport = createInkNoteLogicalRect({
+      height: frame.logicalViewport.height,
+      width: frame.logicalViewport.width,
+      x: frame.logicalViewport.left,
+      y: frame.logicalViewport.top,
+    });
+    const plan = COMMITTED_RASTER_DEMAND_PLANNER.plan({
+      lod,
+      ...(this.lastCommittedViewport === null
+        ? {}
+        : { previousViewport: this.lastCommittedViewport }),
+      viewport,
+    });
+    this.lastCommittedViewport = viewport;
+    if (plan.kind === 'untileable-range') {
+      this.pendingCommittedPrefetchRegions = [];
+      return;
+    }
+    if (!includeVisible) this.committedRasterMotionDemandKey = null;
+    this.prefetchedCommittedLod = lod;
+    const visibleRegions = includeVisible
+      ? committedRasterRegionsForCoordinates(plan.visible, this.editTileContentIndex)
+      : [];
+    this.pendingCommittedPrefetchRegions = [
+      ...visibleRegions,
+      ...committedRasterRegionsForCoordinates(
+        [...plan.nearVisible, ...plan.lookAhead],
+        this.editTileContentIndex,
+      ),
+    ];
+    if (includeVisible) {
+      const demandedVisibleKeys = new Set(visibleRegions.map(({ key }) => key));
+      for (const key of this.presentedCommittedTileKeys) {
+        this.committedRasterTiles.setResidency(
+          key,
+          demandedVisibleKeys.has(key) ? 'visible' : 'near-visible',
+        );
+      }
+    }
+    this.scheduleCommittedRasterPrefetch();
+  }
+
+  private scheduleCommittedRasterPrefetch(): void {
+    const scheduler = this.workScheduler;
+    if (
+      scheduler === null ||
+      this.disposed ||
+      this.active !== null ||
+      this.activePerformanceContact !== null ||
+      this.pendingCommittedPrefetchRegions.length === 0 ||
+      this.committedRasterPrefetchScheduledGeneration !== null
+    ) {
+      return;
+    }
+    const generation = this.committedRasterPrefetchGeneration;
+    this.committedRasterPrefetchScheduledGeneration = generation;
+    void scheduler
+      .schedule({
+        isCurrent: () =>
+          !this.disposed &&
+          generation === this.committedRasterPrefetchGeneration &&
+          this.active === null &&
+          this.activePerformanceContact === null,
+        lane: 'cold',
+        unitKinds: ['edit-tile-prefetch-unit'],
+        units: [() => this.advanceCommittedRasterPrefetch()],
+      })
+      .then(
+        () => this.completeCommittedRasterPrefetchTask(generation),
+        (error: unknown) => {
+          if (this.committedRasterPrefetchScheduledGeneration === generation) {
+            this.committedRasterPrefetchScheduledGeneration = null;
+          }
+          this.pendingCommittedPrefetchRegions = [];
+          this.onDiagnostic(
+            `Committed raster prefetch stopped after a cold-lane failure: ${
+              error instanceof Error ? error.message : 'unknown failure'
+            }`,
+          );
+        },
+      );
+  }
+
+  private completeCommittedRasterPrefetchTask(generation: number): void {
+    if (this.committedRasterPrefetchScheduledGeneration !== generation) return;
+    this.committedRasterPrefetchScheduledGeneration = null;
+    if (generation !== this.committedRasterPrefetchGeneration || this.disposed) return;
+    this.scheduleCommittedRasterPrefetch();
+  }
+
+  private invalidateCommittedRasterPrefetchTask(): void {
+    this.committedRasterPrefetchGeneration += 1;
+    this.committedRasterPrefetchScheduledGeneration = null;
+    if (this.committedRasterBuild?.residency === 'near-visible') {
+      this.cancelCommittedRasterBuild();
+    }
+  }
+
+  private advanceCommittedRasterPrefetch(): boolean {
+    const region = this.pendingCommittedPrefetchRegions[0];
+    if (region === undefined) return false;
+    if (
+      this.presentedCommittedTileKeys.has(region.key) ||
+      this.prefetchedCommittedTileKeys.has(region.key)
+    ) {
+      this.pendingCommittedPrefetchRegions = this.pendingCommittedPrefetchRegions.slice(1);
+      return this.pendingCommittedPrefetchRegions.length > 0;
+    }
+    if (this.committedRasterBuild?.key !== region.key) {
+      const tile = this.committedRasterTiles.get(region.key);
+      if (tile !== null) {
+        tile.canvas.hidden = false;
+        // Once a tile is exposed it is presentation truth, not merely speculative cache data.
+        // Keep it pinned until an exact replacement is ready; document damage must never turn a
+        // currently visible tile into a blank region.
+        this.committedRasterTiles.setResidency(region.key, 'visible');
+        this.prefetchedCommittedTileKeys.add(region.key);
+        this.presentedCommittedTileKeys.add(region.key);
+        this.pendingCommittedPrefetchRegions = this.pendingCommittedPrefetchRegions.slice(1);
+        return this.pendingCommittedPrefetchRegions.length > 0;
+      }
+    }
+    const outcome = this.advanceCommittedRasterTile(
+      region.key,
+      region.bounds,
+      region.rasterDensity,
+      'near-visible',
+    );
+    if (outcome === 'fallback') {
+      this.pendingCommittedPrefetchRegions = [];
+      this.committedRasterPrefetchAdmissionBlocked = true;
+      return false;
+    }
+    return true;
+  }
+
+  private resetCommittedRasterPrefetch(resetViewport: boolean): void {
+    this.invalidateCommittedRasterPrefetchTask();
+    this.pendingCommittedPrefetchRegions = [];
+    for (const child of this.committedTileScene.children) {
+      if (
+        child instanceof HTMLCanvasElement &&
+        this.prefetchedCommittedTileKeys.has(child.dataset.inkstoneCommittedTile ?? '') &&
+        !this.presentedCommittedTileKeys.has(child.dataset.inkstoneCommittedTile ?? '')
+      ) {
+        child.hidden = true;
+      }
+    }
+    this.prefetchedCommittedTileKeys.clear();
+    this.prefetchedCommittedLod = null;
+    this.committedRasterMotionDemandKey = null;
+    this.committedRasterPrefetchAdmissionBlocked = false;
+    if (resetViewport) this.lastCommittedViewport = null;
   }
 
   private drawDocumentChange(frame: InkStageFrame, change: InkDocumentChange): number {
     const addedOnly = isAddedOnlyDocumentChange(change);
     if (addedOnly) {
+      this.committedCanvas.hidden = false;
       const added = new Set(change.addedIds);
       const changedRefs = refsForChange(this.query, change);
       const refs = (
@@ -1971,14 +2863,25 @@ export class InkRenderRuntime {
       for (const ref of refs) {
         const visible = intersects(ref.bounds, logicalViewport(frame));
         const geometry = this.compileRef(ref, visible);
-        this.renderedDigests.set(ref.id, geometry.digest);
-        if (visible) drawCompiled(this.committedContext, geometry, false);
+        const alreadyPresented = this.presentedPromotionDigests.get(ref.id) === geometry.digest;
+        if (visible && !alreadyPresented) {
+          drawCompiled(this.committedContext, geometry, false);
+        }
+        if (visible || alreadyPresented) this.renderedDigests.set(ref.id, geometry.digest);
       }
       return refs.filter(({ bounds }) => intersects(bounds, logicalViewport(frame))).length;
     }
     const dirty = changeBounds(change);
     if (dirty === null) return 0;
     return this.redrawCommittedBounds(frame, dirty);
+  }
+
+  private hasMatchingActivePromotion(change: InkDocumentChange): boolean {
+    if (!isAddedOnlyDocumentChange(change)) return false;
+    const activeStrokeId = this.active?.presentationState.strokeId ?? null;
+    return change.addedIds.every(
+      (strokeId) => strokeId === activeStrokeId || this.presentedPromotionDigests.has(strokeId),
+    );
   }
 
   private redrawCommittedBounds(frame: InkStageFrame, dirty: InkGeometryBounds): number {
@@ -2355,6 +3258,22 @@ export class InkRenderRuntime {
     this.tryActivatePreparedWorker();
   }
 
+  private presentPromotingActive(active: ActiveRenderState): void {
+    const finalized = active.finalized;
+    if (
+      finalized === null ||
+      this.frame === null ||
+      this.lostContexts.has(this.committedCanvas) ||
+      this.presentedPromotionDigests.get(finalized.strokeId) === finalized.digest
+    ) {
+      return;
+    }
+    this.committedCanvas.hidden = false;
+    drawCompiled(this.committedContext, finalized, false);
+    this.presentedPromotionDigests.set(finalized.strokeId, finalized.digest);
+    this.renderedDigests.set(finalized.strokeId, finalized.digest);
+  }
+
   private retirePromotingActive(): void {
     if (this.active === null) return;
     if (this.activePair.kind === 'worker-offscreen-2d') {
@@ -2401,6 +3320,20 @@ function createCanvas(
   canvas.style.pointerEvents = 'none';
   canvas.style.opacity = '1';
   return canvas;
+}
+
+function createCommittedTileScene(document: Document): HTMLElement {
+  const scene = document.createElement('div');
+  scene.className = 'inkstone-ink-committed-tile-scene';
+  scene.dataset.inkstoneCommittedTileScene = 'true';
+  scene.hidden = true;
+  scene.style.inset = '0';
+  scene.style.overflow = 'visible';
+  scene.style.pointerEvents = 'none';
+  scene.style.position = 'absolute';
+  scene.style.transformOrigin = '0 0';
+  scene.style.willChange = 'transform';
+  return scene;
 }
 
 function createMainActiveCanvasPair(document: Document): MainActiveCanvasPair {
@@ -3232,51 +4165,66 @@ function logicalViewport(frame: InkStageFrame): InkLogicalRect {
   };
 }
 
-function committedRasterTileKey(
-  scale: number,
-  devicePixelRatio: number,
-  bounds: InkRasterTileBounds,
-): string {
-  return [
-    scale.toFixed(6),
-    devicePixelRatio.toFixed(4),
-    bounds.x.toFixed(4),
-    bounds.y.toFixed(4),
-    bounds.width.toFixed(4),
-    bounds.height.toFixed(4),
-  ].join(':');
+function committedRasterRegions(
+  frame: InkStageFrame,
+  lod: number,
+  contentIndex: InkEditTileContentIndex,
+): readonly CommittedRasterRegion[] {
+  const viewport = logicalViewport(frame);
+  const addressed = COMMITTED_RASTER_TILE_GRID.addresses(
+    createInkNoteLogicalRect({
+      height: viewport.height,
+      width: viewport.width,
+      x: viewport.x,
+      y: viewport.y,
+    }),
+    lod,
+  );
+  if (addressed.kind === 'untileable-range') return Object.freeze([]);
+  return committedRasterRegionsForCoordinates(addressed.coordinates, contentIndex);
 }
 
-function committedRasterRegions(frame: InkStageFrame): readonly InkRasterTileBounds[] {
-  const logicalTileSize = COMMITTED_RASTER_TILE_CSS_SIZE / frame.actualScale;
-  const viewport = logicalViewport(frame);
-  const firstColumn = Math.floor(viewport.x / logicalTileSize);
-  const lastColumn = Math.floor((viewport.x + viewport.width) / logicalTileSize);
-  const firstRow = Math.floor(viewport.y / logicalTileSize);
-  const lastRow = Math.floor((viewport.y + viewport.height) / logicalTileSize);
-  const result: InkRasterTileBounds[] = [];
-  for (let row = firstRow; row <= lastRow; row += 1) {
-    for (let column = firstColumn; column <= lastColumn; column += 1) {
-      const gridLeft = column * logicalTileSize;
-      const gridTop = row * logicalTileSize;
-      const left = Math.max(viewport.x, gridLeft);
-      const top = Math.max(viewport.y, gridTop);
-      const right = Math.min(viewport.x + viewport.width, gridLeft + logicalTileSize);
-      const bottom = Math.min(viewport.y + viewport.height, gridTop + logicalTileSize);
-      if (right <= left || bottom <= top) continue;
-      result.push({
-        height: bottom - top,
-        width: right - left,
-        x: left,
-        y: top,
-      });
-    }
-  }
-  return result;
+function committedRasterRegionsForCoordinates(
+  coordinates: readonly InkWorldTileCoordinate[],
+  contentIndex: InkEditTileContentIndex,
+): readonly CommittedRasterRegion[] {
+  return Object.freeze(
+    coordinates.map((coordinate) => {
+      const rasterDensity = 2 ** coordinate.lod;
+      const bounds = COMMITTED_RASTER_TILE_GRID.nominalBounds(coordinate);
+      const backingWidth = Math.max(1, Math.ceil(bounds.width * rasterDensity));
+      const backingHeight = Math.max(1, Math.ceil(bounds.height * rasterDensity));
+      const key = COMMITTED_RASTER_TILE_KEY_FACTORY.identity(
+        COMMITTED_RASTER_TILE_KEY_FACTORY.create({
+          coordinate,
+          projectionIdentity: contentIndex.projectionIdentity,
+          rasterVariant: {
+            alphaContract: 'premultiplied-transparent-v1',
+            backingHeight,
+            backingWidth,
+            colorSpace: 'srgb',
+            pixelsPerLogicalUnit: rasterDensity,
+          },
+          rendererVersion: COMMITTED_RASTER_TILE_RENDERER_VERSION,
+          tileContentToken: contentIndex.contentToken(coordinate),
+        }),
+      );
+      return Object.freeze({ bounds, coordinate, key, rasterDensity });
+    }),
+  );
 }
 
 function ordered(refs: readonly InkRenderableStrokeRef[]): readonly InkRenderableStrokeRef[] {
   return [...refs].sort((left, right) => left.order - right.order);
+}
+
+function sameRasterBounds(left: InkRasterTileBounds, right: InkRasterTileBounds): boolean {
+  return (
+    left.x === right.x &&
+    left.y === right.y &&
+    left.width === right.width &&
+    left.height === right.height
+  );
 }
 
 function intersects(left: InkLogicalRect, right: InkLogicalRect): boolean {
@@ -3286,6 +4234,20 @@ function intersects(left: InkLogicalRect, right: InkLogicalRect): boolean {
     left.y <= right.y + right.height &&
     left.y + left.height >= right.y
   );
+}
+
+function intersectBounds(left: InkLogicalRect, right: InkLogicalRect): InkGeometryBounds | null {
+  const x = Math.max(left.x, right.x);
+  const y = Math.max(left.y, right.y);
+  const rightEdge = Math.min(left.x + left.width, right.x + right.width);
+  const bottomEdge = Math.min(left.y + left.height, right.y + right.height);
+  if (rightEdge <= x || bottomEdge <= y) return null;
+  return {
+    height: bottomEdge - y,
+    width: rightEdge - x,
+    x,
+    y,
+  };
 }
 
 function deterministicFallback(stroke: InkStroke): InkStroke {

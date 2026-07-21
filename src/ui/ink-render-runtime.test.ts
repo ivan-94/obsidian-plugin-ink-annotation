@@ -11,6 +11,7 @@ import type {
 import { INK_SAMPLE_FLAGS, type InkSampleCursor, type InkSampleView } from '../domain/ink-contact';
 import type { InkBorrowedControlTraceDelta } from '../domain/ink-control-trace';
 import { createInkBrushActiveGeometryUpdate } from '../domain/ink-brush-geometry-contract';
+import { InkEditTileContentIndex } from '../domain/ink-edit-tile-content-index';
 import { SharedInkStrokeGeometry } from '../domain/ink-shared-stroke-geometry';
 import type { InkStroke } from '../domain/ink-surface';
 import {
@@ -18,7 +19,9 @@ import {
   type InkStrokeGeometry,
 } from '../domain/ink-stroke-geometry';
 import { InkPerformanceDiagnostics } from '../runtime/ink-performance-diagnostics';
+import { InkWorkScheduler } from '../runtime/ink-work-scheduler';
 import type { InkBorrowedProvisionalTail } from './ink-capture-pipeline';
+import { InkGeometryCacheCoordinator } from './ink-geometry-cache';
 import { createInkStageFrame } from './ink-stage-frame';
 import {
   InkRenderRuntime,
@@ -162,6 +165,50 @@ describe('InkRenderRuntime', () => {
       diagnostics.snapshot().recentSpans.filter(({ name }) => name === 'ink-viewport-redraw'),
     ).toEqual([]);
     runtime.dispose();
+  });
+
+  it('keeps committed raster tiles inside plugin memory accounting after document install', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([stroke('accounted-history')]);
+    const memoryCoordinator = new InkGeometryCacheCoordinator(64 * 1024 * 1024);
+    const runtime = new InkRenderRuntime({
+      document,
+      host,
+      memoryCoordinator,
+      query: fixture.query,
+      read: fixture.read,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+    });
+
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    drain(frames);
+    runtime.setFrame(frame(0.8));
+    drain(frames);
+
+    const stats = runtime.stats();
+    expect(stats.rasterTileBytes).toBeGreaterThan(0);
+    expect(memoryCoordinator.byteSize).toBe(
+      stats.cacheBytes + stats.indexBytes + stats.rasterTileBytes,
+    );
+
+    runtime.dispose();
+    expect(memoryCoordinator.byteSize).toBe(0);
   });
 
   it('defers Stage Frame replacement and viewport rebuild until the active contact ends', () => {
@@ -2321,6 +2368,55 @@ describe('InkRenderRuntime', () => {
     runtime.dispose();
   });
 
+  it('keeps a completed stroke visible until its projected Edit frame settles', async () => {
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([]);
+    const runtime = runtimeFixture(host, fixture, frames);
+    const initial = frame();
+    const projected = createInkStageFrame({
+      actualScale: 1,
+      canvasClientRect: { height: 200, left: 0, top: 0, width: 200 },
+      documentClientOrigin: { x: 0, y: -200 },
+    });
+    runtime.setFrame(initial);
+    runtime.installDocument(fixture.read());
+    drain(frames);
+    runtime.projectFrame(projected);
+    runtime.setActivePerformanceContact({ adapter: 'pointer', sequence: 1 });
+
+    const completed = stroke('projected-complete', 240);
+    runtime.applyActiveDelta({
+      delta: { mutableTail: [], stablePrefixDelta: completed.points },
+      strokeId: completed.id,
+      style: { color: completed.color, tool: completed.tool, width: completed.width },
+    });
+    runtime.finalizeActive(completed);
+    drain(frames);
+
+    fixture.replace([completed]);
+    runtime.promoteActive(completed.id);
+    runtime.applyDocumentChange(
+      change('projected-complete', { addedIds: [completed.id], newStroke: completed }),
+    );
+    drain(frames);
+
+    const activeStack = host.querySelector<HTMLElement>('.inkstone-ink-active-stack');
+    expect(runtime.stats().activeStrokeId).toBe(completed.id);
+    expect(activeStack?.style.transform).not.toBe('');
+
+    runtime.setFrame(projected);
+    runtime.invalidateViewport();
+    runtime.setActivePerformanceContact(null);
+    await vi.waitFor(() => {
+      drain(frames);
+      expect(runtime.stats().activeStrokeId).toBeNull();
+    });
+    expect(activeStack?.style.transform).toBe('');
+    runtime.dispose();
+  });
+
   it('accepts the next contact before the prior promotion frame without clearing the new Active stroke', () => {
     const frames: FrameRequestCallback[] = [];
     const host = document.createElement('div');
@@ -2364,6 +2460,71 @@ describe('InkRenderRuntime', () => {
       change('rapid-second-complete', { addedIds: [second.id], newStroke: second }),
     );
     drain(frames);
+    expect(runtime.stats().activeStrokeId).toBeNull();
+    runtime.dispose();
+  });
+
+  it('keeps a promoted stroke visible when the next contact preempts its committed frame', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([stroke('retained-history', 80)]);
+    const runtime = runtimeFixture(host, fixture, frames);
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    drain(frames);
+    const committed = host.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]');
+    const committedContext = committed === null ? undefined : contexts.get(committed);
+    if (committed === null || committedContext === undefined) {
+      throw new Error('Missing committed Canvas context.');
+    }
+    const committedStrokeCount = committedContext.stroke.mock.calls.length;
+    const first = stroke('preempted-promotion');
+    const second = stroke('next-contact', 40);
+
+    runtime.applyActiveDelta({
+      delta: { mutableTail: [], stablePrefixDelta: first.points },
+      strokeId: first.id,
+      style: { color: first.color, tool: first.tool, width: first.width },
+    });
+    drain(frames);
+    runtime.finalizeActive(first);
+    fixture.replace([stroke('retained-history', 80), first]);
+    runtime.promoteActive(first.id);
+    runtime.applyDocumentChange(
+      change('preempted-promotion-complete', { addedIds: [first.id], newStroke: first }),
+    );
+
+    runtime.applyActiveDelta({
+      delta: { mutableTail: [], stablePrefixDelta: second.points },
+      strokeId: second.id,
+      style: { color: second.color, tool: second.tool, width: second.width },
+    });
+
+    expect(committed.hidden).toBe(false);
+    expect(committedContext.stroke.mock.calls.length).toBeGreaterThan(committedStrokeCount);
+    expect(runtime.stats().activeStrokeId).toBe(second.id);
+
+    drain(frames);
+    runtime.finalizeActive(second);
+    fixture.replace([stroke('retained-history', 80), first, second]);
+    runtime.promoteActive(second.id);
+    runtime.applyDocumentChange(
+      change('next-contact-complete', { addedIds: [second.id], newStroke: second }),
+    );
+    drain(frames);
+
+    expect(committedContext.stroke).toHaveBeenCalledTimes(committedStrokeCount + 2);
     expect(runtime.stats().activeStrokeId).toBeNull();
     runtime.dispose();
   });
@@ -2665,7 +2826,7 @@ describe('InkRenderRuntime', () => {
     runtime.dispose();
   });
 
-  it('keeps production committed raster tiles outside the DOM and inside 1.5 viewport bytes', () => {
+  it('keeps retained committed tile nodes bounded inside 1.5 viewport bytes', () => {
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
       this: HTMLCanvasElement,
     ) {
@@ -2691,7 +2852,10 @@ describe('InkRenderRuntime', () => {
     expect(stats.rasterTileBytes).toBeLessThanOrEqual(200 * 200 * 4 * 1.5);
     expect(stats.rasterTileMisses).toBeGreaterThan(0);
     expect(stats.visibleRecoveryRebuildReason).toBe('initial-document-install');
-    expect(host.querySelectorAll('canvas')).toHaveLength(3);
+    expect(host.querySelectorAll('[data-inkstone-committed-tile]')).toHaveLength(
+      stats.rasterTileCount,
+    );
+    expect(host.querySelectorAll('[data-inkstone-committed-tile]').length).toBeLessThanOrEqual(64);
     const committed = host.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]');
     const committedContext = committed === null ? undefined : contexts.get(committed);
     const clearCountBeforeDamage = committedContext?.clearRect.mock.calls.length ?? 0;
@@ -2732,11 +2896,441 @@ describe('InkRenderRuntime', () => {
         .slice(clearCountBeforeExclusion)
         .some(([, , width, height]) => width === 200 && height === 200),
     ).toBe(false);
-    expect(host.querySelectorAll('canvas')).toHaveLength(3);
+    expect(host.querySelectorAll('[data-inkstone-committed-tile]').length).toBeLessThanOrEqual(64);
     runtime.dispose();
   });
 
-  it('prepares at most two missing committed raster tiles per frame before atomic presentation', () => {
+  it('reuses complete world raster tiles across a settled scroll inside the same tile coordinates', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([stroke('stable-world-tile')]);
+    const runtime = runtimeFixture(host, fixture, frames);
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    drain(frames);
+    const initialRebuilds = runtime.stats().rasterTileRebuildCount;
+    expect(runtime.stats().editSceneRevision).toBe(0);
+
+    const scrolled = createInkStageFrame({
+      actualScale: 1,
+      canvasClientRect: { height: 200, left: 0, top: 0, width: 200 },
+      documentClientOrigin: { x: 0, y: -10 },
+    });
+    runtime.setFrame(scrolled);
+    runtime.invalidateViewport();
+    drain(frames);
+
+    expect(runtime.stats().rasterTileRebuildCount).toBe(initialRebuilds);
+    runtime.dispose();
+  });
+
+  it('presents committed history as retained tile nodes without clearing them on settled scroll', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([stroke('retained-history')]);
+    const runtime = runtimeFixture(host, fixture, frames);
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    drain(frames);
+    const committed = host.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]');
+    const committedContext = committed === null ? undefined : contexts.get(committed);
+    const clears = committedContext?.clearRect.mock.calls.length ?? 0;
+    const retainedBefore = [
+      ...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]'),
+    ];
+    const retainedScene = host.querySelector<HTMLElement>('[data-inkstone-committed-tile-scene]');
+    const firstTilePresentation = retainedBefore.map((tile) => ({
+      height: tile.style.height,
+      transform: tile.style.transform,
+      width: tile.style.width,
+    }));
+
+    expect(retainedBefore.length).toBeGreaterThan(0);
+    expect(committed?.hidden).toBe(true);
+    expect(retainedScene?.style.transform).toBe('matrix(1, 0, 0, 1, 0, 0)');
+
+    const scrolled = createInkStageFrame({
+      actualScale: 1,
+      canvasClientRect: { height: 200, left: 0, top: 0, width: 200 },
+      documentClientOrigin: { x: 0, y: -10 },
+    });
+    runtime.projectFrame(scrolled);
+
+    expect(retainedScene?.style.transform).toBe('matrix(1, 0, 0, 1, 0, -10)');
+    expect(
+      retainedBefore.map((tile) => ({
+        height: tile.style.height,
+        transform: tile.style.transform,
+        width: tile.style.width,
+      })),
+    ).toEqual(firstTilePresentation);
+
+    runtime.setFrame(scrolled);
+    runtime.invalidateViewport();
+    drain(frames);
+
+    expect([...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]')]).toEqual(
+      retainedBefore,
+    );
+    expect(retainedScene?.style.transform).toBe('matrix(1, 0, 0, 1, 0, -10)');
+    expect(
+      retainedBefore.map((tile) => ({
+        height: tile.style.height,
+        transform: tile.style.transform,
+        width: tile.style.width,
+      })),
+    ).toEqual(firstTilePresentation);
+    expect(committedContext?.clearRect).toHaveBeenCalledTimes(clears);
+    runtime.dispose();
+  });
+
+  it('retains a bounded near-visible committed tile ring for compositor-only scrolling', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([]);
+    const diagnostics = new InkPerformanceDiagnostics(true);
+    const runtime = new InkRenderRuntime({
+      document,
+      host,
+      inkPerformance: diagnostics,
+      query: fixture.query,
+      read: fixture.read,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+      workScheduler: new InkWorkScheduler({ yieldToHost: () => Promise.resolve() }),
+    });
+    const initial = createInkStageFrame({
+      actualScale: 1,
+      canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+      documentClientOrigin: { x: 0, y: 0 },
+    });
+    runtime.setFrame(initial);
+    runtime.installDocument(fixture.read());
+    drain(frames);
+
+    await vi.waitFor(() => {
+      drain(frames);
+      expect(
+        [...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]')].filter(
+          (tile) => !tile.hidden,
+        ).length,
+      ).toBeGreaterThan(25);
+    });
+    const presented = [
+      ...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]'),
+    ].filter((tile) => !tile.hidden);
+    expect(presented.length).toBeGreaterThan(25);
+    const viewportRedraws = diagnostics
+      .snapshot()
+      .recentSpans.filter(({ name }) => name === 'ink-viewport-redraw');
+    expect(viewportRedraws.length).toBeGreaterThan(0);
+    expect(viewportRedraws.length).toBeLessThanOrEqual(2);
+    expect(runtime.stats().rasterTileBytes).toBeLessThanOrEqual(600 * 600 * 4 * 1.5);
+
+    const hiddenBefore = presented.map((tile) => tile.hidden);
+    runtime.projectFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+        documentClientOrigin: { x: -100, y: 0 },
+      }),
+    );
+
+    expect(presented.map((tile) => tile.hidden)).toEqual(hiddenBefore);
+    runtime.dispose();
+  });
+
+  it('warms newly exposed Edit tiles during Camera motion before the settled rebuild', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([]);
+    const runtime = new InkRenderRuntime({
+      document,
+      host,
+      query: fixture.query,
+      read: fixture.read,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+      workScheduler: new InkWorkScheduler({ yieldToHost: () => Promise.resolve() }),
+    });
+    runtime.setFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+        documentClientOrigin: { x: 0, y: 0 },
+      }),
+    );
+    runtime.installDocument(fixture.read());
+    await vi.waitFor(() => {
+      drain(frames);
+      expect(runtime.stats().visibleRecoveryRebuildCount).toBe(1);
+    });
+
+    runtime.projectFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+        documentClientOrigin: { x: 0, y: -1_200 },
+      }),
+    );
+
+    await vi.waitFor(() => {
+      const projectedTiles = [
+        ...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]'),
+      ].filter((tile) => !tile.hidden && tile.style.transform.includes(', 1200px,'));
+      expect(projectedTiles.length).toBeGreaterThan(0);
+    });
+    runtime.dispose();
+  });
+
+  it('keeps motion-warmed visible tiles presented until a stroke replacement is ready', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([]);
+    const runtime = new InkRenderRuntime({
+      document,
+      host,
+      query: fixture.query,
+      read: fixture.read,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+      workScheduler: new InkWorkScheduler({ yieldToHost: () => Promise.resolve() }),
+    });
+    runtime.setFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+        documentClientOrigin: { x: 0, y: 0 },
+      }),
+    );
+    runtime.installDocument(fixture.read());
+    await vi.waitFor(() => {
+      drain(frames);
+      expect(runtime.stats().visibleRecoveryRebuildCount).toBe(1);
+    });
+
+    runtime.projectFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+        documentClientOrigin: { x: 0, y: -1_200 },
+      }),
+    );
+
+    let warmed: HTMLCanvasElement[] = [];
+    await vi.waitFor(() => {
+      warmed = [
+        ...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]'),
+      ].filter((tile) => !tile.hidden && tile.style.transform.includes(', 1200px,'));
+      expect(warmed.length).toBeGreaterThan(0);
+    });
+
+    const added = stroke('motion-warm-add', 1_220);
+    fixture.replace([added]);
+    runtime.applyDocumentChange(
+      change('motion-warm-add', { addedIds: [added.id], newStroke: added }),
+    );
+
+    expect(warmed.every((tile) => tile.isConnected && !tile.hidden)).toBe(true);
+    runtime.dispose();
+  });
+
+  it('keeps the complete visible scene while an unclassified change rebuilds its replacement', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const history = stroke('unclassified-history');
+    const fixture = documentFixture([history]);
+    const runtime = runtimeFixture(host, fixture, frames);
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    drain(frames);
+    const visible = [
+      ...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]'),
+    ].filter((tile) => !tile.hidden);
+    expect(visible.length).toBeGreaterThan(0);
+
+    fixture.replace([stroke('unclassified-replacement')]);
+    runtime.applyDocumentChange(
+      documentChange('unclassified-change', 1, {
+        bounds: [],
+        updatedIds: [history.id],
+      }),
+    );
+
+    expect(visible.every((tile) => tile.isConnected && !tile.hidden)).toBe(true);
+    while (frames.length > 0) {
+      frames.shift()?.(performance.now());
+      expect(
+        [...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]')].filter(
+          (tile) => !tile.hidden,
+        ).length,
+      ).toBeGreaterThanOrEqual(visible.length);
+    }
+    expect(runtime.stats().visibleRecoveryRebuildReason).toBe('unclassified-document-change');
+    expect(runtime.stats().rasterTileBytes).toBeLessThanOrEqual(200 * 200 * 4 * 1.5);
+    runtime.dispose();
+  });
+
+  it('does not keep the mandatory render-frame queue alive for optional tile prefetch', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([]);
+    const runtime = new InkRenderRuntime({
+      document,
+      host,
+      query: fixture.query,
+      read: fixture.read,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+      workScheduler: new InkWorkScheduler({
+        yieldToHost: (lane) =>
+          lane === 'cold' ? new Promise<void>(() => undefined) : Promise.resolve(),
+      }),
+    });
+
+    runtime.setFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+        documentClientOrigin: { x: 0, y: 0 },
+      }),
+    );
+    runtime.installDocument(fixture.read());
+    await vi.waitFor(() => {
+      drain(frames);
+      expect(runtime.stats().visibleRecoveryRebuildCount).toBe(1);
+    });
+
+    expect(runtime.stats().queuedFrameCount).toBe(0);
+    expect(frames).toHaveLength(0);
+    runtime.dispose();
+  });
+
+  it('keeps resumable visible tile construction off the mandatory render-frame queue', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture([stroke('visible-scheduled')]);
+    const runtime = new InkRenderRuntime({
+      document,
+      host,
+      query: fixture.query,
+      read: fixture.read,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+      workScheduler: new InkWorkScheduler({
+        yieldToHost: () => new Promise<void>(() => undefined),
+      }),
+    });
+
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    frames.shift()?.(performance.now());
+
+    expect(runtime.stats().visibleRecoveryRebuildCount).toBe(0);
+    expect(runtime.stats().queuedFrameCount).toBe(0);
+    expect(frames).toHaveLength(0);
+    runtime.dispose();
+  });
+
+  it('prepares at most one resumable committed raster unit per frame before atomic presentation', () => {
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
       this: HTMLCanvasElement,
     ) {
@@ -2760,7 +3354,7 @@ describe('InkRenderRuntime', () => {
     frames.shift()?.(performance.now());
 
     expect(runtime.stats()).toMatchObject({
-      rasterTileRebuildCount: 2,
+      rasterTileRebuildCount: 1,
       visibleRecoveryRebuildCount: 0,
     });
     expect(frames).toHaveLength(1);
@@ -2772,7 +3366,100 @@ describe('InkRenderRuntime', () => {
     runtime.dispose();
   });
 
-  it('prepares at most two invalidated committed raster tiles per frame', () => {
+  it('resumes a dense committed tile without compiling its complete history in one frame', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const history = Array.from({ length: 12 }, (_, index) => stroke(`dense-${index}`, 10 + index));
+    const fixture = documentFixture(history);
+    const geometry = new LegacyRoundInkStrokeGeometry();
+    const compile = vi.spyOn(geometry, 'compile');
+    const memoryCoordinator = new InkGeometryCacheCoordinator(64 * 1024 * 1024);
+    const runtime = new InkRenderRuntime({
+      document,
+      geometry,
+      host,
+      memoryCoordinator,
+      query: fixture.query,
+      read: fixture.read,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+    });
+
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    frames.shift()?.(performance.now());
+
+    expect(compile.mock.calls.length).toBeLessThanOrEqual(1);
+    expect(frames).toHaveLength(1);
+    expect(memoryCoordinator.byteSize).toBeGreaterThan(fixture.read().indexBytes);
+
+    drain(frames);
+
+    expect(compile).toHaveBeenCalledTimes(history.length);
+    expect(runtime.stats().visibleRecoveryRebuildCount).toBe(1);
+    runtime.dispose();
+    expect(memoryCoordinator.byteSize).toBe(0);
+  });
+
+  it('plans visible raster regions once while a dense tile resumes across scheduler units', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const contentToken = vi.spyOn(InkEditTileContentIndex.prototype, 'contentToken');
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const fixture = documentFixture(
+      Array.from({ length: 12 }, (_, index) => stroke(`planned-dense-${index}`, 10 + index)),
+    );
+    const runtime = new InkRenderRuntime({
+      document,
+      host,
+      query: fixture.query,
+      read: fixture.read,
+      requestFrame: (callback) => {
+        frames.push(callback);
+        return frames.length;
+      },
+      workScheduler: new InkWorkScheduler({
+        yieldToHost: (lane) =>
+          lane === 'cold' ? new Promise<void>(() => undefined) : Promise.resolve(),
+      }),
+    });
+
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+
+    await vi.waitFor(() => {
+      drain(frames);
+      expect(runtime.stats().visibleRecoveryRebuildCount).toBe(1);
+    });
+
+    expect(contentToken.mock.calls.length).toBeLessThanOrEqual(32);
+    runtime.dispose();
+  });
+
+  it('presents an invalidated command patch before preparing retained raster units', () => {
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
       this: HTMLCanvasElement,
     ) {
@@ -2788,31 +3475,157 @@ describe('InkRenderRuntime', () => {
     document.body.append(host);
     const fixture = documentFixture([stroke('damaged-tile')]);
     const runtime = runtimeFixture(host, fixture, frames);
-    runtime.setFrame(frame());
+    runtime.setFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+        documentClientOrigin: { x: 0, y: 0 },
+      }),
+    );
     runtime.installDocument(fixture.read());
     drain(frames);
     const initialRebuilds = runtime.stats().rasterTileRebuildCount;
+    const retainedBeforeDamage = [
+      ...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]'),
+    ];
+    const visibleBeforeDamage = retainedBeforeDamage.filter((tile) => !tile.hidden);
+    const visibleClearCounts = visibleBeforeDamage.map(
+      (tile) => contexts.get(tile)?.clearRect.mock.calls.length ?? 0,
+    );
 
     runtime.applyDocumentChange(
       documentChange('invalidate-visible-viewport', 1, {
         bounds: [
           {
             id: 'damaged-tile',
-            newBounds: { height: 200, width: 200, x: 0, y: 0 },
-            oldBounds: { height: 200, width: 200, x: 0, y: 0 },
+            newBounds: { height: 20, width: 20, x: 0, y: 0 },
+            oldBounds: { height: 20, width: 20, x: 0, y: 0 },
           },
         ],
         updatedIds: ['damaged-tile'],
       }),
     );
 
+    for (const retained of retainedBeforeDamage) expect(retained.isConnected).toBe(true);
+
     frames.shift()?.(performance.now());
 
-    expect(runtime.stats().rasterTileRebuildCount - initialRebuilds).toBe(2);
-    expect(frames).toHaveLength(1);
+    expect(visibleBeforeDamage.every((tile) => tile.isConnected && !tile.hidden)).toBe(true);
+    expect(
+      visibleBeforeDamage.map((tile) => contexts.get(tile)?.clearRect.mock.calls.length ?? 0),
+    ).toEqual(visibleClearCounts);
+    expect(runtime.stats().editSceneRevision).toBe(1);
+    expect(runtime.stats().rasterTileRebuildCount - initialRebuilds).toBe(0);
+    expect(runtime.stats().rasterTileBytes).toBeLessThanOrEqual(600 * 600 * 4 * 1.5);
+    expect(frames).toHaveLength(0);
 
     drain(frames);
-    expect(runtime.stats().rasterTileRebuildCount - initialRebuilds).toBeGreaterThan(1);
+    expect(visibleBeforeDamage.every((tile) => tile.isConnected && !tile.hidden)).toBe(true);
+    expect(runtime.stats().rasterTileRebuildCount - initialRebuilds).toBe(0);
+    runtime.dispose();
+  });
+
+  it('presents a viewport-spanning erase without replacing any visible retained tile', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const erased = stroke('viewport-spanning-erase');
+    const fixture = documentFixture([erased]);
+    const runtime = runtimeFixture(host, fixture, frames);
+    runtime.setFrame(
+      createInkStageFrame({
+        actualScale: 1,
+        canvasClientRect: { height: 600, left: 0, top: 0, width: 600 },
+        documentClientOrigin: { x: 0, y: 0 },
+      }),
+    );
+    runtime.installDocument(fixture.read());
+    drain(frames);
+    const visible = [
+      ...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]'),
+    ].filter((tile) => !tile.hidden);
+    const initialRebuilds = runtime.stats().rasterTileRebuildCount;
+
+    fixture.replace([]);
+    runtime.applyDocumentChange(
+      documentChange('viewport-spanning-erase', 1, {
+        bounds: [
+          {
+            id: erased.id,
+            newBounds: null,
+            oldBounds: { height: 600, width: 600, x: 0, y: 0 },
+          },
+        ],
+        removedIds: [erased.id],
+      }),
+    );
+    drain(frames);
+
+    expect(visible.every((tile) => tile.isConnected && !tile.hidden)).toBe(true);
+    expect(runtime.stats().rasterTileRebuildCount).toBe(initialRebuilds);
+    expect(host.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]')?.hidden).toBe(
+      true,
+    );
+    runtime.dispose();
+  });
+
+  it('restores an undone stroke inside its retained tile without exposing the viewport fallback', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const restored = stroke('redo-retained-tile');
+    const fixture = documentFixture([restored]);
+    const runtime = runtimeFixture(host, fixture, frames);
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    drain(frames);
+    const visible = [
+      ...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]'),
+    ].filter((tile) => !tile.hidden);
+    const initialRebuilds = runtime.stats().rasterTileRebuildCount;
+
+    fixture.replace([]);
+    runtime.applyDocumentChange(
+      documentChange('undo-add', 1, {
+        bounds: [{ id: restored.id, newBounds: null, oldBounds: refBounds(restored) }],
+        removedIds: [restored.id],
+      }),
+    );
+    drain(frames);
+
+    fixture.replace([restored]);
+    runtime.applyDocumentChange(
+      documentChange('redo-add', 2, {
+        addedIds: [restored.id],
+        bounds: [{ id: restored.id, newBounds: refBounds(restored), oldBounds: null }],
+      }),
+    );
+    drain(frames);
+
+    const fallback = host.querySelector<HTMLCanvasElement>('[data-inkstone-ink-committed]');
+    expect(fallback?.hidden).toBe(true);
+    expect(visible.every((tile) => tile.isConnected && !tile.hidden)).toBe(true);
+    expect(runtime.stats().rasterTileRebuildCount).toBe(initialRebuilds);
     runtime.dispose();
   });
 
@@ -2850,6 +3663,52 @@ describe('InkRenderRuntime', () => {
     runtime.dispose();
   });
 
+  it('reuses an already-addressed alternate LOD after an exact command patch updates it', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
+      this: HTMLCanvasElement,
+    ) {
+      const existing = contexts.get(this);
+      if (existing !== undefined) return existing.context;
+      const created = contextFixture();
+      Object.defineProperty(created.context, 'canvas', { configurable: true, value: this });
+      contexts.set(this, created);
+      return created.context;
+    });
+    const frames: FrameRequestCallback[] = [];
+    const host = document.createElement('div');
+    document.body.append(host);
+    const history = stroke('alternate-lod-history');
+    const fixture = documentFixture([history]);
+    const runtime = runtimeFixture(host, fixture, frames);
+    runtime.setFrame(frame());
+    runtime.installDocument(fixture.read());
+    drain(frames);
+
+    runtime.setFrame(frame(0.5));
+    drain(frames);
+    runtime.setFrame(frame());
+    drain(frames);
+
+    const added = stroke('alternate-lod-added', 40);
+    fixture.replace([history, added]);
+    runtime.applyDocumentChange(
+      change('alternate-lod-added', { addedIds: [added.id], newStroke: added }),
+    );
+    drain(frames);
+    const rebuildsBeforeAlternateLod = runtime.stats().rasterTileRebuildCount;
+
+    runtime.setFrame(frame(0.5));
+    drain(frames);
+
+    expect(runtime.stats().rasterTileRebuildCount).toBe(rebuildsBeforeAlternateLod);
+    expect(
+      [...host.querySelectorAll<HTMLCanvasElement>('[data-inkstone-committed-tile]')]
+        .filter((tile) => !tile.hidden)
+        .some((tile) => tile.dataset.inkstoneCommittedTile?.includes('revision:1')),
+    ).toBe(true);
+    runtime.dispose();
+  });
+
   it('keeps the old bitmap projected until resized backing tiles are ready', () => {
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (
       this: HTMLCanvasElement,
@@ -2873,7 +3732,7 @@ describe('InkRenderRuntime', () => {
     const baselineMutations = runtime.stats().backingStoreDimensionMutationCount;
     const resized = createInkStageFrame({
       actualScale: 1,
-      canvasClientRect: { height: 200, left: 0, top: 0, width: 300 },
+      canvasClientRect: { height: 200, left: 0, top: 0, width: 500 },
       documentClientOrigin: { x: 0, y: 0 },
     });
 

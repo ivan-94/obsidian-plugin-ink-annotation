@@ -76,14 +76,10 @@ import {
 } from './settings';
 import { SidecarRepository } from './storage/sidecar-repository';
 import { InkSurfaceRepository } from './storage/ink-surface-repository';
+import { InkDocumentSnapshotRepository } from './storage/ink-document-snapshot-repository';
+import { IndexedDbInkDocumentDraftStore } from './storage/indexeddb-ink-document-draft-store';
 import { VaultIndexCache } from './storage/vault-index-cache';
 import { LocalInkToolPreferenceStore } from './storage/local-ink-tool-preference';
-import { LocalInkRecoveryReader } from './storage/local-ink-recovery';
-import {
-  IndexedDbInkRecoveryArchiveReader,
-  LegacyInkRecoveryStorage,
-  createInkRecoveryStorageKeyspace,
-} from './storage/tiered-ink-recovery-storage';
 
 export default class InkstoneAnnotationsPlugin extends Plugin {
   private readonly diagnostics = new Diagnostics(false);
@@ -137,6 +133,12 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
       onEventIssue: (error) => console.warn('[Inkstone Annotations]', error),
       onSurfaceChanged: (record) => refreshInkSurfaceProjection(record),
     });
+    const inkSnapshotRepository = new InkDocumentSnapshotRepository(sidecarStore);
+    const inkDraftStore =
+      globalThis.indexedDB === undefined
+        ? undefined
+        : new IndexedDbInkDocumentDraftStore(globalThis.indexedDB);
+    if (inkDraftStore !== undefined) this.runtime.registerDisposer(() => inkDraftStore.close());
     const inkSurfaceProjections = new CanonicalInkSurfaceProjectionCoordinator({
       applySummaries: (filePath, summaries) =>
         this.sidebarView?.applyInkSurfaceSummaries(filePath, summaries),
@@ -156,6 +158,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     const sidecarLifecycle = new SidecarLifecycleService({
       annotations: repository,
       ink: inkRepository,
+      inkSnapshot: inkSnapshotRepository,
     });
     const exportDialog = new AnnotationExportDialog({ document: globalThis.document });
     this.runtime.registerDisposer(() => exportDialog.close(false));
@@ -851,38 +854,15 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     });
     this.readingView = readingView;
     this.runtime.registerDisposer(() => readingView.dispose());
-    let legacyRecoveryStorage: Pick<Storage, 'getItem' | 'key' | 'length'> =
-      globalThis.localStorage;
-    if (globalThis.indexedDB !== undefined) {
-      const mergedLegacyStorage = new LegacyInkRecoveryStorage({
-        archive: new IndexedDbInkRecoveryArchiveReader(globalThis.indexedDB),
-        front: globalThis.localStorage,
-        keyspace: createInkRecoveryStorageKeyspace(
-          this.app.vault.getName(),
-          this.pluginSettings.deviceId,
-        ),
-      });
-      try {
-        await mergedLegacyStorage.ready();
-        legacyRecoveryStorage = mergedLegacyStorage;
-        this.runtime.registerDisposer(() => mergedLegacyStorage.close());
-      } catch (error) {
-        mergedLegacyStorage.close();
-        console.warn('[Inkstone Annotations] Legacy Ink recovery could not be read.', error);
-      }
-    }
-    const legacyInkRecoveryReader = new LocalInkRecoveryReader(
-      legacyRecoveryStorage,
-      this.app.vault.getName(),
-      this.pluginSettings.deviceId,
-    );
     inkMode = new ObsidianInkModeManager({
       app: this.app,
       deviceId: this.pluginSettings.deviceId,
       document: globalThis.document,
       exportUnsavedInk: (surface) => writeInkSvgExport(surface, sidecarStore),
       inkPerformance: this.inkPerformance,
+      ...(inkDraftStore === undefined ? {} : { inkDraftStore }),
       inkRepository,
+      inkSnapshotRepository,
       onIssue: (error) => {
         console.warn('[Inkstone Annotations]', error);
         if (error instanceof Error) {
@@ -895,9 +875,6 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         this.app.vault.getName(),
         this.pluginSettings.deviceId,
       ),
-      liveFirstPersistence: {
-        legacyRecoveryReader: legacyInkRecoveryReader,
-      },
       recordInputToPaint: (durationMs) =>
         this.diagnostics.recordLatency('ink-input-to-paint', durationMs),
       showInkPreviewByDefault: this.pluginSettings.showInkPreviewByDefault,
@@ -1081,7 +1058,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     };
     const handleCanonicalSidecarEvent = (file: { readonly path: string }): void => {
       const canonical =
-        /^\.obsidian-annotations\/v1\/notes\/[^/]+\/(?:(?:annotations|surfaces)\/[^/]+\.json|ink-summaries\.json)$/u.test(
+        /^\.obsidian-annotations\/v1\/notes\/[^/]+\/(?:(?:annotations|surfaces)\/[^/]+\.json|ink-summaries\.json|ink\.json)$/u.test(
           file.path,
         );
       if (!canonical) return;
@@ -1093,7 +1070,21 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         })
         .then((unchangedLocalWrite) => {
           if (unchangedLocalWrite) return;
-          if (file.path.includes('/surfaces/') || file.path.endsWith('/ink-summaries.json')) {
+          if (file.path.endsWith('/ink.json')) {
+            void inkSnapshotRepository
+              .resolveFilePath(file.path)
+              .then(async (filePath) => {
+                if (filePath === null) return;
+                await Promise.all([
+                  refreshAnnotationSurfaces(filePath),
+                  inkMode?.refreshFile(filePath),
+                ]);
+              })
+              .catch((error) => console.warn('[Inkstone Annotations]', error));
+          } else if (
+            file.path.includes('/surfaces/') ||
+            file.path.endsWith('/ink-summaries.json')
+          ) {
             void inkRepository
               .rebuildSummariesForSidecarPath(file.path)
               .then(async (filePath) => {

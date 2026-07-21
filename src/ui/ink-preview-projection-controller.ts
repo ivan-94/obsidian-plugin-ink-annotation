@@ -1,5 +1,11 @@
 import type { InkPreviewProjection } from '../application/ink-preview-projection';
 import { SharedInkStrokeGeometry } from '../domain/ink-shared-stroke-geometry';
+import { InkViewportDemandPlanner } from '../domain/ink-viewport-demand-planner';
+import {
+  createInkNoteLogicalRect,
+  InkWorldTileGrid,
+  type InkWorldTileCoordinate,
+} from '../domain/ink-world-tile-grid';
 import {
   NOOP_INK_PERFORMANCE_RECORDER,
   type InkPerformanceRecorder,
@@ -11,6 +17,7 @@ import type {
   InkPreviewCacheHit,
   InkPreviewCacheKey,
   InkPreviewCacheTile,
+  InkPreviewCacheTileCoordinate,
 } from '../storage/indexeddb-ink-preview-cache';
 import { drawInkBrushGeometryToCanvas } from './ink-brush-canvas-adapter';
 import {
@@ -21,8 +28,13 @@ import {
   type InkPreviewTileEncoder,
   InkPreviewTileWorkerEncoder,
 } from './ink-preview-tile-encoder';
+import { InkPreviewSeedBufferCache } from './ink-preview-seed-buffer-cache';
+import { InkMainThreadTileBuilder } from './ink-main-thread-tile-builder';
+import { InkRetainedTileScene } from './ink-retained-tile-scene';
+import { InkViewportPresentationTransaction } from './ink-viewport-presentation-transaction';
 
-type InkPreviewCachePort = Pick<IndexedDbInkPreviewCache, 'load' | 'publish'>;
+type InkPreviewCachePort = Pick<IndexedDbInkPreviewCache, 'publish'> &
+  Partial<Pick<IndexedDbInkPreviewCache, 'load' | 'loadRegion' | 'publishCompleteTiles'>>;
 
 interface InkPreviewViewport {
   readonly backingHeight: number;
@@ -37,6 +49,12 @@ interface InkPreviewViewport {
   readonly scale: number;
   readonly top: number;
   readonly width: number;
+}
+
+interface InkPreviewTileDemand {
+  readonly all: readonly InkPreviewCacheTileCoordinate[];
+  readonly exact: readonly InkPreviewCacheTileCoordinate[];
+  readonly visible: readonly InkPreviewCacheTileCoordinate[];
 }
 
 /** One-canvas, read-only Preview presenter. It owns no Pencil, toolbar, Undo, or persistence state. */
@@ -61,22 +79,34 @@ export class InkPreviewProjectionController {
   private readonly overlay: HTMLElement;
   private readonly projection: InkPreviewProjection;
   private readonly requestFrame: (callback: FrameRequestCallback) => number;
+  private readonly retainedSceneKeys = new Map<string, string>();
+  private readonly retainedScene: InkRetainedTileScene;
   private root: HTMLElement;
   private scrollContainer: HTMLElement | null;
   private stagingCanvas: HTMLCanvasElement;
   private stagingContext: CanvasRenderingContext2D;
+  private readonly tileBuilder: InkMainThreadTileBuilder;
   private readonly tileEncoder: InkPreviewTileEncoder;
   private visible = false;
   private presentationEpoch = 0;
   private viewportEpoch = 0;
-  private cachedSeedTiles: readonly InkPreviewCacheTile[] = [];
+  private readonly seedBuffers: InkPreviewSeedBufferCache;
   private publishingCache = false;
+  private canonicalPrefetchRun = 0;
   private viewportCompleteSpan: InkPerformanceSpan | null = null;
   private presentedViewport: InkPreviewViewport | null = null;
   private cacheLookupSpan: InkPerformanceSpan | null = null;
   private cacheFallbackFrame: number | null = null;
   private cachePublishSpan: InkPerformanceSpan | null = null;
   private readonly workScheduler: InkWorkScheduler;
+  private readonly demandPlanner: InkViewportDemandPlanner;
+  private readonly tileGrid: InkWorldTileGrid;
+  private readonly viewportTransaction = new InkViewportPresentationTransaction({
+    hysteresisRatio: 0.1,
+    maximumLod: 4,
+    minimumLod: -4,
+  });
+  private scheduledCacheLookup = false;
 
   constructor(input: {
     readonly cancelFrame?: (handle: number) => void;
@@ -101,10 +131,26 @@ export class InkPreviewProjectionController {
     this.document = input.document;
     this.cache = input.cache ?? null;
     this.cacheKey = input.cacheKey ?? null;
+    this.tileGrid = new InkWorldTileGrid({
+      baseWorldSpan: input.cacheKey?.logicalTileSize ?? 512,
+    });
+    this.demandPlanner = new InkViewportDemandPlanner({
+      grid: this.tileGrid,
+      lookAheadRings: 1,
+      nearVisibleRings: 1,
+    });
     this.decodeTile = input.decodeTile ?? decodePngTile;
     this.inkPerformance = input.inkPerformance ?? NOOP_INK_PERFORMANCE_RECORDER;
     this.memoryReservation = new InkDisposableMemoryReservation(input.memoryCoordinator);
+    this.seedBuffers = new InkPreviewSeedBufferCache(input.memoryCoordinator);
     this.workScheduler = input.workScheduler ?? new InkWorkScheduler();
+    this.tileBuilder = new InkMainThreadTileBuilder({
+      document: input.document,
+      scheduler: this.workScheduler,
+      ...(input.memoryCoordinator === undefined
+        ? {}
+        : { memoryCoordinator: input.memoryCoordinator }),
+    });
     this.tileEncoder = input.tileEncoder ?? new InkPreviewTileWorkerEncoder();
     this.root = input.root;
     this.layoutRoot = input.layoutRoot ?? input.root;
@@ -115,6 +161,14 @@ export class InkPreviewProjectionController {
     this.overlay.className = 'inkstone-ink-surface inkstone-ink-preview-projection';
     this.overlay.dataset.inkstoneInkPreviewProjection = this.projection.read().documentId;
     this.overlay.hidden = true;
+    this.retainedScene = new InkRetainedTileScene({
+      document: input.document,
+      host: this.overlay,
+      maximumNodeCount: 64,
+      ...(input.memoryCoordinator === undefined
+        ? {}
+        : { memoryCoordinator: input.memoryCoordinator }),
+    });
     this.canvas = input.document.createElement('canvas');
     this.canvas.className = 'inkstone-ink-canvas inkstone-ink-canvas-preview';
     this.canvas.dataset.inkstoneInkPreviewCanvas = 'true';
@@ -174,34 +228,34 @@ export class InkPreviewProjectionController {
           }
           this.cacheFallbackFrame = null;
           canonicalFallbackStarted = true;
-          lookupSpan.finish({ accepted: false });
-          if (this.cacheLookupSpan === lookupSpan) this.cacheLookupSpan = null;
           this.schedule();
         });
         if (!completedSynchronously) this.cacheFallbackFrame = fallbackFrame;
       }),
     );
-    void this.cache.load(this.cacheKey).then(
+    const demandedCoordinates = this.previewTileDemand(this.measureViewport()).all;
+    const cacheLoad =
+      this.cache.loadRegion?.(this.cacheKey, demandedCoordinates) ??
+      this.cache.load?.(this.cacheKey) ??
+      Promise.resolve(null);
+    void cacheLoad.then(
       (hit) => {
         cacheSettled = true;
         if (this.disposed || !this.visible || epoch !== this.presentationEpoch) return;
         if (this.cacheFallbackFrame !== null) this.cancelFrame(this.cacheFallbackFrame);
         this.cacheFallbackFrame = null;
-        if (canonicalFallbackStarted) {
-          if (hit !== null) this.cachedSeedTiles = hit.tiles;
-          return;
-        }
         lookupSpan.finish({ accepted: hit !== null });
         if (this.cacheLookupSpan === lookupSpan) this.cacheLookupSpan = null;
         if (hit === null) {
-          this.cachedSeedTiles = [];
-          this.schedule();
+          this.seedBuffers.replace([]);
+          if (!canonicalFallbackStarted) this.schedule();
           return;
         }
+        this.seedBuffers.replace(hit.tiles);
         void this.renderCached(hit, epoch).then((presented) => {
           if (!presented && !this.disposed && this.visible && epoch === this.presentationEpoch) {
-            this.cachedSeedTiles = hit.tiles;
-            this.schedule();
+            this.seedBuffers.replace(hit.tiles);
+            if (!canonicalFallbackStarted) this.schedule();
           }
         });
       },
@@ -210,10 +264,9 @@ export class InkPreviewProjectionController {
         if (this.disposed || !this.visible || epoch !== this.presentationEpoch) return;
         if (this.cacheFallbackFrame !== null) this.cancelFrame(this.cacheFallbackFrame);
         this.cacheFallbackFrame = null;
-        if (canonicalFallbackStarted) return;
         lookupSpan.finish({ accepted: false });
         if (this.cacheLookupSpan === lookupSpan) this.cacheLookupSpan = null;
-        this.schedule();
+        if (!canonicalFallbackStarted) this.schedule();
       },
     );
   }
@@ -235,7 +288,9 @@ export class InkPreviewProjectionController {
   hidePreview(): void {
     this.visible = false;
     this.presentationEpoch += 1;
+    this.canonicalPrefetchRun += 1;
     this.overlay.hidden = true;
+    this.retainedScene.hide();
     this.cancelPreviewSpans();
     this.resolveFirstPresentation?.();
     this.resolveFirstPresentation = null;
@@ -277,6 +332,7 @@ export class InkPreviewProjectionController {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.canonicalPrefetchRun += 1;
     this.presentationEpoch += 1;
     this.cancelPreviewSpans();
     if (this.frame !== null) this.cancelFrame(this.frame);
@@ -291,32 +347,72 @@ export class InkPreviewProjectionController {
     this.overlay.remove();
     this.root.classList.remove('inkstone-ink-host');
     this.memoryReservation.dispose();
+    this.seedBuffers.dispose();
+    this.retainedScene.dispose();
+    this.tileBuilder.dispose();
     this.tileEncoder.dispose();
   }
 
   private readonly onViewportChanged = (): void => {
     const measured = this.measureViewport();
     this.projectPresentedViewport(measured);
-    this.schedule();
+    this.schedule(true);
   };
 
-  private schedule(): void {
+  private schedule(cacheFirst = false): void {
     if (this.disposed || !this.visible) return;
+    if (cacheFirst) this.scheduledCacheLookup = true;
     this.viewportEpoch += 1;
     if (this.frame !== null) return;
     let completedSynchronously = false;
     const frame = this.requestFrame(() => {
       completedSynchronously = true;
       this.frame = null;
-      void this.renderVisibleViewport(this.viewportEpoch);
+      const lookupCache = this.scheduledCacheLookup;
+      this.scheduledCacheLookup = false;
+      void this.renderVisibleViewport(this.viewportEpoch, lookupCache);
     });
     if (!completedSynchronously) this.frame = frame;
   }
 
-  private async renderVisibleViewport(viewportEpoch: number): Promise<void> {
+  private async renderVisibleViewport(viewportEpoch: number, lookupCache: boolean): Promise<void> {
+    const presentationEpoch = this.presentationEpoch;
+    if (
+      lookupCache &&
+      this.cache !== null &&
+      this.cacheKey !== null &&
+      this.cache.loadRegion !== undefined
+    ) {
+      const measured = this.measureViewport();
+      const pendingHit = this.cache.loadRegion(this.cacheKey, this.previewTileDemand(measured).all);
+      const cacheOutcome = await this.cacheRegionBeforeNextFrame(pendingHit);
+      if (cacheOutcome.kind === 'deadline') {
+        void pendingHit.then(
+          (lateHit) => {
+            if (lateHit !== null) {
+              this.seedBuffers.merge(lateHit.tiles);
+            }
+          },
+          () => undefined,
+        );
+      }
+      if (!this.previewWorkIsCurrent(presentationEpoch, viewportEpoch)) return;
+      if (
+        cacheOutcome.kind === 'settled' &&
+        cacheOutcome.hit !== null &&
+        (await this.renderCached(cacheOutcome.hit, presentationEpoch))
+      ) {
+        this.seedBuffers.merge(cacheOutcome.hit.tiles);
+        return;
+      }
+    }
+    const tiledViewport = this.measureViewport();
+    if (await this.renderCanonicalVisibleTiles(tiledViewport, presentationEpoch, viewportEpoch)) {
+      return;
+    }
+    if (!this.previewWorkIsCurrent(presentationEpoch, viewportEpoch)) return;
     const viewport = this.prepareStagingViewport();
     const targetContext = this.stagingContext;
-    const presentationEpoch = this.presentationEpoch;
     const query = this.projection.prepareQuery({
       height: viewport.logicalHeight,
       width: viewport.logicalWidth,
@@ -361,6 +457,180 @@ export class InkPreviewProjectionController {
     this.scheduleCachePublication(viewport, viewportEpoch);
   }
 
+  private async renderCanonicalVisibleTiles(
+    viewport: InkPreviewViewport,
+    presentationEpoch: number,
+    viewportEpoch: number,
+  ): Promise<boolean> {
+    const plan = this.demandPlanner.plan({
+      lod: this.targetTileLod(viewport),
+      viewport: previewLogicalRect(viewport),
+    });
+    if (plan.kind === 'untileable-range' || plan.visible.length === 0) return false;
+    this.positionAndMeasureOverlay(viewport.left, viewport.top, viewport.width, viewport.height);
+    for (const coordinate of plan.visible) {
+      const identity = previewCoordinateIdentity(coordinate.lod, coordinate.column, coordinate.row);
+      if (this.hasRetainedCoordinate(coordinate)) continue;
+      const adoptedKey = await this.buildCanonicalTile(
+        coordinate,
+        viewport,
+        presentationEpoch,
+        viewportEpoch,
+        'visible',
+      );
+      if (adoptedKey === null) return false;
+      this.retainedSceneKeys.set(identity, adoptedKey);
+      this.retainedScene.project(retainedTileCamera(viewport));
+    }
+    if (!this.previewWorkIsCurrent(presentationEpoch, viewportEpoch)) return false;
+    const complete = plan.visible.every((coordinate) => this.hasRetainedCoordinate(coordinate));
+    if (!complete) return false;
+    this.retainedScene.presentOnly(
+      new Set(
+        plan.visible.flatMap((coordinate) => {
+          const key = this.retainedSceneKey(coordinate);
+          return key === null ? [] : [key];
+        }),
+      ),
+    );
+    this.canvas.hidden = true;
+    this.stagingCanvas.hidden = true;
+    this.retainedScene.project(retainedTileCamera(viewport));
+    this.presentedViewport = viewport;
+    this.viewportTransaction.accept({
+      cameraEpoch: viewportEpoch,
+      coverage: 'exact',
+      projectionIdentity: this.projection.read().documentId,
+    });
+    this.finishPreviewPresentation();
+    this.scheduleCachePublication(viewport, viewportEpoch);
+    this.scheduleCanonicalPrefetch(
+      [...plan.nearVisible, ...plan.lookAhead],
+      viewport,
+      presentationEpoch,
+      viewportEpoch,
+    );
+    return true;
+  }
+
+  private async buildCanonicalTile(
+    coordinate: InkWorldTileCoordinate,
+    viewport: InkPreviewViewport,
+    presentationEpoch: number,
+    viewportEpoch: number,
+    lane: 'cold' | 'visible',
+  ): Promise<string | null> {
+    const bounds = this.tileGrid.nominalBounds(coordinate);
+    const density = Math.max(1, Math.min(4, viewport.dpr * viewport.scale));
+    const key = `canonical:${this.projection.read().documentId}:${coordinate.lod}:${coordinate.column}:${coordinate.row}`;
+    const result = await this.tileBuilder.build({
+      backingHeight: Math.max(1, Math.ceil(bounds.height * density)),
+      backingWidth: Math.max(1, Math.ceil(bounds.width * density)),
+      bounds,
+      createDrawPlan: (context, visible) => {
+        this.memoryReservation.setBytes(this.projection.read().indexBytes);
+        const drawUnits = visible.flatMap(({ stroke }) => {
+          let compiled: ReturnType<SharedInkStrokeGeometry['compile']> | null = null;
+          return [
+            () => {
+              compiled = this.geometry.compile(stroke);
+            },
+            () => {
+              if (compiled?.kind === 'exact' || compiled?.kind === 'unpublished') {
+                drawInkBrushGeometryToCanvas(context, compiled.geometry);
+              }
+            },
+          ];
+        });
+        return {
+          unitKinds: visible.flatMap(() => ['preview-geometry-compile', 'preview-canvas-draw']),
+          units: drawUnits,
+        };
+      },
+      density,
+      isCurrent: () => this.previewWorkIsCurrent(presentationEpoch, viewportEpoch),
+      key,
+      lane,
+      prepareQuery: () => this.projection.prepareQuery(bounds),
+    });
+    if (result === null) return null;
+    const adopted = this.retainedScene.adopt({
+      backingHeight: result.canvas.height,
+      backingWidth: result.canvas.width,
+      key,
+      logicalBounds: bounds,
+      presented: lane === 'visible' && !this.retainedScene.hasPresentation,
+      source: result.canvas,
+    });
+    result.canvas.width = 0;
+    result.canvas.height = 0;
+    return adopted ? key : null;
+  }
+
+  private scheduleCanonicalPrefetch(
+    coordinates: readonly InkWorldTileCoordinate[],
+    viewport: InkPreviewViewport,
+    presentationEpoch: number,
+    viewportEpoch: number,
+  ): void {
+    const run = ++this.canonicalPrefetchRun;
+    void (async () => {
+      for (const coordinate of coordinates) {
+        if (
+          run !== this.canonicalPrefetchRun ||
+          !this.previewWorkIsCurrent(presentationEpoch, viewportEpoch)
+        ) {
+          return;
+        }
+        if (this.hasRetainedCoordinate(coordinate)) continue;
+        const adoptedKey = await this.buildCanonicalTile(
+          coordinate,
+          viewport,
+          presentationEpoch,
+          viewportEpoch,
+          'cold',
+        );
+        if (adoptedKey === null) return;
+        this.retainedSceneKeys.set(
+          previewCoordinateIdentity(coordinate.lod, coordinate.column, coordinate.row),
+          adoptedKey,
+        );
+      }
+    })().catch(() => undefined);
+  }
+
+  private cacheRegionBeforeNextFrame(
+    pending: Promise<InkPreviewCacheHit | null>,
+  ): Promise<
+    | { readonly hit: InkPreviewCacheHit | null; readonly kind: 'settled' }
+    | { readonly kind: 'deadline' }
+  > {
+    return new Promise((resolve) => {
+      let finished = false;
+      let deadlineHandle: number | null = null;
+      const finish = (
+        outcome:
+          | { readonly hit: InkPreviewCacheHit | null; readonly kind: 'settled' }
+          | { readonly kind: 'deadline' },
+      ): void => {
+        if (finished) return;
+        finished = true;
+        if (deadlineHandle !== null) this.cancelFrame(deadlineHandle);
+        resolve(outcome);
+      };
+      void pending.then(
+        (hit) => finish({ hit, kind: 'settled' }),
+        () => finish({ hit: null, kind: 'settled' }),
+      );
+      let completedSynchronously = false;
+      const handle = this.requestFrame(() => {
+        completedSynchronously = true;
+        finish({ kind: 'deadline' });
+      });
+      if (!completedSynchronously && !finished) deadlineHandle = handle;
+    });
+  }
+
   private scheduleCachePublication(viewport: InkPreviewViewport, viewportEpoch: number): void {
     if (
       this.cache === null ||
@@ -395,7 +665,8 @@ export class InkPreviewProjectionController {
     const cache = this.cache;
     const key = this.cacheKey;
     if (cache === null || key === null) return false;
-    const tileSize = key.logicalTileSize;
+    const lod = this.targetTileLod(viewport);
+    const tileSize = key.logicalTileSize / 2 ** lod;
     const firstX = Math.floor(viewport.logicalLeft / tileSize);
     const lastX = Math.floor(
       Math.max(viewport.logicalLeft, viewport.logicalLeft + viewport.logicalWidth - 0.001) /
@@ -407,29 +678,48 @@ export class InkPreviewProjectionController {
         tileSize,
     );
     const byCoordinate = new Map(
-      this.cachedSeedTiles.map((tile) => [`${tile.x}:${tile.y}`, tile] as const),
+      this.seedBuffers
+        .snapshot()
+        .map((tile) => [previewCoordinateIdentity(tile.lod, tile.x, tile.y), tile] as const),
     );
+    const completedTiles: InkPreviewCacheTile[] = [];
     for (let y = firstY; y <= lastY; y += 1) {
       for (let x = firstX; x <= lastX; x += 1) {
-        if (byCoordinate.has(`${x}:${y}`)) continue;
-        const bytes = await this.renderEncodedTile(x, y, key, presentationEpoch, viewportEpoch);
-        if (bytes === null) return false;
-        byCoordinate.set(`${x}:${y}`, {
-          byteLength: bytes.byteLength,
-          bytes,
+        const identity = previewCoordinateIdentity(lod, x, y);
+        if (byCoordinate.has(identity)) continue;
+        const bytes = await this.renderEncodedTile(
+          lod,
           x,
           y,
-        });
+          key,
+          presentationEpoch,
+          viewportEpoch,
+        );
+        if (bytes === null) return false;
+        const completed = {
+          byteLength: bytes.byteLength,
+          bytes,
+          lod,
+          x,
+          y,
+        };
+        byCoordinate.set(identity, completed);
+        completedTiles.push(completed);
       }
     }
     if (!this.previewWorkIsCurrent(presentationEpoch, viewportEpoch)) return false;
+    if (completedTiles.length === 0) return true;
     const tiles = [...byCoordinate.values()];
-    const published = await cache.publish(key, tiles);
-    if (published) this.cachedSeedTiles = tiles;
+    const published =
+      cache.publishCompleteTiles === undefined
+        ? await cache.publish(key, tiles)
+        : await cache.publishCompleteTiles(key, completedTiles);
+    if (published) this.seedBuffers.replace(tiles);
     return published;
   }
 
   private async renderEncodedTile(
+    lod: number,
     tileX: number,
     tileY: number,
     key: InkPreviewCacheKey,
@@ -437,9 +727,10 @@ export class InkPreviewProjectionController {
     viewportEpoch: number,
   ): Promise<ArrayBuffer | null> {
     const pixelScale = key.scaleBucket * key.devicePixelRatio;
+    const logicalTileSize = key.logicalTileSize / 2 ** lod;
     const canvas = createPreviewTileCanvas(
-      Math.max(1, Math.ceil(key.logicalTileSize * pixelScale)),
-      Math.max(1, Math.ceil(key.logicalTileSize * pixelScale)),
+      Math.max(1, Math.ceil(logicalTileSize * pixelScale)),
+      Math.max(1, Math.ceil(logicalTileSize * pixelScale)),
     );
     if (canvas === null) return null;
     const context = previewTileContext(canvas);
@@ -449,14 +740,14 @@ export class InkPreviewProjectionController {
       0,
       0,
       pixelScale,
-      -tileX * key.logicalTileSize * pixelScale,
-      -tileY * key.logicalTileSize * pixelScale,
+      -tileX * logicalTileSize * pixelScale,
+      -tileY * logicalTileSize * pixelScale,
     );
     const query = this.projection.prepareQuery({
-      height: key.logicalTileSize,
-      width: key.logicalTileSize,
-      x: tileX * key.logicalTileSize,
-      y: tileY * key.logicalTileSize,
+      height: logicalTileSize,
+      width: logicalTileSize,
+      x: tileX * logicalTileSize,
+      y: tileY * logicalTileSize,
     });
     const queryOutcome = await this.workScheduler.schedule({
       isCurrent: () => this.previewWorkIsCurrent(presentationEpoch, viewportEpoch),
@@ -518,53 +809,185 @@ export class InkPreviewProjectionController {
     const viewport = this.measureViewport();
     const tileSize = this.cacheKey?.logicalTileSize;
     if (tileSize === undefined) return false;
-    const tileByCoordinate = new Map(hit.tiles.map((tile) => [`${tile.x}:${tile.y}`, tile]));
-    const firstX = Math.floor(viewport.logicalLeft / tileSize);
-    const lastX = Math.floor(
-      Math.max(viewport.logicalLeft, viewport.logicalLeft + viewport.logicalWidth - 0.001) /
-        tileSize,
+    const demand = this.previewTileDemand(viewport);
+    const required = hit.tiles.filter(
+      ({ lod, x, y }) => !this.hasRetainedCoordinate({ column: x, lod, row: y }),
     );
-    const firstY = Math.floor(viewport.logicalTop / tileSize);
-    const lastY = Math.floor(
-      Math.max(viewport.logicalTop, viewport.logicalTop + viewport.logicalHeight - 0.001) /
-        tileSize,
-    );
-    const required = [];
-    for (let y = firstY; y <= lastY; y += 1) {
-      for (let x = firstX; x <= lastX; x += 1) {
-        const tile = tileByCoordinate.get(`${x}:${y}`);
-        if (tile === undefined) return false;
-        required.push(tile);
-      }
-    }
     const outcomes = await Promise.all(
-      required.map(({ bytes }) =>
-        this.decodeTile(bytes).then(
-          (value) => ({ ok: true as const, value }),
-          () => ({ ok: false as const }),
+      required.map((tile) =>
+        this.decodeTile(tile.bytes).then(
+          (source) => ({ ok: true as const, source, tile }),
+          () => ({ ok: false as const, tile }),
         ),
       ),
     );
-    const decoded = outcomes.flatMap((outcome) => (outcome.ok ? [outcome.value] : []));
-    if (decoded.length !== required.length) {
-      for (const source of decoded) releaseCanvasImageSource(source);
-      return false;
-    }
+    const decoded = outcomes.flatMap((outcome) =>
+      outcome.ok ? [{ source: outcome.source, tile: outcome.tile }] : [],
+    );
     try {
       if (!this.previewWorkIsCurrent(epoch, viewportEpoch)) return false;
-      this.prepareStagingViewport(viewport);
-      const targetContext = this.stagingContext;
-      for (const [index, tile] of required.entries()) {
-        const bitmap = decoded[index];
-        if (bitmap === undefined) continue;
-        targetContext.drawImage(bitmap, tile.x * tileSize, tile.y * tileSize, tileSize, tileSize);
+      this.positionAndMeasureOverlay(viewport.left, viewport.top, viewport.width, viewport.height);
+      for (const { source, tile } of decoded) {
+        const bounds = this.tileGrid.nominalBounds({
+          column: tile.x,
+          lod: tile.lod,
+          row: tile.y,
+        });
+        if (
+          !this.retainedScene.adopt({
+            backingHeight: Math.max(
+              1,
+              Math.ceil(
+                bounds.height *
+                  (this.cacheKey?.scaleBucket ?? 1) *
+                  (this.cacheKey?.devicePixelRatio ?? 1),
+              ),
+            ),
+            backingWidth: Math.max(
+              1,
+              Math.ceil(
+                bounds.width *
+                  (this.cacheKey?.scaleBucket ?? 1) *
+                  (this.cacheKey?.devicePixelRatio ?? 1),
+              ),
+            ),
+            key: `${hit.generation}:${tile.lod}:${tile.x}:${tile.y}`,
+            logicalBounds: bounds,
+            presented: false,
+            source,
+          })
+        ) {
+          continue;
+        }
+        const identity = previewCoordinateIdentity(tile.lod, tile.x, tile.y);
+        const sceneKey = `${hit.generation}:${tile.lod}:${tile.x}:${tile.y}`;
+        this.retainedSceneKeys.set(identity, sceneKey);
       }
-      this.presentStagingViewport(viewport);
+      const visibleComplete = demand.visible.every((coordinate) =>
+        this.hasRetainedCoordinateOrParent(coordinate),
+      );
+      if (!visibleComplete) return false;
+      this.retainedScene.presentOnly(this.bestRetainedCoverage(demand.exact));
+      this.canvas.hidden = true;
+      this.stagingCanvas.hidden = true;
+      this.retainedScene.project(retainedTileCamera(viewport));
+      this.presentedViewport = viewport;
+      this.viewportTransaction.accept({
+        cameraEpoch: viewportEpoch,
+        coverage: demand.visible.every(({ lod, x, y }) =>
+          this.hasRetainedCoordinate({ column: x, lod, row: y }),
+        )
+          ? 'exact'
+          : 'fallback',
+        projectionIdentity: this.projection.read().documentId,
+      });
       this.finishPreviewPresentation();
+      if (
+        !demand.visible.every(({ lod, x, y }) =>
+          this.hasRetainedCoordinate({ column: x, lod, row: y }),
+        )
+      ) {
+        this.schedule();
+      }
       return true;
     } finally {
-      for (const source of decoded) releaseCanvasImageSource(source);
+      for (const { source } of decoded) releaseCanvasImageSource(source);
     }
+  }
+
+  private previewTileDemand(viewport: InkPreviewViewport): InkPreviewTileDemand {
+    const plan = this.demandPlanner.plan({
+      lod: this.targetTileLod(viewport),
+      ...(this.presentedViewport === null
+        ? {}
+        : { previousViewport: previewLogicalRect(this.presentedViewport) }),
+      viewport: previewLogicalRect(viewport),
+    });
+    if (plan.kind === 'untileable-range') {
+      return Object.freeze({
+        all: Object.freeze([]),
+        exact: Object.freeze([]),
+        visible: Object.freeze([]),
+      });
+    }
+    const visible = plan.visible.map(previewStorageCoordinate);
+    const exact = [...plan.visible, ...plan.nearVisible, ...plan.lookAhead];
+    const parents = exact.map((coordinate) => this.tileGrid.parent(coordinate));
+    return Object.freeze({
+      all: Object.freeze(
+        uniquePreviewCoordinates([...exact, ...parents].map(previewStorageCoordinate)),
+      ),
+      exact: Object.freeze(exact.map(previewStorageCoordinate)),
+      visible: Object.freeze(visible),
+    });
+  }
+
+  private hasRetainedCoordinate(coordinate: InkWorldTileCoordinate): boolean {
+    return this.retainedSceneKey(coordinate) !== null;
+  }
+
+  private hasRetainedCoordinateOrParent(coordinate: InkPreviewCacheTileCoordinate): boolean {
+    const exact = { column: coordinate.x, lod: coordinate.lod, row: coordinate.y };
+    return (
+      this.hasRetainedCoordinate(exact) || this.hasRetainedCoordinate(this.tileGrid.parent(exact))
+    );
+  }
+
+  private retainedSceneKey(coordinate: InkWorldTileCoordinate): string | null {
+    const identity = previewCoordinateIdentity(coordinate.lod, coordinate.column, coordinate.row);
+    const key = this.retainedSceneKeys.get(identity);
+    return key !== undefined && this.retainedScene.has(key) ? key : null;
+  }
+
+  private bestRetainedCoverage(
+    exact: readonly InkPreviewCacheTileCoordinate[],
+  ): ReadonlySet<string> {
+    const groups = new Map<
+      string,
+      { readonly parent: InkWorldTileCoordinate; readonly children: InkWorldTileCoordinate[] }
+    >();
+    for (const coordinate of exact) {
+      const child = { column: coordinate.x, lod: coordinate.lod, row: coordinate.y };
+      const parent = this.tileGrid.parent(child);
+      const parentIdentity = previewCoordinateIdentity(parent.lod, parent.column, parent.row);
+      const group = groups.get(parentIdentity);
+      if (group === undefined) groups.set(parentIdentity, { children: [child], parent });
+      else group.children.push(child);
+    }
+    const selected = new Set<string>();
+    for (const { children, parent } of groups.values()) {
+      const childKeys = children.map((child) => this.retainedSceneKey(child));
+      if (childKeys.every((key): key is string => key !== null)) {
+        for (const key of childKeys) selected.add(key);
+        continue;
+      }
+      const parentKey = this.retainedSceneKey(parent);
+      if (parentKey !== null) {
+        selected.add(parentKey);
+        continue;
+      }
+      for (const key of childKeys) if (key !== null) selected.add(key);
+    }
+    return selected;
+  }
+
+  private targetTileLod(viewport: InkPreviewViewport): number {
+    return this.viewportTransaction.request({
+      camera: {
+        devicePixelRatio: viewport.dpr,
+        logicalLeft: viewport.logicalLeft,
+        logicalTop: viewport.logicalTop,
+        scale: viewport.scale,
+      },
+      motion:
+        this.presentedViewport === null
+          ? 'mount'
+          : Math.abs(this.presentedViewport.scale - viewport.scale) > 1e-6
+            ? 'zoom'
+            : 'settled',
+      projectionIdentity: this.projection.read().documentId,
+      stageFrameEpoch: this.viewportEpoch,
+    }).targetLod;
   }
 
   private finishPreviewPresentation(): void {
@@ -637,6 +1060,7 @@ export class InkPreviewProjectionController {
   }
 
   private presentStagingViewport(viewport: InkPreviewViewport): void {
+    this.retainedScene.hide();
     const previousCanvas = this.canvas;
     const previousContext = this.context;
     previousCanvas.hidden = true;
@@ -652,6 +1076,10 @@ export class InkPreviewProjectionController {
   }
 
   private projectPresentedViewport(next: InkPreviewViewport): void {
+    if (this.retainedScene.hasPresentation) {
+      this.retainedScene.project(retainedTileCamera(next));
+      return;
+    }
     const presented = this.presentedViewport;
     if (presented === null || this.canvas.hidden) return;
     if (Math.abs(presented.scale - next.scale) > 1e-6) return;
@@ -837,4 +1265,49 @@ function releasePreviewTileCanvas(canvas: OffscreenCanvas): void {
   } catch {
     // A transferred OffscreenCanvas is already detached from the main thread.
   }
+}
+
+function previewLogicalRect(viewport: InkPreviewViewport) {
+  return createInkNoteLogicalRect({
+    height: viewport.logicalHeight,
+    width: viewport.logicalWidth,
+    x: viewport.logicalLeft,
+    y: viewport.logicalTop,
+  });
+}
+
+function previewStorageCoordinate(
+  coordinate: InkWorldTileCoordinate,
+): InkPreviewCacheTileCoordinate {
+  return Object.freeze({ lod: coordinate.lod, x: coordinate.column, y: coordinate.row });
+}
+
+function previewCoordinateIdentity(lod: number, x: number, y: number): string {
+  return `${lod}:${x}:${y}`;
+}
+
+function uniquePreviewCoordinates(
+  coordinates: readonly InkPreviewCacheTileCoordinate[],
+): readonly InkPreviewCacheTileCoordinate[] {
+  const unique = new Map<string, InkPreviewCacheTileCoordinate>();
+  for (const coordinate of coordinates) {
+    unique.set(previewCoordinateIdentity(coordinate.lod, coordinate.x, coordinate.y), coordinate);
+  }
+  return Object.freeze([...unique.values()]);
+}
+
+function retainedTileCamera(viewport: InkPreviewViewport): {
+  readonly height: number;
+  readonly logicalLeft: number;
+  readonly logicalTop: number;
+  readonly scale: number;
+  readonly width: number;
+} {
+  return Object.freeze({
+    height: viewport.height,
+    logicalLeft: viewport.logicalLeft,
+    logicalTop: viewport.logicalTop,
+    scale: viewport.scale,
+    width: viewport.width,
+  });
 }
