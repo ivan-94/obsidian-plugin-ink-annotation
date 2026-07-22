@@ -36,9 +36,13 @@ export function sidebarStatePresentation(
       if (summary.deletedAt === undefined) return true;
       return Date.now() < Date.parse(summary.deletedAt) + 5_000;
     });
-    if (store.current.model.value.total === 0 && !hasVisibleInk) {
+    const hasVisibleSnapshot = store.current.snapshotSummaries.value.some((summary) => {
+      if (summary.deletedAt === undefined) return true;
+      return Date.now() < Date.parse(summary.deletedAt) + 5_000;
+    });
+    if (store.current.model.value.total === 0 && !hasVisibleInk && !hasVisibleSnapshot) {
       return {
-        description: 'Select text in Reading View or start Ink Mode.',
+        description: 'Select text in Reading View or capture a Snapshot to annotate.',
         icon: 'bookmark-plus',
         kind: 'empty',
         title: 'No annotations yet',

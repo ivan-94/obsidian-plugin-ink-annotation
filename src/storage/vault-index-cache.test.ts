@@ -8,7 +8,7 @@ describe('disposable Vault index cache', () => {
   it('round-trips list-only entries and treats deletion as a rebuildable cache miss', async () => {
     const store = new MemoryStore();
     const cache = new VaultIndexCache(store);
-    const entries = [entry(), inkEntry()];
+    const entries = [entry(), inkEntry(), snapshotEntry()];
 
     await cache.save(entries, '2026-07-14T10:00:00.000Z');
     await expect(cache.load()).resolves.toEqual({
@@ -68,6 +68,32 @@ function inkEntry(): AnnotationIndexEntry {
     tags: [],
     type: 'ink',
     updatedAt: '2026-07-14T09:00:00.000Z',
+  };
+}
+
+function snapshotEntry(): AnnotationIndexEntry {
+  return {
+    body: '2 strokes',
+    conflict: false,
+    filePath: 'Note.md',
+    id: 'snapshot-1',
+    noteId: 'note-1',
+    position: 60,
+    quote: 'Snapshot · Ink',
+    revision: 2,
+    snapshot: {
+      capturedAt: '2026-07-22T08:00:00.000Z',
+      headingPath: ['Ink'],
+      linkState: 'linked',
+      logicalHeight: 768,
+      logicalWidth: 1024,
+      strokeCount: 2,
+      thumbnailKey: 'snapshot:a:2',
+    },
+    status: 'active',
+    tags: [],
+    type: 'snapshot',
+    updatedAt: '2026-07-22T08:05:00.000Z',
   };
 }
 

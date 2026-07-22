@@ -18,6 +18,11 @@ import type {
 } from '../../storage/ink-surface-repository';
 import { summarizeInkSurface, type InkSurfaceSummary } from '../../domain/ink-surface-summary';
 import type { RepositoryConflict } from '../../storage/sidecar-repository';
+import type { SnapshotAnnotationRepository } from '../../storage/snapshot-annotation-repository';
+import {
+  createSnapshotAnnotationSummaryFromIndexEntry,
+  type SnapshotAnnotationSummary,
+} from '../../domain/snapshot-annotation-summary';
 import {
   AnnotationConflictDialog,
   type AnnotationConflictReviewView,
@@ -41,6 +46,7 @@ export class AnnotationSidebarView extends ItemView {
     readonly health: { readonly conflictCount: number; readonly readIssueCount: number };
     readonly inkSummaries: readonly InkSurfaceSummary[];
     readonly model: CurrentFileAnnotationList;
+    readonly snapshotSummaries: readonly SnapshotAnnotationSummary[];
   } | null = null;
   private currentComponent: CurrentFileSidebar | null = null;
   private currentConflicts: readonly RepositoryConflict[] = [];
@@ -58,8 +64,25 @@ export class AnnotationSidebarView extends ItemView {
   private readonly conflictDialog: AnnotationConflictDialog;
   private recentDeletion: readonly AnnotationSidebarDeletedItem[] = [];
   private recentDeletionTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly inkRepository: InkSurfaceRepository;
+  private readonly inkRepository: Pick<
+    InkSurfaceRepository,
+    'listSurfaceSummaries' | 'listSurfaces' | 'readSurface'
+  >;
   private readonly service: AnnotationService;
+  private readonly snapshots:
+    | {
+        readonly delete: (summary: SnapshotAnnotationSummary) => void;
+        readonly edit: (summary: SnapshotAnnotationSummary) => void;
+        readonly exportPng: (summary: SnapshotAnnotationSummary) => void;
+        readonly jump: (summary: SnapshotAnnotationSummary) => void;
+        readonly preview: (summary: SnapshotAnnotationSummary) => void;
+        readonly readSource: (filePath: string) => Promise<string>;
+        readonly relink: (summary: SnapshotAnnotationSummary) => void;
+        readonly repository: Pick<SnapshotAnnotationRepository, 'listIndexEntries'>;
+        readonly restore: (summary: SnapshotAnnotationSummary) => void;
+        readonly thumbnail: (summary: SnapshotAnnotationSummary) => Promise<string | null>;
+      }
+    | undefined;
   private readonly stylePresets: readonly StylePreset[];
   private readonly vaultIndex: VaultAnnotationIndex;
   private readonly vaultIndexBuilder: VaultIndexBuilder;
@@ -74,8 +97,23 @@ export class AnnotationSidebarView extends ItemView {
     leaf: WorkspaceLeaf,
     input: {
       readonly commands: AnnotationSidebarCommands;
-      readonly inkRepository: InkSurfaceRepository;
+      readonly inkRepository: Pick<
+        InkSurfaceRepository,
+        'listSurfaceSummaries' | 'listSurfaces' | 'readSurface'
+      >;
       readonly service: AnnotationService;
+      readonly snapshots?: {
+        readonly delete?: (summary: SnapshotAnnotationSummary) => void;
+        readonly edit?: (summary: SnapshotAnnotationSummary) => void;
+        readonly exportPng?: (summary: SnapshotAnnotationSummary) => void;
+        readonly jump?: (summary: SnapshotAnnotationSummary) => void;
+        readonly preview?: (summary: SnapshotAnnotationSummary) => void;
+        readonly readSource: (filePath: string) => Promise<string>;
+        readonly relink?: (summary: SnapshotAnnotationSummary) => void;
+        readonly repository: Pick<SnapshotAnnotationRepository, 'listIndexEntries'>;
+        readonly restore?: (summary: SnapshotAnnotationSummary) => void;
+        readonly thumbnail?: (summary: SnapshotAnnotationSummary) => Promise<string | null>;
+      };
       readonly stylePresets: readonly StylePreset[];
       readonly vaultIndex: VaultAnnotationIndex;
       readonly vaultIndexBuilder: VaultIndexBuilder;
@@ -90,6 +128,21 @@ export class AnnotationSidebarView extends ItemView {
     this.conflictDialog = new AnnotationConflictDialog({ document: this.contentEl.ownerDocument });
     this.inkRepository = input.inkRepository;
     this.service = input.service;
+    this.snapshots =
+      input.snapshots === undefined
+        ? undefined
+        : {
+            delete: input.snapshots.delete ?? (() => undefined),
+            edit: input.snapshots.edit ?? (() => undefined),
+            exportPng: input.snapshots.exportPng ?? (() => undefined),
+            jump: input.snapshots.jump ?? (() => undefined),
+            preview: input.snapshots.preview ?? (() => undefined),
+            readSource: input.snapshots.readSource,
+            relink: input.snapshots.relink ?? (() => undefined),
+            repository: input.snapshots.repository,
+            restore: input.snapshots.restore ?? (() => undefined),
+            thumbnail: input.snapshots.thumbnail ?? (() => Promise.resolve(null)),
+          };
     this.stylePresets = input.stylePresets;
     this.vaultIndex = input.vaultIndex;
     this.vaultIndexBuilder = input.vaultIndexBuilder;
@@ -206,8 +259,13 @@ export class AnnotationSidebarView extends ItemView {
 
   async refreshAfterCanonicalMutation(filePath: string): Promise<void> {
     const currentFilePath = this.commands.getCurrentFilePath();
+    this.vaultIndexFresh = false;
     if (this.currentCache?.filePath === filePath || currentFilePath === filePath) {
       this.currentFileStale = true;
+    }
+    if (this.sidebarStore.scope.value === 'entire-vault') {
+      await this.refreshVaultIndex();
+      return;
     }
     if (
       this.sidebarStore.scope.value === 'current-file' &&
@@ -252,6 +310,10 @@ export class AnnotationSidebarView extends ItemView {
       }
     }
     return false;
+  }
+
+  selectSnapshot(snapshotId: string): boolean {
+    return this.currentComponent?.selectSnapshot(snapshotId) ?? false;
   }
 
   private async showCurrentFile(): Promise<void> {
@@ -356,10 +418,15 @@ export class AnnotationSidebarView extends ItemView {
             .then(() => this.refreshCurrentFile(), this.commands.issue);
         }
       },
-      onEditInk: (surfaceId) => {
-        const filePath = this.commands.getCurrentFilePath();
-        if (filePath !== null) this.commands.editInk(filePath, surfaceId);
-      },
+      onDeleteSnapshot: (summary) => this.snapshots?.delete(summary),
+      onEditSnapshot: (summary) => this.snapshots?.edit(summary),
+      onExportSnapshot: (summary) => this.snapshots?.exportPng(summary),
+      onPreviewSnapshot: (summary) => this.snapshots?.preview(summary),
+      onRelinkSnapshot: (summary) => this.snapshots?.relink(summary),
+      onRestoreSnapshot: (summary) => this.snapshots?.restore(summary),
+      onSelectSnapshotSource: (summary) => this.snapshots?.jump(summary),
+      loadSnapshotThumbnail: (summary) =>
+        this.snapshots?.thumbnail(summary) ?? Promise.resolve(null),
       onExportCurrentFile: (invoker) => {
         const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
@@ -424,7 +491,12 @@ export class AnnotationSidebarView extends ItemView {
     });
     const cached = this.currentCache;
     if (cached !== null && cached.filePath === this.commands.getCurrentFilePath()) {
-      this.currentComponent.render(cached.model, cached.health, cached.inkSummaries);
+      this.currentComponent.render(
+        cached.model,
+        cached.health,
+        cached.inkSummaries,
+        cached.snapshotSummaries,
+      );
     }
     await this.refreshCurrentFile();
   }
@@ -455,21 +527,35 @@ export class AnnotationSidebarView extends ItemView {
       this.sidebarStore.current.status.value = 'loading';
     }
     try {
-      const [loaded, inkSummaries] = await Promise.all([
+      const [loaded, inkSummaryRead, snapshotSummaries] = await Promise.all([
         this.service.listCurrentFile(filePath),
-        this.inkRepository.listSurfaceSummaries(filePath),
+        this.inkRepository.listSurfaceSummaries(filePath).then(
+          (summaries) => ({ error: null, summaries }),
+          (error: unknown) => ({ error, summaries: [] as readonly InkSurfaceSummary[] }),
+        ),
+        this.snapshots === undefined
+          ? Promise.resolve([] as readonly SnapshotAnnotationSummary[])
+          : Promise.all([
+              this.snapshots.repository.listIndexEntries(filePath),
+              this.snapshots.readSource(filePath),
+            ]).then(([entries, source]) =>
+              entries.map((entry) => createSnapshotAnnotationSummaryFromIndexEntry(entry, source)),
+            ),
       ]);
       if (this.currentComponent !== component || generation !== this.currentRefreshGeneration) {
         return;
       }
+      if (inkSummaryRead.error !== null) {
+        this.commands.issue(inkSummaryRead.error);
+      }
       const projectedInkSummaries =
         (this.currentInkSummaryGenerations.get(filePath) ?? 0) === inkSummaryGeneration
-          ? inkSummaries
+          ? inkSummaryRead.summaries
           : this.currentCache?.filePath === filePath
             ? this.currentCache.inkSummaries
             : this.sidebarStore.current.filePath.peek() === filePath
               ? this.sidebarStore.current.inkSummaries.peek()
-              : inkSummaries;
+              : inkSummaryRead.summaries;
       loaded.issues.forEach(this.commands.issue);
       const currentConflicts = loaded.conflicts.filter(
         (conflict) => conflict.kind === 'same-revision-divergence',
@@ -485,16 +571,19 @@ export class AnnotationSidebarView extends ItemView {
       this.currentInkConflicts = inkConflicts;
       const health = {
         conflictCount: currentConflicts.length + inkConflicts.length,
-        readIssueCount: loaded.issues.filter((issue) => issue.kind === 'corrupt-record').length,
+        readIssueCount:
+          loaded.issues.filter((issue) => issue.kind === 'corrupt-record').length +
+          (inkSummaryRead.error === null ? 0 : 1),
       };
       this.currentCache = {
         filePath,
         health,
         inkSummaries: projectedInkSummaries,
         model: loaded.model,
+        snapshotSummaries,
       };
       this.currentFileStale = false;
-      component.render(loaded.model, health, projectedInkSummaries);
+      component.render(loaded.model, health, projectedInkSummaries, snapshotSummaries);
     } catch (error) {
       if (this.currentComponent !== component || generation !== this.currentRefreshGeneration) {
         return;
@@ -584,15 +673,21 @@ export class AnnotationSidebarView extends ItemView {
         };
       },
       onCurrentFile: () => this.showCurrentFile(),
+      onDeleteSnapshot: (summary) => this.snapshots?.delete(summary),
       onEdit: (entry, invoker) => {
-        if (entry.type === 'ink') {
-          this.commands.editInk(entry.filePath, entry.id);
-          return;
-        }
+        if (entry.type === 'ink') return;
         this.commands.inspectAnnotation(entry.id, invoker);
       },
+      onEditSnapshot: (summary) => this.snapshots?.edit(summary),
       onExport: this.commands.exportVaultEntries,
+      onExportSnapshot: (summary) => this.snapshots?.exportPng(summary),
       onOpen: (entry) => this.commands.navigateToVaultAnnotation(entry),
+      onPreviewSnapshot: (summary) => this.snapshots?.preview(summary),
+      onRelinkSnapshot: (summary) => this.snapshots?.relink(summary),
+      onRestoreSnapshot: (summary) => this.snapshots?.restore(summary),
+      onSelectSnapshotSource: (summary) => this.snapshots?.jump(summary),
+      loadSnapshotThumbnail: (summary) =>
+        this.snapshots?.thumbnail(summary) ?? Promise.resolve(null),
       state: this.sidebarStore.vault,
       showScope: false,
       styleOptions: this.stylePresets.map((preset) => [preset.id, preset.name ?? preset.id]),
@@ -714,7 +809,7 @@ export class AnnotationSidebarView extends ItemView {
             ...(record.deviceId === undefined ? {} : { deviceId: record.deviceId }),
             path,
             ...(previewSvg === undefined ? {} : { previewSvg }),
-            quote: headingPath.length === 0 ? 'Document Ink' : headingPath.join(' › '),
+            quote: headingPath.length === 0 ? 'Legacy Document Ink' : headingPath.join(' › '),
             revision: record.revision,
             tags: [],
             updatedAt: record.updatedAt,

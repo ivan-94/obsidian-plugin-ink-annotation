@@ -16,7 +16,14 @@ const SNAPSHOT_BASENAME = 'ink.json';
  * TextFileStore owns the platform-specific atomic replacement detail.
  */
 export class InkDocumentSnapshotRepository {
-  constructor(private readonly store: TextFileStore) {}
+  private readonly onSnapshotChanged: (snapshot: InkSurfaceRecord) => void;
+
+  constructor(
+    private readonly store: TextFileStore,
+    options: { readonly onSnapshotChanged?: (snapshot: InkSurfaceRecord) => void } = {},
+  ) {
+    this.onSnapshotChanged = options.onSnapshotChanged ?? (() => undefined);
+  }
 
   async read(filePath: string): Promise<InkSurfaceRecord | null> {
     const normalizedPath = normalizeVaultPath(filePath);
@@ -33,6 +40,33 @@ export class InkDocumentSnapshotRepository {
     const directory = await this.noteDirectory(snapshot.filePath);
     await this.store.mkdir(directory);
     await this.store.write(`${directory}/${SNAPSHOT_BASENAME}`, encodeInkSurfaceRecord(snapshot));
+    this.onSnapshotChanged(snapshot);
+  }
+
+  /** Marks the one authoritative document snapshot deleted while retaining it for Undo. */
+  async tombstone(filePath: string, deletedAt: string): Promise<InkSurfaceRecord> {
+    const current = await this.requireSnapshot(filePath);
+    const deleted: InkSurfaceRecord = {
+      ...current,
+      deletedAt,
+      revision: current.revision + 1,
+      updatedAt: deletedAt,
+    };
+    await this.replace(deleted);
+    return deleted;
+  }
+
+  /** Restores a retained snapshot without consulting a legacy surface or revision chain. */
+  async restore(filePath: string, restoredAt: string): Promise<InkSurfaceRecord> {
+    const current = await this.requireSnapshot(filePath);
+    const restored = {
+      ...current,
+      revision: current.revision + 1,
+      updatedAt: restoredAt,
+    };
+    delete restored.deletedAt;
+    await this.replace(restored);
+    return restored;
   }
 
   async resolveFilePath(sidecarPath: string): Promise<string | null> {
@@ -72,5 +106,11 @@ export class InkDocumentSnapshotRepository {
 
   private async snapshotPath(filePath: string): Promise<string> {
     return `${await this.noteDirectory(filePath)}/${SNAPSHOT_BASENAME}`;
+  }
+
+  private async requireSnapshot(filePath: string): Promise<InkSurfaceRecord> {
+    const current = await this.read(filePath);
+    if (current === null) throw new Error(`Ink document snapshot no longer exists: ${filePath}`);
+    return current;
   }
 }

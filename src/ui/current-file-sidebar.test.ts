@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { CurrentFileAnnotationList } from '../domain/current-file-annotation-list';
 import type { InkSurfaceSummary } from '../domain/ink-surface-summary';
+import type { SnapshotAnnotationSummary } from '../domain/snapshot-annotation-summary';
 import { CurrentFileSidebar } from './current-file-sidebar';
 
 describe('current-file sidebar', () => {
@@ -19,7 +20,9 @@ describe('current-file sidebar', () => {
     sidebar.render({ groups: [], total: 0 });
 
     expect(container.textContent).toContain('No annotations yet');
-    expect(container.textContent).toContain('Select text in Reading View or start Ink Mode.');
+    expect(container.textContent).toContain(
+      'Select text in Reading View or capture a Snapshot to annotate.',
+    );
     expect(container.querySelector('[data-inkstone-annotation-row]')).toBeNull();
     expect(
       container.querySelector<HTMLInputElement>(
@@ -131,28 +134,30 @@ describe('current-file sidebar', () => {
     container.querySelector<HTMLButtonElement>('[data-inkstone-ink-actions="surface-1"]')?.click();
     document.body
       .querySelector<HTMLButtonElement>(
-        '[data-obsidian-test-menu] button[aria-label="Delete Ink surface…"]',
+        '[data-obsidian-test-menu] button[aria-label="Delete Legacy Ink surface…"]',
       )
       ?.click();
 
     expect(deleted).toEqual([]);
     await vi.waitFor(() => {
-      expect(container.querySelector('[aria-label="Confirm Ink deletion"]')).not.toBeNull();
+      expect(container.querySelector('[aria-label="Confirm Legacy Ink deletion"]')).not.toBeNull();
     });
-    let dialog = container.querySelector<HTMLElement>('[aria-label="Confirm Ink deletion"]');
+    let dialog = container.querySelector<HTMLElement>('[aria-label="Confirm Legacy Ink deletion"]');
     dialog?.querySelector<HTMLButtonElement>('button:not([aria-label])')?.click();
     expect(deleted).toEqual([]);
     container.querySelector<HTMLButtonElement>('[data-inkstone-ink-actions="surface-1"]')?.click();
     document.body
       .querySelector<HTMLButtonElement>(
-        '[data-obsidian-test-menu] button[aria-label="Delete Ink surface…"]',
+        '[data-obsidian-test-menu] button[aria-label="Delete Legacy Ink surface…"]',
       )
       ?.click();
     await vi.waitFor(() => {
-      expect(container.querySelector('[aria-label="Confirm Ink deletion"]')).not.toBeNull();
+      expect(container.querySelector('[aria-label="Confirm Legacy Ink deletion"]')).not.toBeNull();
     });
-    dialog = container.querySelector<HTMLElement>('[aria-label="Confirm Ink deletion"]');
-    dialog?.querySelector<HTMLButtonElement>('[aria-label="Confirm delete Ink surface"]')?.click();
+    dialog = container.querySelector<HTMLElement>('[aria-label="Confirm Legacy Ink deletion"]');
+    dialog
+      ?.querySelector<HTMLButtonElement>('[aria-label="Confirm delete Legacy Ink surface"]')
+      ?.click();
     expect(deleted).toEqual(['surface-1']);
   });
 
@@ -632,7 +637,6 @@ describe('current-file sidebar', () => {
       container,
       document,
       onDeleteInk: (id, expectedRevision) => actions.push(`delete:${id}@${expectedRevision}`),
-      onEditInk: (id) => actions.push(`edit:${id}`),
       onExportInkPng: (id) => actions.push(`png:${id}`),
       onExportInkSvg: (id) => actions.push(`svg:${id}`),
       onRestoreInk: (id, expectedRevision) => actions.push(`restore:${id}@${expectedRevision}`),
@@ -645,6 +649,7 @@ describe('current-file sidebar', () => {
     expect(container.querySelector('[data-inkstone-ink-thumbnail]')?.getAttribute('src')).toContain(
       'data:image/svg+xml',
     );
+    expect(container.textContent).toContain('Legacy Ink');
     expect(container.textContent).toContain('2 strokes');
     container.querySelector<HTMLButtonElement>('[data-inkstone-ink-row="surface-1"]')?.click();
     const menuToggle = container.querySelector<HTMLButtonElement>(
@@ -657,36 +662,29 @@ describe('current-file sidebar', () => {
     menuToggle?.click();
     expect(menuToggle?.getAttribute('aria-expanded')).toBe('true');
     let menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
-    expect(menu?.textContent).toContain('Edit');
+    expect(menu?.textContent).not.toContain('Edit');
     expect(menu?.textContent).toContain('Export SVG');
     expect(menu?.textContent).toContain('Export PNG');
-    expect(menu?.textContent).toContain('Delete Ink surface');
-    menu?.querySelector<HTMLButtonElement>('button[aria-label="Edit"]')?.click();
-    menuToggle?.click();
-    menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
+    expect(menu?.textContent).toContain('Delete Legacy Ink surface');
     menu?.querySelector<HTMLButtonElement>('button[aria-label="Export SVG"]')?.click();
     menuToggle?.click();
     menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
     menu?.querySelector<HTMLButtonElement>('button[aria-label="Export PNG"]')?.click();
     menuToggle?.click();
     menu = document.body.querySelector<HTMLElement>('[data-obsidian-test-menu]');
-    menu?.querySelector<HTMLButtonElement>('button[aria-label="Delete Ink surface…"]')?.click();
-    expect(actions).toEqual([
-      'select:surface-1',
-      'edit:surface-1',
-      'svg:surface-1',
-      'png:surface-1',
-    ]);
+    menu
+      ?.querySelector<HTMLButtonElement>('button[aria-label="Delete Legacy Ink surface…"]')
+      ?.click();
+    expect(actions).toEqual(['select:surface-1', 'svg:surface-1', 'png:surface-1']);
     await vi.waitFor(() => {
-      expect(container.querySelector('[aria-label="Confirm Ink deletion"]')).not.toBeNull();
+      expect(container.querySelector('[aria-label="Confirm Legacy Ink deletion"]')).not.toBeNull();
     });
     container
-      .querySelector<HTMLButtonElement>('[aria-label="Confirm delete Ink surface"]')
+      .querySelector<HTMLButtonElement>('[aria-label="Confirm delete Legacy Ink surface"]')
       ?.click();
     container.querySelector<HTMLButtonElement>('[data-inkstone-ink-restore="surface-2"]')?.click();
     expect(actions).toEqual([
       'select:surface-1',
-      'edit:surface-1',
       'svg:surface-1',
       'png:surface-1',
       'delete:surface-1@2',
@@ -732,6 +730,87 @@ describe('current-file sidebar', () => {
 
     expect(container.querySelector('[data-inkstone-ink-row]')).toBeNull();
     expect(container.textContent).toContain('No annotations yet');
+  });
+
+  it('renders each Snapshot as an aspect-ratio preview card with actions in one menu', () => {
+    const container = document.createElement('div');
+    const source = vi.fn();
+    const preview = vi.fn();
+    const edit = vi.fn();
+    const exported = vi.fn();
+    const deleted = vi.fn();
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onDeleteSnapshot: deleted,
+      onEditSnapshot: edit,
+      onExportSnapshot: exported,
+      onPreviewSnapshot: preview,
+      onSelect: () => undefined,
+      onSelectSnapshotSource: source,
+    });
+    sidebar.render({ groups: [], total: 0 }, undefined, [], [snapshotSummary()]);
+
+    expect(container.querySelector('[data-inkstone-snapshot-id="snapshot-a"]')).not.toBeNull();
+    expect(container.textContent).toContain('3 strokes');
+    expect(
+      container.querySelector<HTMLElement>('[data-inkstone-snapshot-id="snapshot-a"]')?.style
+        .aspectRatio,
+    ).toBe('300 / 200');
+    expect(container.querySelector('[aria-label="Edit Snapshot"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Export Snapshot PNG"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Delete Snapshot"]')).toBeNull();
+
+    container.querySelector<HTMLButtonElement>('[aria-label^="Preview Snapshot"]')?.click();
+    const strokeCount = container.querySelector<HTMLElement>('[data-inkstone-snapshot-strokes]');
+    expect(strokeCount?.tagName).toBe('SPAN');
+    expect(container.querySelector('[aria-label^="Jump to Snapshot source"]')).toBeNull();
+    strokeCount?.click();
+    expect(source).not.toHaveBeenCalled();
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T00:00:00.000Z',
+      'Go to source',
+    );
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T00:00:00.000Z',
+      'Edit Snapshot',
+    );
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T00:00:00.000Z',
+      'Export Snapshot PNG',
+    );
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T00:00:00.000Z',
+      'Delete Snapshot',
+    );
+    expect(preview).toHaveBeenCalledOnce();
+    expect(source).toHaveBeenCalledOnce();
+    expect(edit).toHaveBeenCalledOnce();
+    expect(exported).toHaveBeenCalledOnce();
+    expect(deleted).toHaveBeenCalledOnce();
+  });
+
+  it('groups Snapshot cards into one masonry surface per heading', () => {
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onSelect: () => undefined,
+    });
+    sidebar.render(
+      { groups: [], total: 0 },
+      undefined,
+      [],
+      [snapshotSummary(), { ...snapshotSummary(), id: 'snapshot-b' }],
+    );
+
+    const masonry = container.querySelector('[data-inkstone-snapshot-masonry]');
+    expect(masonry).not.toBeNull();
+    expect(masonry?.querySelectorAll('[data-inkstone-snapshot-id]')).toHaveLength(2);
   });
 });
 
@@ -816,5 +895,23 @@ function deletedInkSummary(): InkSurfaceSummary {
     deletedAt: '2026-07-14T12:01:00.000Z',
     id: 'surface-2',
     position: 200,
+  };
+}
+
+function snapshotSummary(): SnapshotAnnotationSummary {
+  return {
+    capturedAt: '2026-07-22T00:00:00.000Z',
+    filePath: 'Notes/Test.md',
+    headingPath: ['Test'],
+    id: 'snapshot-a',
+    linkState: 'linked',
+    logicalHeight: 200,
+    logicalWidth: 300,
+    revision: 1,
+    sourceOrder: 10,
+    status: 'active',
+    strokeCount: 3,
+    thumbnailKey: 'snapshot:a:1',
+    updatedAt: '2026-07-22T00:00:00.000Z',
   };
 }

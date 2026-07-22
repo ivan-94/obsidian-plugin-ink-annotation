@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { TextAnnotationRecord } from '../domain/text-annotation';
 import type { InkSurfaceSummary } from '../domain/ink-surface-summary';
+import type { SnapshotAnnotationSummary } from '../domain/snapshot-annotation-summary';
 import {
   textRecordToIndexEntry,
   VaultAnnotationIndex,
@@ -11,6 +12,35 @@ import type { NoteMeta, RepositoryConflict } from '../storage/sidecar-repository
 import { VaultIndexBuilder, type CanonicalVaultAnnotationSource } from './vault-index-builder';
 
 describe('Vault index builder', () => {
+  it('indexes compact Snapshot summaries for Entire Vault search and grouping', async () => {
+    const snapshot = snapshotSummary('Snapshots/Board.md');
+    const index = new VaultAnnotationIndex();
+    const source = {
+      listAnnotations: () => Promise.resolve({ conflicts: [], issues: [], records: [] }),
+      listNotes: () => Promise.resolve({ issues: [], notes: [note(snapshot.filePath)] }),
+      listSnapshotSummaries: () => Promise.resolve([snapshot]),
+      listSurfaceSummaries: () => Promise.resolve([]),
+    };
+
+    await new VaultIndexBuilder({ index, source }).rebuild();
+
+    expect(index.snapshot()).toMatchObject([
+      {
+        filePath: 'Snapshots/Board.md',
+        id: 'snapshot-Snapshots/Board.md',
+        snapshot: {
+          headingPath: ['Design', 'Board'],
+          logicalHeight: 768,
+          logicalWidth: 1024,
+          strokeCount: 3,
+        },
+        type: 'snapshot',
+      },
+    ]);
+    expect(index.query({ text: 'design board' }).total).toBe(1);
+    expect(index.query({ text: '3 strokes snapshot' }).total).toBe(1);
+  });
+
   it('rebuilds from canonical notes with bounded concurrency and reports progress', async () => {
     const source = new DelayedCanonicalSource(['A.md', 'B.md', 'C.md']);
     const index = new VaultAnnotationIndex();
@@ -97,6 +127,7 @@ describe('Vault index builder', () => {
           issues: [],
           notes: [note('Race.md')],
         }),
+      listSnapshotSummaries: () => Promise.resolve([]),
       listSurfaceSummaries: () => Promise.resolve([]),
     };
     const index = new VaultAnnotationIndex();
@@ -144,6 +175,7 @@ describe('Vault index builder', () => {
           issues: [],
           notes: [note('Busy.md')],
         }),
+      listSnapshotSummaries: () => Promise.resolve([]),
       listSurfaceSummaries: () => Promise.resolve([]),
     };
     const index = new VaultAnnotationIndex();
@@ -299,6 +331,10 @@ class DelayedCanonicalSource implements CanonicalVaultAnnotationSource {
     });
   }
 
+  listSnapshotSummaries(): Promise<readonly SnapshotAnnotationSummary[]> {
+    return Promise.resolve([]);
+  }
+
   listSurfaceSummaries(filePath: string): Promise<readonly InkSurfaceSummary[]> {
     return Promise.resolve([
       {
@@ -336,6 +372,24 @@ function record(filePath: string): TextAnnotationRecord {
       scope: {},
     },
     updatedAt: '2026-07-14T08:00:00.000Z',
+  };
+}
+
+function snapshotSummary(filePath: string): SnapshotAnnotationSummary {
+  return {
+    capturedAt: '2026-07-22T08:00:00.000Z',
+    filePath,
+    headingPath: ['Design', 'Board'],
+    id: `snapshot-${filePath}`,
+    linkState: 'linked',
+    logicalHeight: 768,
+    logicalWidth: 1024,
+    revision: 2,
+    sourceOrder: 30,
+    status: 'active',
+    strokeCount: 3,
+    thumbnailKey: `snapshot:${filePath}:2`,
+    updatedAt: '2026-07-22T08:05:00.000Z',
   };
 }
 

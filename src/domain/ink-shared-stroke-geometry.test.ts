@@ -162,6 +162,34 @@ describe('shared Ink Brush Geometry consumer seam', () => {
     },
   );
 
+  it('accepts iPad-scaled legacy bounds whose reconstructed edge differs only by machine rounding', () => {
+    const source = {
+      color: '#4f46d888',
+      id: 'ipad-scaled-highlighter',
+      points: [
+        {
+          pressure: 0.017540378496050835,
+          time: 220_918,
+          x: 88.50574554794136,
+          y: 293.24137825801455,
+        },
+        {
+          pressure: 0.012122961692512035,
+          time: 221_422,
+          x: 249.8390788812747,
+          y: 289.70114837295705,
+        },
+      ],
+      tool: 'highlighter' as const,
+      width: 16,
+    };
+
+    expect(new SharedInkStrokeGeometry().compile(source)).toMatchObject({
+      geometry: { logicalStrokeId: source.id, version: 'legacy-round-v1' },
+      kind: 'exact',
+    });
+  });
+
   it('fails closed for an unknown Brush Render Version without manufacturing legacy geometry', () => {
     const compiler = new SharedInkStrokeGeometry();
     const unknown = {

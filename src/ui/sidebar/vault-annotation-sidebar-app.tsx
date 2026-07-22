@@ -5,6 +5,8 @@ import type {
   VaultAnnotationFilters,
   VaultAnnotationIndex,
 } from '../../domain/vault-annotation-index';
+import { snapshotIndexEntryToSummary } from '../../domain/vault-annotation-index';
+import type { SnapshotAnnotationSummary } from '../../domain/snapshot-annotation-summary';
 import { mapVaultAnnotation } from '../models/annotation-list-item-model';
 import { EmptyState } from '../primitives/empty-state';
 import { EllipsisMenuTrigger } from '../primitives/ellipsis-menu-trigger';
@@ -16,6 +18,7 @@ import { BulkActionDialog } from './bulk-action-dialog';
 import { GroupedVirtualList } from './grouped-virtual-list';
 import { ListItemFrame } from './list-item-frame';
 import { SelectionModeHeaderActions } from './selection-mode-header-actions';
+import { SnapshotAnnotationCard } from './snapshot-annotation-card';
 import { useDismissibleMenu } from './use-dismissible-menu';
 import {
   type BulkOutcome,
@@ -29,6 +32,10 @@ const VAULT_GROUP_HEADER_HEIGHT = 36;
 const VAULT_GROUP_ITEM_HEIGHT = 42;
 const VAULT_ROW_HEIGHT = 72;
 const VAULT_ROW_CARD_HEIGHT = 66;
+const VAULT_SNAPSHOT_CARD_GAP = 8;
+const VAULT_SNAPSHOT_REFERENCE_WIDTH = 300;
+const VAULT_SNAPSHOT_MIN_HEIGHT = 160;
+const VAULT_SNAPSHOT_MAX_HEIGHT = 360;
 
 type VaultVirtualItem =
   | {
@@ -54,9 +61,17 @@ export interface VaultAnnotationSidebarAppProps {
   readonly onBulkCopy: (entries: readonly AnnotationIndexEntry[]) => Promise<void>;
   readonly onBulkDelete: (selection: readonly BulkSelectionSnapshot[]) => Promise<BulkOutcome>;
   readonly onCurrentFile: () => void | Promise<void>;
+  readonly onDeleteSnapshot: (summary: SnapshotAnnotationSummary) => void;
   readonly onEdit?: (entry: AnnotationIndexEntry, invoker: HTMLElement) => void;
+  readonly onEditSnapshot: (summary: SnapshotAnnotationSummary) => void;
   readonly onExport: (entries: readonly AnnotationIndexEntry[], invoker: HTMLElement) => void;
+  readonly onExportSnapshot: (summary: SnapshotAnnotationSummary) => void;
   readonly onOpen: (entry: AnnotationIndexEntry, invoker: HTMLElement) => void;
+  readonly onPreviewSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onRelinkSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onRestoreSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onSelectSnapshotSource: (summary: SnapshotAnnotationSummary) => void;
+  readonly loadSnapshotThumbnail?: (summary: SnapshotAnnotationSummary) => Promise<string | null>;
   readonly onRenderNow: () => void;
   readonly onRequestFrame: () => void;
   readonly onResetSearchAndFilters: () => void;
@@ -122,7 +137,9 @@ function VaultReadyApp(props: VaultAnnotationSidebarAppProps) {
   );
   const selectedEntries = props.index
     .snapshot()
-    .filter((entry) => state.selectedKeys.value.has(vaultEntryKey(entry)));
+    .filter(
+      (entry) => entry.type !== 'snapshot' && state.selectedKeys.value.has(vaultEntryKey(entry)),
+    );
 
   return (
     <>
@@ -195,6 +212,7 @@ function VaultHeader({
   state,
   ...props
 }: VaultAnnotationSidebarAppProps & { readonly entries: readonly AnnotationIndexEntry[] }) {
+  const exportableEntries = entries.filter((entry) => entry.type !== 'snapshot');
   const actions = state.bulkSelectionMode.value ? (
     <SelectionModeHeaderActions
       onDeselectAll={() => {
@@ -242,9 +260,10 @@ function VaultHeader({
               title: 'Select multiple…',
             },
             {
+              disabled: exportableEntries.length === 0,
               icon: 'share',
               id: 'export-results',
-              onSelect: () => onExport(entries, trigger),
+              onSelect: () => onExport(exportableEntries, trigger),
               section: 'export',
               title: 'Export results…',
             },
@@ -414,7 +433,8 @@ function VaultFilterMenu({
           ['highlight', 'Highlight'],
           ['underline', 'Underline'],
           ['note', 'Note'],
-          ['ink', 'Ink'],
+          ['ink', 'Legacy Ink'],
+          ['snapshot', 'Snapshot'],
         ]}
         value={filters.types?.[0] ?? ''}
       />
@@ -538,7 +558,7 @@ function VaultGroupHeader({
   readonly total: number;
 }) {
   const expanded = !state.collapsedGroups.value.has(filePath);
-  const keys = entries.map(vaultEntryKey);
+  const keys = entries.filter((entry) => entry.type !== 'snapshot').map(vaultEntryKey);
   const selectedCount = keys.filter((key) => state.selectedKeys.value.has(key)).length;
   const allSelected = total > 0 && selectedCount === total;
   const toggleExpanded = (): void => {
@@ -565,7 +585,7 @@ function VaultGroupHeader({
         <ObsidianIcon icon="file-text" />
         <strong title={filePath}>{filePath}</strong>
       </button>
-      {state.bulkSelectionMode.value ? (
+      {state.bulkSelectionMode.value && keys.length > 0 ? (
         <GroupSelectionCheckbox
           allSelected={allSelected}
           filePath={filePath}
@@ -625,6 +645,29 @@ function VaultAnnotationRow(
     readonly entry: AnnotationIndexEntry;
   },
 ) {
+  if (props.entry.type === 'snapshot') {
+    const summary = snapshotIndexEntryToSummary(props.entry);
+    const height = vaultSnapshotCardHeight(props.entry) - VAULT_SNAPSHOT_CARD_GAP;
+    return (
+      <SnapshotAnnotationCard
+        className="inkstone-vault-snapshot-card"
+        dataAttributes={{ 'data-inkstone-vault-snapshot-id': summary.id }}
+        document={props.document}
+        {...(props.loadSnapshotThumbnail === undefined
+          ? {}
+          : { loadThumbnail: props.loadSnapshotThumbnail })}
+        onDelete={props.onDeleteSnapshot}
+        onEdit={props.onEditSnapshot}
+        onExport={props.onExportSnapshot}
+        onPreview={props.onPreviewSnapshot}
+        onRelink={props.onRelinkSnapshot}
+        onRestore={props.onRestoreSnapshot}
+        onSelectSource={props.onSelectSnapshotSource}
+        style={{ height: `${height}px` }}
+        summary={summary}
+      />
+    );
+  }
   const { entry, onEdit, onExport, onOpen, onRenderNow, state } = props;
   const model = mapVaultAnnotation(entry);
   const selected = state.selectedKeys.value.has(vaultEntryKey(entry));
@@ -647,7 +690,7 @@ function VaultAnnotationRow(
           onSelect: () => onOpen(entry, trigger),
           title: 'Open source',
         },
-        ...(onEdit === undefined
+        ...(onEdit === undefined || entry.type === 'ink'
           ? []
           : [
               {
@@ -968,7 +1011,24 @@ function flattenResult(
 }
 
 function virtualItemHeight(item: VaultVirtualItem): number {
-  return item.kind === 'group' ? VAULT_GROUP_ITEM_HEIGHT : VAULT_ROW_HEIGHT;
+  if (item.kind === 'group') return VAULT_GROUP_ITEM_HEIGHT;
+  return item.entry.type === 'snapshot' ? vaultSnapshotCardHeight(item.entry) : VAULT_ROW_HEIGHT;
+}
+
+function vaultSnapshotCardHeight(entry: AnnotationIndexEntry): number {
+  const snapshot = entry.snapshot;
+  if (snapshot === undefined) return VAULT_ROW_HEIGHT;
+  return (
+    Math.round(
+      Math.max(
+        VAULT_SNAPSHOT_MIN_HEIGHT,
+        Math.min(
+          VAULT_SNAPSHOT_MAX_HEIGHT,
+          (VAULT_SNAPSHOT_REFERENCE_WIDTH * snapshot.logicalHeight) / snapshot.logicalWidth,
+        ),
+      ),
+    ) + VAULT_SNAPSHOT_CARD_GAP
+  );
 }
 
 function virtualItemKey(item: VaultVirtualItem): string {

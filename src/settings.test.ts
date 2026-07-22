@@ -10,40 +10,22 @@ describe('parseSettings', () => {
     expect(parseSettings({ diagnosticsEnabled: true, ignored: 'value' })).toEqual({
       deviceId: '',
       diagnosticsEnabled: true,
-      inkPresentationAdapter: 'main-canvas-2d',
-      showInkPreviewByDefault: true,
       stylePresets: DEFAULT_STYLE_PRESETS,
     });
   });
 
-  it('keeps the unverified Worker renderer behind an explicit fail-closed selection', () => {
-    expect(parseSettings({ diagnosticsEnabled: false }).inkPresentationAdapter).toBe(
-      'main-canvas-2d',
-    );
+  it('ignores retired document Ink settings during upgrade', () => {
     expect(
       parseSettings({
         diagnosticsEnabled: false,
         inkPresentationAdapter: 'worker-offscreen-2d',
-      }).inkPresentationAdapter,
-    ).toBe('worker-offscreen-2d');
-    expect(
-      parseSettings({
-        diagnosticsEnabled: false,
-        inkPresentationAdapter: 'webgpu',
-      }).inkPresentationAdapter,
-    ).toBe('main-canvas-2d');
-  });
-
-  it('shows saved Ink in preview by default while preserving an explicit opt-out', () => {
-    expect(parseSettings({ diagnosticsEnabled: false }).showInkPreviewByDefault).toBe(true);
-    expect(
-      parseSettings({ diagnosticsEnabled: false, showInkPreviewByDefault: false })
-        .showInkPreviewByDefault,
-    ).toBe(false);
-    expect(
-      parseSettings({ diagnosticsEnabled: false, showInkPreviewByDefault: 'sometimes' })
-        .showInkPreviewByDefault,
-    ).toBe(true);
+        showInkPreviewByDefault: false,
+      }),
+    ).toEqual({
+      deviceId: '',
+      diagnosticsEnabled: false,
+      stylePresets: DEFAULT_STYLE_PRESETS,
+    });
   });
 
   it('restores valid renamed/recolored presets while rejecting malformed catalogs', () => {

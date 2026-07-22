@@ -11,6 +11,7 @@ interface DataAdapterLike {
   list(path: string): Promise<ListedPaths>;
   mkdir(path: string): Promise<void>;
   read(path: string): Promise<string>;
+  readBinary?(path: string): Promise<ArrayBuffer>;
   remove(path: string): Promise<void>;
   rename?(from: string, to: string): Promise<void>;
   write(path: string, contents: string): Promise<void>;
@@ -107,6 +108,21 @@ export class ObsidianVaultTextFileStore implements TextFileStore {
     await this.recoverAtomicPath(normalized);
     return (await this.adapter.exists(normalized))
       ? withTimeout(this.adapter.read(normalized), this.readTimeoutMs, `read ${normalized}`)
+      : null;
+  }
+
+  async readBinary(path: string): Promise<ArrayBuffer | null> {
+    if (this.adapter.readBinary === undefined) {
+      throw new Error('The Obsidian data adapter does not support binary Snapshot assets.');
+    }
+    const normalized = normalizeVaultPath(path);
+    await this.recoverAtomicPath(normalized);
+    return (await this.adapter.exists(normalized))
+      ? withTimeout(
+          this.adapter.readBinary(normalized),
+          this.readTimeoutMs,
+          `read binary ${normalized}`,
+        )
       : null;
   }
 

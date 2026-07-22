@@ -6,7 +6,11 @@ import {
 import type { NoteMeta, RepositoryConflict, RepositoryIssue } from '../storage/sidecar-repository';
 import type { TextAnnotationRecord } from '../domain/text-annotation';
 import type { InkSurfaceSummary } from '../domain/ink-surface-summary';
-import { inkSummaryToIndexEntry } from '../domain/vault-annotation-index';
+import type { SnapshotAnnotationSummary } from '../domain/snapshot-annotation-summary';
+import {
+  inkSummaryToIndexEntry,
+  snapshotSummaryToIndexEntry,
+} from '../domain/vault-annotation-index';
 
 export interface CanonicalVaultAnnotationSource {
   isSourceAvailable?(filePath: string): boolean;
@@ -19,6 +23,7 @@ export interface CanonicalVaultAnnotationSource {
     readonly issues: readonly RepositoryIssue[];
     readonly notes: readonly NoteMeta[];
   }>;
+  listSnapshotSummaries(filePath: string): Promise<readonly SnapshotAnnotationSummary[]>;
   listSurfaceSummaries(filePath: string): Promise<readonly InkSurfaceSummary[]>;
 }
 
@@ -111,9 +116,10 @@ export class VaultIndexBuilder {
           if (note === undefined) {
             return;
           }
-          const [loaded, inkSummaries] = await Promise.all([
+          const [loaded, inkSummaries, snapshotSummaries] = await Promise.all([
             this.source.listAnnotations(note.filePath),
             this.source.listSurfaceSummaries(note.filePath),
+            this.source.listSnapshotSummaries(note.filePath),
           ]);
           throwIfAborted(input.signal);
           issues.push(...loaded.issues);
@@ -138,6 +144,11 @@ export class VaultIndexBuilder {
           for (const summary of inkSummaries) {
             if (summary.deletedAt === undefined && summary.strokeCount > 0) {
               entries.push(inkSummaryToIndexEntry(summary, note.noteId));
+            }
+          }
+          for (const summary of snapshotSummaries) {
+            if (summary.deletedAt === undefined) {
+              entries.push(snapshotSummaryToIndexEntry(summary, note.noteId));
             }
           }
           completed += 1;

@@ -1,6 +1,7 @@
 # Inkstone Annotations
 
-Inkstone Annotations is an Obsidian plugin for text and ink annotations over mutable Markdown.
+Inkstone Annotations is an Obsidian plugin for text annotations over mutable Markdown and freehand
+markup over stable, Vault-local snapshots.
 
 The project is under active development. The canonical product and execution specifications live in
 the adjacent AI Wiki workspace.
@@ -12,14 +13,11 @@ Requirements: Node.js 20.19 or newer and npm.
 ```bash
 npm install
 npm run check
-npm run measure:scale
 npm run install:dev
 ```
 
 `npm run install:dev` installs the built plugin into `test-fixtures/vault` by default. Set
-`INKSTONE_VAULT` to install into another development Vault. `npm run measure:scale` creates a
-temporary 20,100-file APFS/Node qualification fixture and writes its machine-readable report under
-the S14 delivery directory; it is not an iCloud/device benchmark.
+`INKSTONE_VAULT` to install into another development Vault.
 
 ## Privacy
 

@@ -31,6 +31,12 @@ Markdown.
   `docs/specs/2026-07-20-ink-retained-tile-scene-and-worker-rasterization.md`
 - Current Ink simple snapshot persistence specification:
   `docs/specs/2026-07-21-ink-simple-snapshot-persistence.md`
+- Current Ink semantic layers and transform-only interaction specification:
+  `docs/specs/2026-07-21-ink-semantic-layers-and-transform-only-interactions.md`
+- Current Ink shared scene, deterministic layout, and atomic camera specification:
+  `docs/specs/2026-07-21-ink-shared-scene-layout-and-atomic-camera.md`
+- Current Snapshot Annotation capture and markup specification:
+  `docs/specs/2026-07-22-snapshot-annotation-capture-and-markup.md`
 - UI architecture refactor specification: `docs/specs/2026_07_15_refactor_to_preact.md`
 - Slice evidence: `docs/delivery/slices/`
 

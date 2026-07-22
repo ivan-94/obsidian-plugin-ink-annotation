@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 
 import type { InkSurfaceSummary } from '../../domain/ink-surface-summary';
+import type { SnapshotAnnotationSummary } from '../../domain/snapshot-annotation-summary';
 import {
   mapCurrentInkAnnotation,
   mapCurrentTextAnnotation,
@@ -17,6 +18,7 @@ import { BulkActionDialog } from './bulk-action-dialog';
 import type { CurrentBulkOutcome, CurrentBulkSelectionEntry } from './current-bulk-selection-types';
 import { InkAnnotationListItem } from './ink-annotation-list-item';
 import { SelectionModeHeaderActions } from './selection-mode-header-actions';
+import { SnapshotAnnotationCard } from './snapshot-annotation-card';
 import { TextAnnotationListItem } from './text-annotation-list-item';
 import type { SelectOption } from './vault-sidebar-types';
 
@@ -41,7 +43,6 @@ export interface CurrentFileSidebarAppProps {
   ) => Promise<void>;
   readonly onDeleteAnnotation: (annotationId: string, expectedRevision: number) => void;
   readonly onDeleteInk: (surfaceId: string, expectedRevision: number) => void;
-  readonly onEditInk: (surfaceId: string) => void;
   readonly onEntireVault: () => void | Promise<void>;
   readonly onExportCurrentFile: (invoker: HTMLElement) => void;
   readonly onExportInkPng: (surfaceId: string) => void;
@@ -55,6 +56,14 @@ export interface CurrentFileSidebarAppProps {
   readonly onRestoreInk: (surfaceId: string, expectedRevision: number) => void;
   readonly onSelect: (annotationId: string) => void;
   readonly onSelectInk: (summary: InkSurfaceSummary) => void;
+  readonly onDeleteSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onEditSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onExportSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onPreviewSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onRelinkSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onRestoreSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onSelectSnapshotSource: (summary: SnapshotAnnotationSummary) => void;
+  readonly loadSnapshotThumbnail?: (summary: SnapshotAnnotationSummary) => Promise<string | null>;
   readonly showScope: boolean;
   readonly state: CurrentFileSidebarStore;
   readonly styleOptions: readonly SelectOption[];
@@ -96,7 +105,13 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
   const inkSummaries = state.inkSummaries.value.filter(
     (summary) => summary.strokeCount > 0 && visibleUntil(summary.deletedAt, now),
   );
-  const total = groups.reduce((sum, group) => sum + group.rows.length, 0) + inkSummaries.length;
+  const snapshotSummaries = state.snapshotSummaries.value
+    .filter((summary) => visibleUntil(summary.deletedAt, now))
+    .sort((left, right) => left.sourceOrder - right.sourceOrder || left.id.localeCompare(right.id));
+  const total =
+    groups.reduce((sum, group) => sum + group.rows.length, 0) +
+    inkSummaries.length +
+    snapshotSummaries.length;
   const query = state.searchQuery.value.trim().toLocaleLowerCase();
   const matches = (value: string): boolean =>
     query.length === 0 || value.toLocaleLowerCase().includes(query);
@@ -120,7 +135,7 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
         filePath: summary.filePath,
         id: summary.id,
         key: currentSelectionKey('ink', summary.id),
-        quote: `Ink · ${summary.headingPath.join(' › ') || 'Document'}`,
+        quote: `Legacy Ink · ${summary.headingPath.join(' › ') || 'Document'}`,
         type: 'ink' as const,
       })),
     ...groups.flatMap((group) =>
@@ -168,19 +183,24 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
         {total === 0 ? (
           <div className="inkstone-sidebar__empty">
             <EmptyState
-              description="Select text in Reading View or start Ink Mode."
+              description="Select text in Reading View or capture a Snapshot to annotate."
               icon="bookmark-plus"
               title="No annotations yet"
             />
           </div>
         ) : (
           <>
+            <SnapshotAnnotationGroups
+              matches={matches}
+              props={props}
+              summaries={snapshotSummaries}
+            />
             {inkSummaries.length === 0 ? null : (
               <section
                 className="inkstone-sidebar-group inkstone-sidebar-group--ink"
                 hidden={!inkSummaries.some((summary) => matches(inkSearchText(summary)))}
               >
-                <AnnotationGroupHeader count={inkSummaries.length} kind="ink" title="Ink" />
+                <AnnotationGroupHeader count={inkSummaries.length} kind="ink" title="Legacy Ink" />
                 {inkSummaries.map((summary) => {
                   const model = mapCurrentInkAnnotation(summary);
                   const selectionKey = currentSelectionKey('ink', summary.id);
@@ -195,7 +215,6 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
                             title: model.title,
                           };
                         }}
-                        onEdit={() => props.onEditInk(summary.id)}
                         onExportPng={() => props.onExportInkPng(summary.id)}
                         onExportSvg={() => props.onExportInkSvg(summary.id)}
                         onRestore={() => props.onRestoreInk(summary.id, summary.revision)}
@@ -276,6 +295,66 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
   );
 }
 
+function SnapshotAnnotationGroups({
+  matches,
+  props,
+  summaries,
+}: {
+  readonly matches: (value: string) => boolean;
+  readonly props: CurrentFileSidebarAppProps;
+  readonly summaries: readonly SnapshotAnnotationSummary[];
+}) {
+  const groups = new Map<string, SnapshotAnnotationSummary[]>();
+  for (const summary of summaries) {
+    const title =
+      summary.linkState === 'unanchored'
+        ? 'Problems'
+        : (summary.headingPath.at(-1) ?? 'Document snapshots');
+    const group = groups.get(title) ?? [];
+    group.push(summary);
+    groups.set(title, group);
+  }
+  return [...groups].map(([title, rows]) => {
+    const visibleRows = rows.filter((summary) => matches(snapshotSearchText(summary)));
+    if (visibleRows.length === 0) return null;
+    return (
+      <section className="inkstone-sidebar-group inkstone-sidebar-group--snapshot" key={title}>
+        <AnnotationGroupHeader
+          count={rows.length}
+          kind={title === 'Problems' ? 'problems' : 'heading'}
+          title={title}
+        />
+        <div className="inkstone-snapshot-masonry" data-inkstone-snapshot-masonry="">
+          {visibleRows.map((summary) => (
+            <SnapshotAnnotationCard
+              active={props.state.activeSnapshotId.value === summary.id}
+              className="inkstone-snapshot-row"
+              dataAttributes={{
+                'data-inkstone-snapshot-id': summary.id,
+                'data-inkstone-snapshot-link-state': summary.linkState,
+              }}
+              document={props.document}
+              key={summary.id}
+              {...(props.loadSnapshotThumbnail === undefined
+                ? {}
+                : { loadThumbnail: props.loadSnapshotThumbnail })}
+              onDelete={props.onDeleteSnapshot}
+              onEdit={props.onEditSnapshot}
+              onExport={props.onExportSnapshot}
+              onPreview={props.onPreviewSnapshot}
+              onRelink={props.onRelinkSnapshot}
+              onRestore={props.onRestoreSnapshot}
+              onSelectSource={props.onSelectSnapshotSource}
+              style={{ aspectRatio: `${summary.logicalWidth} / ${summary.logicalHeight}` }}
+              summary={summary}
+            />
+          ))}
+        </div>
+      </section>
+    );
+  });
+}
+
 function InkDeleteDialog({ onDeleteInk, state }: CurrentFileSidebarAppProps) {
   const pending = state.pendingInkDelete.value;
   if (pending === null) return null;
@@ -284,11 +363,11 @@ function InkDeleteDialog({ onDeleteInk, state }: CurrentFileSidebarAppProps) {
   };
   return (
     <BulkActionDialog
-      ariaLabel="Confirm Ink deletion"
-      confirmAriaLabel="Confirm delete Ink surface"
+      ariaLabel="Confirm Legacy Ink deletion"
+      confirmAriaLabel="Confirm delete Legacy Ink surface"
       confirmLabel="Delete"
       danger
-      description="This deletes the entire Ink surface. You can restore it briefly afterward."
+      description="This deletes the entire Legacy Ink surface. You can restore it briefly afterward."
       feedback={null}
       icon="trash-2"
       onCancel={close}
@@ -531,7 +610,7 @@ function CurrentHeader({
               id: 'export-ink-report',
               onSelect: onExportInkReport,
               section: 'export',
-              title: 'Export Ink report…',
+              title: 'Export Legacy Ink report…',
             },
           ]}
           label="More actions"
@@ -662,4 +741,8 @@ function inkSearchText(summary: InkSurfaceSummary): string {
   return [summary.headingPath.join(' '), summary.status, `${summary.strokeCount} strokes`].join(
     ' ',
   );
+}
+
+function snapshotSearchText(summary: SnapshotAnnotationSummary): string {
+  return `${summary.headingPath.join(' ')} ${summary.linkState} ${summary.strokeCount} ${summary.capturedAt}`;
 }

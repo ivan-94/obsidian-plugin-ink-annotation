@@ -9,7 +9,8 @@ describe('production CSS architecture', () => {
     expect(styles).toContain('/* base / primitives */');
     expect(styles).toContain('/* features / Current File and Entire Vault sidebar */');
     expect(styles).toContain('/* features / Inspector and decision dialogs */');
-    expect(styles).toContain('/* features / imperative Canvas and Preact Ink Toolbar */');
+    expect(styles).toContain('/* features / Snapshot markup toolbar */');
+    expect(styles).toContain('/* features / bounded Snapshot Annotation editor */');
   });
 
   it('removes selectors belonging only to deleted imperative UI helpers', () => {
@@ -127,6 +128,40 @@ describe('production CSS architecture', () => {
     );
   });
 
+  it('keeps the Snapshot overlay below Obsidian frameless title bars', () => {
+    expect(styles).toMatch(
+      /body\.is-frameless:not\(\.is-fullscreen\):not\(\.is-mobile\)\s+\.inkstone-snapshot-editor\s*\{[^}]*top:\s*calc\(var\(--titlebar-height\)\s*\/\s*var\(--zoom-factor\)\)/u,
+    );
+    expect(styles).toMatch(
+      /body\.is-frameless\.is-hidden-frameless:not\(\.is-fullscreen\):not\(\.is-mobile\)\s+\.inkstone-snapshot-editor\s*\{[^}]*top:\s*calc\(var\(--header-height\)\s*-\s*1px\)/u,
+    );
+  });
+
+  it('reserves the iPad safe header and defaults the shared Ink toolbar to the bottom', () => {
+    expect(styles).toMatch(
+      /body\.is-mobile\s+\.inkstone-snapshot-editor\s*\{[^}]*--inkstone-snapshot-mobile-safe-top:\s*max\(24px,\s*env\(safe-area-inset-top\)\)[^}]*box-sizing:\s*border-box[^}]*padding-top:\s*var\(--inkstone-snapshot-mobile-safe-top\)/u,
+    );
+    expect(styles).toMatch(
+      /body\.is-mobile\s+\.inkstone-ink-controls\s*\{[^}]*top:\s*auto[^}]*bottom:\s*max\(8px,\s*env\(safe-area-inset-bottom\)\)/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-editor__close\s*\{[^}]*min-width:\s*40px[^}]*min-height:\s*40px/u,
+    );
+  });
+
+  it('keeps persistent Inkstone text annotations visible while a Snapshot is captured', () => {
+    expect(styles).not.toMatch(/\.is-inkstone-snapshot-capturing\s+\[class\*=['"]inkstone-['"]\]/u);
+  });
+
+  it('lets the Snapshot camera own centering from the viewport origin', () => {
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-editor__viewport\s*\{[^}]*position:\s*relative[^}]*display:\s*block[^}]*overflow:\s*hidden/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-editor__frame\s*\{[^}]*position:\s*absolute[^}]*top:\s*0[^}]*left:\s*0[^}]*width:\s*var\(--inkstone-snapshot-width\)/u,
+    );
+  });
+
   it('adapts the shared sidebar by container width instead of viewport width', () => {
     expect(styles).toMatch(
       /\.inkstone-annotation-sidebar-view\s*\{[^}]*container-name:\s*inkstone-sidebar[^}]*container-type:\s*inline-size/u,
@@ -147,6 +182,30 @@ describe('production CSS architecture', () => {
     );
     expect(styles).toMatch(
       /@container inkstone-sidebar \(max-width:\s*380px\)[\s\S]*?\.inkstone-sidebar-ink-row\s+img\s*\{[^}]*width:\s*44px[^}]*height:\s*34px/u,
+    );
+  });
+
+  it('lays out Current file Snapshot cards as a two-column masonry with a narrow fallback', () => {
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-masonry\s*\{[^}]*column-count:\s*2[^}]*column-gap:\s*8px/u,
+    );
+    expect(styles).toMatch(
+      /@container inkstone-sidebar \(max-width:\s*280px\)[\s\S]*?\.inkstone-snapshot-masonry\s*\{[^}]*column-count:\s*1/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-row\s*\{[^}]*width:\s*100%[^}]*break-inside:\s*avoid/u,
+    );
+  });
+
+  it('contains Snapshot cards inside narrow leaves and fills thumbnails with cover cropping', () => {
+    expect(styles).toMatch(
+      /\.inkstone-annotation-sidebar-view\s*\{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-card\s*\{[^}]*box-sizing:\s*border-box[^}]*min-width:\s*0[^}]*max-width:\s*100%/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-card__thumbnail\s*>\s*img\s*\{[^}]*object-fit:\s*cover/u,
     );
   });
 

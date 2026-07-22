@@ -1,4 +1,5 @@
 import type { AnnotationIndexEntry, VaultAnnotationIndex } from '../domain/vault-annotation-index';
+import type { SnapshotAnnotationSummary } from '../domain/snapshot-annotation-summary';
 import { createPreactIsland, type UiIsland } from './runtime/mount-preact-island';
 import {
   VaultAnnotationSidebarApp,
@@ -33,13 +34,22 @@ export class VaultAnnotationSidebar {
     selection: readonly BulkSelectionSnapshot[],
   ) => Promise<BulkOutcome>;
   private readonly onCurrentFile: () => void | Promise<void>;
+  private readonly onDeleteSnapshot: (summary: SnapshotAnnotationSummary) => void;
   private readonly onEdit:
     ((entry: AnnotationIndexEntry, invoker: HTMLElement) => void) | undefined;
+  private readonly onEditSnapshot: (summary: SnapshotAnnotationSummary) => void;
   private readonly onExport: (
     entries: readonly AnnotationIndexEntry[],
     invoker: HTMLElement,
   ) => void;
   private readonly onOpen: (entry: AnnotationIndexEntry, invoker: HTMLElement) => void;
+  private readonly onExportSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onPreviewSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onRelinkSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onRestoreSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onSelectSnapshotSource: (summary: SnapshotAnnotationSummary) => void;
+  private readonly loadSnapshotThumbnail:
+    ((summary: SnapshotAnnotationSummary) => Promise<string | null>) | undefined;
   private searchTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly showScope: boolean;
   private readonly state: VaultSidebarStore;
@@ -62,9 +72,17 @@ export class VaultAnnotationSidebar {
     readonly onBulkCopy?: (entries: readonly AnnotationIndexEntry[]) => Promise<void>;
     readonly onBulkDelete?: (selection: readonly BulkSelectionSnapshot[]) => Promise<BulkOutcome>;
     readonly onCurrentFile?: () => void | Promise<void>;
+    readonly onDeleteSnapshot?: (summary: SnapshotAnnotationSummary) => void;
     readonly onEdit?: (entry: AnnotationIndexEntry, invoker: HTMLElement) => void;
+    readonly onEditSnapshot?: (summary: SnapshotAnnotationSummary) => void;
     readonly onExport?: (entries: readonly AnnotationIndexEntry[], invoker: HTMLElement) => void;
+    readonly onExportSnapshot?: (summary: SnapshotAnnotationSummary) => void;
     readonly onOpen?: (entry: AnnotationIndexEntry, invoker: HTMLElement) => void;
+    readonly onPreviewSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onRelinkSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onRestoreSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onSelectSnapshotSource?: (summary: SnapshotAnnotationSummary) => void;
+    readonly loadSnapshotThumbnail?: (summary: SnapshotAnnotationSummary) => Promise<string | null>;
     readonly state?: VaultSidebarStore;
     readonly styleOptions?: readonly SelectOption[];
     readonly showScope?: boolean;
@@ -78,9 +96,17 @@ export class VaultAnnotationSidebar {
     this.onBulkCopy = input.onBulkCopy ?? (() => Promise.resolve());
     this.onBulkDelete = input.onBulkDelete ?? (() => Promise.resolve({ failed: [] }));
     this.onCurrentFile = input.onCurrentFile ?? (() => undefined);
+    this.onDeleteSnapshot = input.onDeleteSnapshot ?? (() => undefined);
     this.onEdit = input.onEdit;
+    this.onEditSnapshot = input.onEditSnapshot ?? (() => undefined);
     this.onExport = input.onExport ?? (() => undefined);
+    this.onExportSnapshot = input.onExportSnapshot ?? (() => undefined);
     this.onOpen = input.onOpen ?? (() => undefined);
+    this.onPreviewSnapshot = input.onPreviewSnapshot ?? (() => undefined);
+    this.onRelinkSnapshot = input.onRelinkSnapshot ?? (() => undefined);
+    this.onRestoreSnapshot = input.onRestoreSnapshot ?? (() => undefined);
+    this.onSelectSnapshotSource = input.onSelectSnapshotSource ?? (() => undefined);
+    this.loadSnapshotThumbnail = input.loadSnapshotThumbnail;
     this.showScope = input.showScope ?? true;
     this.state = input.state ?? createVaultSidebarStore();
     this.styleOptions = input.styleOptions ?? [];
@@ -141,9 +167,19 @@ export class VaultAnnotationSidebar {
       onBulkCopy: this.onBulkCopy,
       onBulkDelete: this.onBulkDelete,
       onCurrentFile: this.onCurrentFile,
+      onDeleteSnapshot: this.onDeleteSnapshot,
       ...(this.onEdit === undefined ? {} : { onEdit: this.onEdit }),
+      onEditSnapshot: this.onEditSnapshot,
       onExport: this.onExport,
+      onExportSnapshot: this.onExportSnapshot,
       onOpen: this.onOpen,
+      onPreviewSnapshot: this.onPreviewSnapshot,
+      onRelinkSnapshot: this.onRelinkSnapshot,
+      onRestoreSnapshot: this.onRestoreSnapshot,
+      onSelectSnapshotSource: this.onSelectSnapshotSource,
+      ...(this.loadSnapshotThumbnail === undefined
+        ? {}
+        : { loadSnapshotThumbnail: this.loadSnapshotThumbnail }),
       onRenderNow: () => this.renderNow(),
       onRequestFrame: () => this.requestFrame(),
       onResetSearchAndFilters: () => this.resetSearchAndFilters(),

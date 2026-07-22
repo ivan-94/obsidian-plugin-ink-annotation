@@ -5,6 +5,11 @@ import { ObsidianIcon } from '../primitives/obsidian-icon';
 import type { InkToolbarState } from '../stores/ink-toolbar-store';
 
 export interface InkToolbarAppProps {
+  readonly labels?: {
+    readonly done?: string;
+    readonly exportUnsaved?: string;
+    readonly retry?: string;
+  };
   readonly onColor: (color: string) => void;
   readonly onDeleteSelection: () => void;
   readonly onDone: () => void;
@@ -62,7 +67,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         disabled={state.committing}
         hidden={!state.active}
         icon="circle-check"
-        label="Exit Ink Mode"
+        label={props.labels?.done ?? 'Done'}
         onClick={props.onDone}
       />
       {(['pen', 'highlighter', 'eraser'] as const).map((tool) => (
@@ -207,7 +212,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         disabled={state.committing}
         hidden={state.saveError === null}
         icon="refresh-cw"
-        label="Retry local Ink save"
+        label={props.labels?.retry ?? 'Retry local Ink save'}
         onClick={props.onRetry}
         text="Retry"
       />
@@ -216,7 +221,7 @@ export function InkToolbarApp(props: InkToolbarAppProps) {
         disabled={state.committing}
         hidden={state.saveError === null}
         icon="download"
-        label="Export retained unsaved Ink as SVG"
+        label={props.labels?.exportUnsaved ?? 'Export retained unsaved Ink as SVG'}
         onClick={props.onExportUnsaved}
         text="Export"
       />

@@ -1,5 +1,6 @@
 import { annotationTargetText, type TextAnnotationRecord } from './text-annotation';
 import type { InkSurfaceSummary } from './ink-surface-summary';
+import type { SnapshotAnnotationSummary } from './snapshot-annotation-summary';
 
 export type AnnotationIndexStatus = TextAnnotationRecord['status'] | 'needs-rebase';
 
@@ -12,6 +13,15 @@ export interface AnnotationIndexEntry {
     readonly headingPath: readonly string[];
     readonly strokeCount: number;
   };
+  readonly snapshot?: {
+    readonly capturedAt: string;
+    readonly headingPath: readonly string[];
+    readonly linkState: SnapshotAnnotationSummary['linkState'];
+    readonly logicalHeight: number;
+    readonly logicalWidth: number;
+    readonly strokeCount: number;
+    readonly thumbnailKey: string;
+  };
   readonly noteId: string;
   readonly position: number;
   readonly quote: string;
@@ -20,7 +30,7 @@ export interface AnnotationIndexEntry {
   readonly styleId?: string;
   readonly styleName?: string;
   readonly tags: readonly string[];
-  readonly type: 'highlight' | 'ink' | 'note' | 'underline';
+  readonly type: 'highlight' | 'ink' | 'note' | 'snapshot' | 'underline';
   readonly updatedAt: string;
 }
 
@@ -395,12 +405,66 @@ export function inkSummaryToIndexEntry(
     ink: { headingPath: [...summary.headingPath], strokeCount: summary.strokeCount },
     noteId,
     position: summary.position,
-    quote: `Ink · ${heading}`,
+    quote: `Legacy Ink · ${heading}`,
     revision: summary.revision,
     status: summary.status,
     tags: [],
     type: 'ink',
     updatedAt: summary.updatedAt,
+  });
+}
+
+export function snapshotSummaryToIndexEntry(
+  summary: SnapshotAnnotationSummary,
+  noteId: string,
+): AnnotationIndexEntry {
+  const heading = summary.headingPath.length === 0 ? 'Document' : summary.headingPath.join(' › ');
+  const strokeLabel = `${summary.strokeCount} ${summary.strokeCount === 1 ? 'stroke' : 'strokes'}`;
+  return freezeEntry({
+    body: strokeLabel,
+    conflict: false,
+    filePath: summary.filePath,
+    id: summary.id,
+    noteId,
+    position: summary.sourceOrder,
+    quote: `Snapshot · ${heading}`,
+    revision: summary.revision,
+    snapshot: {
+      capturedAt: summary.capturedAt,
+      headingPath: [...summary.headingPath],
+      linkState: summary.linkState,
+      logicalHeight: summary.logicalHeight,
+      logicalWidth: summary.logicalWidth,
+      strokeCount: summary.strokeCount,
+      thumbnailKey: summary.thumbnailKey,
+    },
+    status: summary.status,
+    tags: [],
+    type: 'snapshot',
+    updatedAt: summary.updatedAt,
+  });
+}
+
+export function snapshotIndexEntryToSummary(
+  entry: AnnotationIndexEntry,
+): SnapshotAnnotationSummary {
+  if (entry.type !== 'snapshot' || entry.snapshot === undefined) {
+    throw new Error('Vault index entry is not a Snapshot Annotation.');
+  }
+  return Object.freeze({
+    capturedAt: entry.snapshot.capturedAt,
+    filePath: entry.filePath,
+    headingPath: Object.freeze([...entry.snapshot.headingPath]),
+    id: entry.id,
+    linkState: entry.snapshot.linkState,
+    logicalHeight: entry.snapshot.logicalHeight,
+    logicalWidth: entry.snapshot.logicalWidth,
+    revision: entry.revision,
+    sourceOrder: entry.position,
+    status: entry.status === 'unanchored' ? 'unanchored' : 'active',
+    strokeCount: entry.snapshot.strokeCount,
+    thumbnailKey: entry.snapshot.thumbnailKey,
+    updatedAt: entry.updatedAt,
   });
 }
 
@@ -421,6 +485,14 @@ function freezeEntry(entry: AnnotationIndexEntry): AnnotationIndexEntry {
           ink: Object.freeze({
             headingPath: Object.freeze([...entry.ink.headingPath]),
             strokeCount: entry.ink.strokeCount,
+          }),
+        }),
+    ...(entry.snapshot === undefined
+      ? {}
+      : {
+          snapshot: Object.freeze({
+            ...entry.snapshot,
+            headingPath: Object.freeze([...entry.snapshot.headingPath]),
           }),
         }),
     tags: Object.freeze([...entry.tags]),
@@ -476,6 +548,10 @@ function searchableText(entry: AnnotationIndexEntry): string {
       entry.styleId ?? '',
       entry.ink?.headingPath.join(' ') ?? '',
       entry.ink === undefined ? '' : `${entry.ink.strokeCount} strokes ink drawing`,
+      entry.snapshot?.headingPath.join(' ') ?? '',
+      entry.snapshot === undefined
+        ? ''
+        : `${entry.snapshot.strokeCount} strokes snapshot ${entry.snapshot.linkState}`,
       entry.type,
       entry.status,
       entry.updatedAt,

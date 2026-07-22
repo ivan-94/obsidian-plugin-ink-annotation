@@ -1,7 +1,10 @@
 # Inkstone Domain Context
 
-This glossary names the Ink concepts introduced by the native-feel performance and brush-fidelity
-work. It complements `AGENTS.md`; it does not replace the product specifications.
+This glossary names the reusable stroke/brush concepts introduced by the earlier Ink work. The
+live-Markdown document-world editor described in historical entries was retired on 2026-07-22;
+Snapshot Annotation now owns new freehand creation and editing. Existing legacy sidecars remain
+read/export compatible. This file complements `AGENTS.md`; it does not replace product
+specifications.
 
 ## Ink Sample
 
@@ -61,12 +64,12 @@ metadata means `legacy-round-v1` only while decoding schema v1/v2. A schema v3 P
 missing or unknown metadata is unsupported and fails closed; it never silently selects another
 model.
 
-## Ink Live Document
+## Ink Live Document (retired)
 
-The mounted, incremental read-and-command model that presents stable logical-stroke references,
-viewport queries, exact changes, Undo/Redo, and persistence state without rebuilding a composite
-canonical snapshot on the input path. It is the sole active editor for a note and remains in memory
-until Done, Discard, or process loss.
+The historical mounted read-and-command model for drawing directly over live Markdown. Production no
+longer creates or mounts this editor. Its description is retained only to interpret historical
+specifications and legacy sidecars; Snapshot Annotation uses a bounded immutable image and
+image-local strokes instead.
 
 ## Canonical Ink Snapshot
 

@@ -132,6 +132,47 @@ describe('AnnotationSidebarApp', () => {
     await act(() => island.unmount());
   });
 
+  it('keeps Current file content visible when Snapshot is the only annotation type', async () => {
+    const container = document.createElement('div');
+    const store = new AnnotationSidebarStore();
+    store.current.status.value = 'ready';
+    store.current.snapshotSummaries.value = [
+      {
+        capturedAt: '2026-07-22T10:00:00.000Z',
+        filePath: 'Snapshot.md',
+        headingPath: ['Snapshot'],
+        id: 'snapshot-only',
+        linkState: 'linked',
+        logicalHeight: 200,
+        logicalWidth: 300,
+        revision: 1,
+        sourceOrder: 0,
+        status: 'active',
+        strokeCount: 1,
+        thumbnailKey: 'snapshot:a:1',
+        updatedAt: '2026-07-22T10:00:00.000Z',
+      },
+    ];
+    const island = createPreactIsland(AnnotationSidebarApp);
+
+    await act(() =>
+      island.mount(container, {
+        onCurrentContentMount: () => undefined,
+        onCurrentHeaderActionsMount: () => undefined,
+        onScopeChange: () => undefined,
+        onVaultContentMount: () => undefined,
+        onVaultHeaderActionsMount: () => undefined,
+        store,
+      }),
+    );
+
+    expect(container.querySelector('[data-inkstone-sidebar-content]')?.hasAttribute('hidden')).toBe(
+      false,
+    );
+    expect(container.querySelector('.inkstone-sidebar__empty')).toBeNull();
+    await act(() => island.unmount());
+  });
+
   it('keeps the Vault content and search controls mounted when a query has no matches', async () => {
     const container = document.createElement('div');
     const store = new AnnotationSidebarStore();

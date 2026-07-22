@@ -22,7 +22,7 @@ export function AnnotationSummary({
     return (
       <button
         aria-disabled={disabled || undefined}
-        aria-label={`Ink in ${model.title}, ${model.secondary ?? 'Ink'}, ${model.state.deleted ? 'deleted' : model.tone}`}
+        aria-label={`Legacy Ink in ${model.title}, ${model.secondary ?? 'Legacy Ink'}, ${model.state.deleted ? 'deleted' : model.tone}`}
         data-inkstone-ink-row={model.id}
         onClick={disabled || selectionMode ? undefined : (event) => onActivate(event.currentTarget)}
         tabIndex={selectionMode ? -1 : undefined}

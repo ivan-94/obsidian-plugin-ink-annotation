@@ -2,6 +2,7 @@ import { signal, type Signal } from '@preact/signals';
 
 import type { CurrentFileAnnotationList } from '../../domain/current-file-annotation-list';
 import type { InkSurfaceSummary } from '../../domain/ink-surface-summary';
+import type { SnapshotAnnotationSummary } from '../../domain/snapshot-annotation-summary';
 import type {
   VaultAnnotationFilters,
   VaultAnnotationQueryResult,
@@ -20,12 +21,14 @@ export interface RecentDeletionReceipt {
 
 export interface CurrentFileSidebarStore {
   readonly activeAnnotationId: Signal<string | null>;
+  readonly activeSnapshotId: Signal<string | null>;
   readonly bulkDialog: Signal<CurrentBulkDialog>;
   readonly bulkFeedback: Signal<string | null>;
   readonly bulkPending: Signal<boolean>;
   readonly errorMessage: Signal<string | null>;
   readonly filePath: Signal<string | null>;
   readonly inkSummaries: Signal<readonly InkSurfaceSummary[]>;
+  readonly snapshotSummaries: Signal<readonly SnapshotAnnotationSummary[]>;
   readonly model: Signal<CurrentFileAnnotationList>;
   readonly pendingInkDelete: Signal<{
     readonly expectedRevision: number;
@@ -47,12 +50,14 @@ export interface CurrentFileSidebarStore {
 export function createCurrentFileSidebarStore(): CurrentFileSidebarStore {
   return {
     activeAnnotationId: signal(null),
+    activeSnapshotId: signal(null),
     bulkDialog: signal(null),
     bulkFeedback: signal(null),
     bulkPending: signal(false),
     errorMessage: signal(null),
     filePath: signal(null),
     inkSummaries: signal([]),
+    snapshotSummaries: signal([]),
     model: signal({ groups: [], total: 0 }),
     pendingInkDelete: signal(null),
     restoreDeadline: signal(null),

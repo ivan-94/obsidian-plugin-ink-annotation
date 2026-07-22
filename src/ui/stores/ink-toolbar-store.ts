@@ -51,7 +51,7 @@ export function createInkToolbarStore(preference: InkToolPreference): InkToolbar
           : { ...preference.toolbarPosition, dragged: true },
       saveError: null,
       selectedCount: 0,
-      statusText: 'Ink Mode',
+      statusText: 'Markup',
       tool: preference.tool,
       width: preference.width,
       zoomMode: preference.zoomMode ?? 'fit',

@@ -1,10 +1,23 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { InkSurfaceRecord } from '../domain/ink-surface';
 import { InkDocumentSnapshotRepository } from './ink-document-snapshot-repository';
 import type { TextFileStore } from './sidecar-repository';
 
 describe('InkDocumentSnapshotRepository', () => {
+  it('publishes the authoritative snapshot after a successful replacement', async () => {
+    const onSnapshotChanged = vi.fn();
+    const repository = new InkDocumentSnapshotRepository(new RecordingTextFileStore(), {
+      onSnapshotChanged,
+    });
+    const saved = snapshot('published');
+
+    await repository.replace(saved);
+
+    expect(onSnapshotChanged).toHaveBeenCalledOnce();
+    expect(onSnapshotChanged).toHaveBeenCalledWith(saved);
+  });
+
   it('replaces one canonical snapshot without reading or comparing the previous value', async () => {
     const store = new RecordingTextFileStore();
     const repository = new InkDocumentSnapshotRepository(store);
@@ -28,6 +41,29 @@ describe('InkDocumentSnapshotRepository', () => {
     const repository = new InkDocumentSnapshotRepository(new RecordingTextFileStore());
 
     await expect(repository.read('Ink.md')).resolves.toBeNull();
+  });
+
+  it('tombstones and restores the authoritative snapshot without exposing legacy Ink again', async () => {
+    const repository = new InkDocumentSnapshotRepository(new RecordingTextFileStore());
+    await repository.replace(snapshot('saved'));
+
+    const deleted = await repository.tombstone('Ink.md', '2026-07-21T02:00:00.000Z');
+
+    expect(deleted).toMatchObject({
+      deletedAt: '2026-07-21T02:00:00.000Z',
+      strokes: [{ id: 'saved' }],
+      updatedAt: '2026-07-21T02:00:00.000Z',
+    });
+    await expect(repository.read('Ink.md')).resolves.toEqual(deleted);
+
+    const restored = await repository.restore('Ink.md', '2026-07-21T02:01:00.000Z');
+
+    expect(restored.deletedAt).toBeUndefined();
+    expect(restored).toMatchObject({
+      strokes: [{ id: 'saved' }],
+      updatedAt: '2026-07-21T02:01:00.000Z',
+    });
+    await expect(repository.read('Ink.md')).resolves.toEqual(restored);
   });
 
   it('resolves an external snapshot event back to its validated note path', async () => {

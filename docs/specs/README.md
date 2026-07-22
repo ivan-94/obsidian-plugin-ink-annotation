@@ -20,6 +20,10 @@ Inkstone Annotations plugin.
 - [Ink responsive commands, save, and Preview](2026-07-20-ink-responsive-commands-save-and-preview.md)
 - [Ink retained tile scene and Worker rasterization](2026-07-20-ink-retained-tile-scene-and-worker-rasterization.md)
 - [Ink simple snapshot persistence](2026-07-21-ink-simple-snapshot-persistence.md)
+- [Ink semantic layers and transform-only interactions](2026-07-21-ink-semantic-layers-and-transform-only-interactions.md)
+- [Ink shared scene, deterministic layout, and atomic camera](2026-07-21-ink-shared-scene-layout-and-atomic-camera.md)
+- [Ink iPad immediate usability patch](2026-07-22-ink-ipad-immediate-usability-patch.md)
+- [Snapshot Annotation capture and markup](2026-07-22-snapshot-annotation-capture-and-markup.md)
 - [Entire Vault demand-bounded local index and automated Gate](2026-07-19-entire-vault-demand-bounded-index.md)
 - [Preact UI architecture refactor specification](2026_07_15_refactor_to_preact.md)
 
@@ -71,6 +75,10 @@ are no longer valid sources of truth.
 - `docs/specs/2026-07-20-ink-responsive-commands-save-and-preview.md`
 - `docs/specs/2026-07-20-ink-retained-tile-scene-and-worker-rasterization.md`
 - `docs/specs/2026-07-21-ink-simple-snapshot-persistence.md`
+- `docs/specs/2026-07-21-ink-semantic-layers-and-transform-only-interactions.md`
+- `docs/specs/2026-07-21-ink-shared-scene-layout-and-atomic-camera.md`
+- `docs/specs/2026-07-22-ink-ipad-immediate-usability-patch.md`
+- `docs/specs/2026-07-22-snapshot-annotation-capture-and-markup.md`
 - `docs/specs/2026-07-19-entire-vault-demand-bounded-index.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`
 - `docs/specs/2026-07-15-preact-execution-plan-update.md`
@@ -97,6 +105,22 @@ are no longer valid sources of truth.
 - The 2026-07-21 simple-snapshot specification replaces concurrent multi-surface persistence with
   memory-first editing, one Last-Done-Wins `ink.json`, and an optional one-record idle draft. Legacy
   bounded surfaces become read-only migration input.
+- The 2026-07-21 semantic-layer specification rejects a broad GPU cutover for current interaction
+  defects. It keeps accepted Canvas/tile/Active paths, makes selection drag transform-only, and
+  requires complete staged tile replacement for undo, redo, and destructive eraser commands.
+- The 2026-07-21 shared-scene specification keeps Canvas2D, reuses one retained History Scene across
+  Preview/Edit, batches bounded work inside a frame budget, freezes macOS/iPadOS Ink layout metrics,
+  strictly contains pane overlays, and atomically publishes visual/input camera transforms.
+- The 2026-07-22 iPad immediate-usability specification pauses that architectural expansion for the
+  current release. It limits work to four independently reversible patches: bounded first
+  presentation, layout-neutral Preview containment, one shared Preview/Edit origin calibration, and
+  a post-zoom camera-ready input fence. It changes no canonical schema or Logical Stroke
+  coordinates.
+- The 2026-07-22 Snapshot Annotation specification replaces new persistent freehand creation over
+  live Markdown with immutable viewport capture plus semantic source anchors. Capture is a
+  replaceable backend: the core desktop vertical slice starts with Electron, later Slices add
+  open-source and self-developed DOM backends, and physical-iPad acceptance selects platform
+  defaults before cutover. Legacy document-world Ink remains readable and exportable.
 - Supporting design images moved with the plan so all relative references remain repository-local.
 
 ### Verification evidence

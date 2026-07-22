@@ -15,7 +15,7 @@ export interface AnnotationListItemModel {
   readonly capabilities: readonly AnnotationCapability[];
   readonly id: string;
   readonly key: string;
-  readonly kind: 'highlight' | 'ink' | 'note' | 'underline';
+  readonly kind: 'highlight' | 'ink' | 'note' | 'snapshot' | 'underline';
   readonly leading:
     | { readonly icon: string; readonly kind: 'icon'; readonly styleId?: string }
     | { readonly kind: 'thumbnail'; readonly source: string };
@@ -200,6 +200,8 @@ function annotationKindIcon(kind: AnnotationIndexEntry['type']): string {
       return 'waves';
     case 'note':
       return 'message-square-text';
+    case 'snapshot':
+      return 'camera';
     case 'underline':
       return 'underline';
   }

@@ -2,7 +2,12 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { VaultAnnotationIndex, type AnnotationIndexEntry } from '../domain/vault-annotation-index';
+import {
+  snapshotSummaryToIndexEntry,
+  VaultAnnotationIndex,
+  type AnnotationIndexEntry,
+} from '../domain/vault-annotation-index';
+import type { SnapshotAnnotationSummary } from '../domain/snapshot-annotation-summary';
 import { createVaultSidebarStore } from './stores/annotation-sidebar-store';
 import { VaultAnnotationSidebar } from './vault-annotation-sidebar';
 
@@ -206,12 +211,78 @@ describe('Entire Vault annotation sidebar', () => {
     expect(opened).toEqual(['row-actions']);
   });
 
+  it('renders a Vault Snapshot as a large preview card with its complete action menu', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const summary = snapshotSummary();
+    const index = new VaultAnnotationIndex();
+    index.rebuild([snapshotSummaryToIndexEntry(summary, 'note-snapshot')]);
+    const preview = vi.fn();
+    const source = vi.fn();
+    const edit = vi.fn();
+    const exported = vi.fn();
+    const deleted = vi.fn();
+    const sidebar = new VaultAnnotationSidebar({
+      container,
+      document,
+      index,
+      loadSnapshotThumbnail: () => Promise.resolve('data:image/png;base64,c25hcHNob3Q='),
+      onDeleteSnapshot: deleted,
+      onEditSnapshot: edit,
+      onExportSnapshot: exported,
+      onPreviewSnapshot: preview,
+      onSelectSnapshotSource: source,
+    });
+
+    sidebar.showReady();
+
+    const card = container.querySelector<HTMLElement>(
+      '[data-inkstone-vault-snapshot-id="snapshot-vault"]',
+    );
+    expect(card).not.toBeNull();
+    expect(Number.parseFloat(card?.style.height ?? '0')).toBeGreaterThan(100);
+    expect(card?.textContent).toContain('3 strokes');
+    await vi.waitFor(() =>
+      expect(card?.querySelector<HTMLImageElement>('img')?.src).toContain('data:image/png'),
+    );
+
+    card?.querySelector<HTMLButtonElement>('[aria-label^="Preview Snapshot"]')?.click();
+    expect(card?.querySelector('[aria-label^="Jump to Snapshot source"]')).toBeNull();
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T08:00:00.000Z',
+      'Go to source',
+    );
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T08:00:00.000Z',
+      'Edit Snapshot',
+    );
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T08:00:00.000Z',
+      'Export Snapshot PNG',
+    );
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T08:00:00.000Z',
+      'Delete Snapshot',
+    );
+
+    expect(preview).toHaveBeenCalledOnce();
+    expect(source).toHaveBeenCalledOnce();
+    expect(edit).toHaveBeenCalledOnce();
+    expect(exported).toHaveBeenCalledOnce();
+    expect(deleted).toHaveBeenCalledOnce();
+  });
+
   it('applies and removes a visible type filter chip', () => {
     const container = document.createElement('div');
     const index = new VaultAnnotationIndex();
     index.rebuild([
       entry('highlight', 'Highlight row'),
       { ...entry('underline', 'Underline row'), type: 'underline' },
+      snapshotSummaryToIndexEntry(snapshotSummary(), 'note-snapshot'),
     ]);
     const sidebar = new VaultAnnotationSidebar({ container, document, index });
     sidebar.showReady();
@@ -261,7 +332,7 @@ describe('Entire Vault annotation sidebar', () => {
     sidebar.showReady();
 
     const type = container.querySelector<HTMLSelectElement>('select[aria-label="Filter by type"]');
-    expect([...(type?.options ?? [])].map((option) => option.textContent)).toContain('Ink');
+    expect([...(type?.options ?? [])].map((option) => option.textContent)).toContain('Legacy Ink');
     if (type === null) throw new Error('Expected type filter.');
     type.value = 'ink';
     type.dispatchEvent(new Event('change', { bubbles: true }));
@@ -938,6 +1009,7 @@ describe('Entire Vault annotation sidebar', () => {
       onExport: (entries) => exports.push(entries.map((item) => item.id)),
     });
     sidebar.showReady();
+    clickActionMenuItem(container, 'More actions', 'Export results…');
     const type = container.querySelector<HTMLSelectElement>('select[aria-label="Filter by type"]');
     if (type === null) {
       throw new Error('Expected type filter.');
@@ -954,7 +1026,7 @@ describe('Entire Vault annotation sidebar', () => {
       ?.click();
     container.querySelector<HTMLButtonElement>('button[aria-label="Export selected"]')?.click();
 
-    expect(exports).toEqual([['underline'], ['highlight']]);
+    expect(exports).toEqual([['highlight', 'underline'], ['underline'], ['highlight']]);
   });
 });
 
@@ -989,5 +1061,23 @@ function entry(id: string, quote: string): AnnotationIndexEntry {
     tags: [],
     type: 'highlight',
     updatedAt: '2026-07-14T08:00:00.000Z',
+  };
+}
+
+function snapshotSummary(): SnapshotAnnotationSummary {
+  return {
+    capturedAt: '2026-07-22T08:00:00.000Z',
+    filePath: 'Notes/Snapshot.md',
+    headingPath: ['Lists and callout'],
+    id: 'snapshot-vault',
+    linkState: 'linked',
+    logicalHeight: 900,
+    logicalWidth: 1200,
+    revision: 2,
+    sourceOrder: 40,
+    status: 'active',
+    strokeCount: 3,
+    thumbnailKey: 'snapshot:vault:2',
+    updatedAt: '2026-07-22T08:05:00.000Z',
   };
 }

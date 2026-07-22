@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { SharedInkStrokeGeometry } from './ink-shared-stroke-geometry';
 import type { InkSurfaceRecord } from './ink-surface';
@@ -95,6 +95,18 @@ describe('Ink surface summary brush compatibility', () => {
     expect(summary.thumbnailSvg.match(/data-ink-stroke-id=/gu)).toHaveLength(64);
     expect(summary.thumbnailSvg).toContain('data-ink-stroke-id="stroke-0"');
     expect(summary.thumbnailSvg).toContain('data-ink-stroke-id="stroke-199"');
+  });
+
+  it('compiles immutable single-surface thumbnail geometry only once', () => {
+    const record = physicalSurface();
+    const compile = vi.spyOn(SharedInkStrokeGeometry.prototype, 'compile');
+
+    summarizeInkSurface(record);
+    const firstProjectionCompileCount = compile.mock.calls.length;
+    summarizeInkSurface(record);
+
+    expect(firstProjectionCompileCount).toBeGreaterThan(0);
+    expect(compile).toHaveBeenCalledTimes(firstProjectionCompileCount);
   });
 });
 

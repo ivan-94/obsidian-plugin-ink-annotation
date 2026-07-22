@@ -2,6 +2,7 @@ import { batch } from '@preact/signals';
 
 import type { CurrentFileAnnotationList } from '../domain/current-file-annotation-list';
 import type { InkSurfaceSummary } from '../domain/ink-surface-summary';
+import type { SnapshotAnnotationSummary } from '../domain/snapshot-annotation-summary';
 import {
   CurrentFileSidebarApp,
   type CurrentFileSidebarAppProps,
@@ -26,6 +27,10 @@ export class CurrentFileSidebar {
   private readonly island: UiIsland<CurrentFileSidebarAppProps> =
     createPreactIsland(CurrentFileSidebarApp);
   private mounted = false;
+  private suppressAutoFollowUntil = 0;
+  private readonly markSidebarInteraction = (): void => {
+    this.suppressAutoFollowUntil = Date.now() + 1_200;
+  };
   private readonly onBulkAddTags: (
     selection: readonly CurrentBulkSelectionEntry[],
     tags: readonly string[],
@@ -44,7 +49,6 @@ export class CurrentFileSidebar {
   ) => Promise<void>;
   private readonly onDeleteAnnotation: (annotationId: string, expectedRevision: number) => void;
   private readonly onDeleteInk: (surfaceId: string, expectedRevision: number) => void;
-  private readonly onEditInk: (surfaceId: string) => void;
   private readonly onEntireVault: () => void | Promise<void>;
   private readonly onExportCurrentFile: (invoker: HTMLElement) => void;
   private readonly onExportInkPng: (surfaceId: string) => void;
@@ -59,6 +63,15 @@ export class CurrentFileSidebar {
   private readonly onRestoreInk: (surfaceId: string, expectedRevision: number) => void;
   private readonly onSelect: (annotationId: string) => void;
   private readonly onSelectInk: (summary: InkSurfaceSummary) => void;
+  private readonly onDeleteSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onEditSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onExportSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onPreviewSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onRelinkSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onRestoreSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onSelectSnapshotSource: (summary: SnapshotAnnotationSummary) => void;
+  private readonly loadSnapshotThumbnail:
+    ((summary: SnapshotAnnotationSummary) => Promise<string | null>) | undefined;
   private readonly showScope: boolean;
   private readonly state: CurrentFileSidebarStore;
   private readonly styleOptions: readonly SelectOption[];
@@ -87,7 +100,6 @@ export class CurrentFileSidebar {
     readonly onInspect?: (annotationId: string, invoker: HTMLElement) => void;
     readonly onRepairAnnotation?: (annotationId: string, invoker: HTMLElement) => void;
     readonly onDeleteInk?: (surfaceId: string, expectedRevision: number) => void;
-    readonly onEditInk?: (surfaceId: string) => void;
     readonly onExportInkPng?: (surfaceId: string) => void;
     readonly onExportInkReport?: () => void;
     readonly onExportInkSvg?: (surfaceId: string) => void;
@@ -99,11 +111,22 @@ export class CurrentFileSidebar {
     readonly onRestoreAnnotation?: (annotationId: string, expectedRevision: number) => void;
     readonly onSelect: (annotationId: string) => void;
     readonly onSelectInk?: (summary: InkSurfaceSummary) => void;
+    readonly onDeleteSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onEditSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onExportSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onPreviewSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onRelinkSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onRestoreSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onSelectSnapshotSource?: (summary: SnapshotAnnotationSummary) => void;
+    readonly loadSnapshotThumbnail?: (summary: SnapshotAnnotationSummary) => Promise<string | null>;
     readonly showScope?: boolean;
     readonly state?: CurrentFileSidebarStore;
     readonly styleOptions?: readonly SelectOption[];
   }) {
     this.container = input.container;
+    for (const eventName of ['keydown', 'pointerenter', 'scroll', 'touchstart', 'wheel']) {
+      this.container.addEventListener(eventName, this.markSidebarInteraction, { passive: true });
+    }
     this.document = input.document;
     this.headerContainer = input.headerContainer;
     this.onBulkAddTags = input.onBulkAddTags ?? (() => Promise.resolve({ failed: [] }));
@@ -113,7 +136,6 @@ export class CurrentFileSidebar {
     this.onBulkExport = input.onBulkExport ?? (() => Promise.resolve());
     this.onDeleteAnnotation = input.onDeleteAnnotation ?? (() => undefined);
     this.onDeleteInk = input.onDeleteInk ?? (() => undefined);
-    this.onEditInk = input.onEditInk ?? (() => undefined);
     this.onEntireVault = input.onEntireVault ?? (() => undefined);
     this.onExportCurrentFile = input.onExportCurrentFile ?? (() => undefined);
     this.onExportInkPng = input.onExportInkPng ?? (() => undefined);
@@ -127,6 +149,14 @@ export class CurrentFileSidebar {
     this.onRestoreInk = input.onRestoreInk ?? (() => undefined);
     this.onSelect = input.onSelect;
     this.onSelectInk = input.onSelectInk ?? (() => undefined);
+    this.onDeleteSnapshot = input.onDeleteSnapshot ?? (() => undefined);
+    this.onEditSnapshot = input.onEditSnapshot ?? (() => undefined);
+    this.onExportSnapshot = input.onExportSnapshot ?? (() => undefined);
+    this.onPreviewSnapshot = input.onPreviewSnapshot ?? (() => undefined);
+    this.onRelinkSnapshot = input.onRelinkSnapshot ?? (() => undefined);
+    this.onRestoreSnapshot = input.onRestoreSnapshot ?? (() => undefined);
+    this.onSelectSnapshotSource = input.onSelectSnapshotSource ?? (() => undefined);
+    this.loadSnapshotThumbnail = input.loadSnapshotThumbnail;
     this.showScope = input.showScope ?? true;
     this.state = input.state ?? createCurrentFileSidebarStore();
     this.styleOptions = input.styleOptions ?? [];
@@ -139,13 +169,20 @@ export class CurrentFileSidebar {
       readIssueCount: 0,
     },
     inkSummaries: readonly InkSurfaceSummary[] = [],
+    snapshotSummaries: readonly SnapshotAnnotationSummary[] = [],
   ): void {
     batch(() => {
       this.state.errorMessage.value = null;
       this.state.model.value = model;
       this.state.inkSummaries.value = inkSummaries;
+      this.state.snapshotSummaries.value = snapshotSummaries;
       this.state.storageHealth.value = health;
-      this.state.restoreDeadline.value = nextRestoreDeadline(model, inkSummaries, Date.now());
+      this.state.restoreDeadline.value = nextRestoreDeadline(
+        model,
+        inkSummaries,
+        snapshotSummaries,
+        Date.now(),
+      );
       this.state.status.value = 'ready';
     });
     this.renderIsland();
@@ -165,6 +202,18 @@ export class CurrentFileSidebar {
       if (active) candidate.setAttribute('aria-current', 'true');
       else candidate.removeAttribute('aria-current');
     }
+    if (Date.now() >= this.suppressAutoFollowUntil) {
+      row.scrollIntoView?.({ block: 'nearest' });
+    }
+    return true;
+  }
+
+  selectSnapshot(snapshotId: string): boolean {
+    const row = [
+      ...this.container.querySelectorAll<HTMLElement>('[data-inkstone-snapshot-id]'),
+    ].find((candidate) => candidate.dataset.inkstoneSnapshotId === snapshotId);
+    if (row === undefined) return false;
+    this.state.activeSnapshotId.value = snapshotId;
     row.scrollIntoView?.({ block: 'nearest' });
     return true;
   }
@@ -173,6 +222,9 @@ export class CurrentFileSidebar {
     this.state.scrollOffset.value = this.container.scrollTop;
     this.island.unmount();
     this.mounted = false;
+    for (const eventName of ['keydown', 'pointerenter', 'scroll', 'touchstart', 'wheel']) {
+      this.container.removeEventListener(eventName, this.markSidebarInteraction);
+    }
   }
 
   renderFailure(message: string): void {
@@ -195,7 +247,6 @@ export class CurrentFileSidebar {
       onBulkExport: this.onBulkExport,
       onDeleteAnnotation: this.onDeleteAnnotation,
       onDeleteInk: this.onDeleteInk,
-      onEditInk: this.onEditInk,
       onEntireVault: this.onEntireVault,
       onExportCurrentFile: this.onExportCurrentFile,
       onExportInkPng: this.onExportInkPng,
@@ -211,6 +262,16 @@ export class CurrentFileSidebar {
       onRestoreInk: this.onRestoreInk,
       onSelect: this.onSelect,
       onSelectInk: this.onSelectInk,
+      onDeleteSnapshot: this.onDeleteSnapshot,
+      onEditSnapshot: this.onEditSnapshot,
+      onExportSnapshot: this.onExportSnapshot,
+      onPreviewSnapshot: this.onPreviewSnapshot,
+      onRelinkSnapshot: this.onRelinkSnapshot,
+      onRestoreSnapshot: this.onRestoreSnapshot,
+      onSelectSnapshotSource: this.onSelectSnapshotSource,
+      ...(this.loadSnapshotThumbnail === undefined
+        ? {}
+        : { loadSnapshotThumbnail: this.loadSnapshotThumbnail }),
       showScope: this.showScope,
       state: this.state,
       styleOptions: this.styleOptions,
@@ -233,11 +294,13 @@ export class CurrentFileSidebar {
 function nextRestoreDeadline(
   model: CurrentFileAnnotationList,
   inkSummaries: readonly InkSurfaceSummary[],
+  snapshotSummaries: readonly SnapshotAnnotationSummary[],
   now: number,
 ): number | null {
   const deadlines = [
     ...model.groups.flatMap((group) => group.rows).flatMap((row) => deadline(row.deletedAt)),
     ...inkSummaries.flatMap((summary) => deadline(summary.deletedAt)),
+    ...snapshotSummaries.flatMap((summary) => deadline(summary.deletedAt)),
   ]
     .filter((value) => value > now)
     .sort((left, right) => left - right);

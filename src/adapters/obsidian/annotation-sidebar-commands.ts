@@ -42,7 +42,6 @@ export interface AnnotationSidebarCommands {
     surfaceId: string,
     expectedRevision: number,
   ) => Promise<void>;
-  readonly editInk: (filePath: string, surfaceId: string) => void;
   readonly exportCurrentFile: (filePath: string, invoker: HTMLElement) => void;
   readonly exportInkPng: (filePath: string, surfaceId: string) => Promise<void>;
   readonly exportInkReport: (filePath: string) => Promise<void>;

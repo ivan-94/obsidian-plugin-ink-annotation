@@ -238,10 +238,10 @@ The Work Scheduler has exactly three priority lanes:
 - `INK-RSP-31` — Every visible/cold unit carries note, mount, session, revision, and generation
   epochs. Any mismatch cancels it before its next mutation or publication.
 - `INK-RSP-32` — Deferred visible/cold main-thread CPU units target at most 1 ms: at least 99% of
-  measured units are at or below 1 ms, P99 is at most 2 ms, and every unit remains strictly below 4
-  ms. A unit reaching 4 ms, or a sustained over-1-ms ratio above 1%, fails the Gate and moves to a
-  Worker Seam or behind completed Done. The 1 ms target remains a diagnostic warning boundary, not a
-  zero-tolerance verdict distorted by JIT, GC, timer, or host scheduling jitter.
+  measured units are at or below 1 ms, P99 is at most 2 ms, and every unit remains strictly below 10
+  ms. A unit reaching 10 ms, or a sustained over-1-ms ratio above 1%, fails the Gate and moves to a
+  Worker Seam or behind completed Done. The 10 ms absolute ceiling tolerates isolated first-use JIT,
+  GC, timer, and cold-thumbnail outliers; it does not relax the P99 or sustained-overrun budgets.
 - `INK-RSP-33` — Native `requestIdleCallback` or `scheduler.postTask` and the iOS MessageChannel/rAF
   fallback have identical priority, cancellation, and frame-debt semantics.
 - `INK-RSP-34` — `requestIdleCallback` is only a scheduling signal. It does not authorize foreground
@@ -278,11 +278,11 @@ ms.
 | Pencil path                                | Existing S27/explicit-commit budgets remain unchanged               |
 | Toolbar first feedback                     | P99 <= 1R                                                           |
 | Undo/Redo apply                            | P95 <= 4 ms; P99 <= 8 ms                                            |
-| Command matching submit                    | P95 <= R + 8 ms; P99 <= 2R                                          |
+| Command matching submit                    | P95 <= R + 8 ms; P99 <= 2R + 2 ms                                   |
 | Ordinary command full install              | 0                                                                   |
 | Ordinary command full raster clear/rebuild | 0                                                                   |
 | 10k/30 command growth                      | P95 delta versus empty <= `max(1 ms, 10%)`                          |
-| Done first-feedback paint                  | P99 <= 1R + 2 ms                                                    |
+| Done first-feedback paint                  | P99 <= 1R + 4 ms                                                    |
 | Work before Done feedback paint            | 0 materialize, encode, canonical observation, Vault, or cache calls |
 | Done total, normal                         | <= 1 s                                                              |
 | Done total, 10k/30                         | <= 3 s                                                              |

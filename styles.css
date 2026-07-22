@@ -2,7 +2,7 @@
  * Inkstone CSS architecture
  * 1. tokens: shared component variables
  * 2. base/primitives: icons, focus, and reusable control behavior
- * 3. features: annotation rendering, sidebar, floating surfaces, and Ink
+ * 3. features: annotation rendering, sidebar, floating surfaces, and Snapshot markup
  *
  * Obsidian consumes this single production stylesheet directly. Section boundaries are deliberately
  * comments rather than CSS cascade layers so the established theme-specific specificity remains
@@ -401,7 +401,6 @@
 .inkstone-sidebar :is(button, input, select, textarea):focus-visible,
 .inkstone-annotation-inspector :is(button, input, select, textarea):focus-visible,
 .inkstone-ink-controls :is(button, input, select, textarea):focus-visible,
-.inkstone-ink-rebase-dialog :is(button, input, select, textarea):focus-visible,
 .inkstone-export-dialog :is(button, input, select, textarea):focus-visible,
 .inkstone-conflict-dialog :is(button, input, select, textarea):focus-visible {
   outline: 2px solid var(--interactive-accent);
@@ -426,6 +425,9 @@
 .inkstone-annotation-sidebar-view {
   container-name: inkstone-sidebar;
   container-type: inline-size;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
   padding: 0 !important;
   overflow: hidden;
 }
@@ -453,6 +455,9 @@
   display: grid;
   position: relative;
   box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   gap: 10px;
   align-content: start;
   min-height: 100%;
@@ -534,6 +539,8 @@
 
 [data-inkstone-sidebar-scope-content] {
   height: 100%;
+  min-width: 0;
+  max-width: 100%;
   min-height: 0;
   padding: 0;
 }
@@ -1372,6 +1379,8 @@
 
 .inkstone-sidebar-group {
   display: grid;
+  min-width: 0;
+  max-width: 100%;
   gap: 8px;
 }
 
@@ -2143,60 +2152,7 @@
   }
 }
 
-/* S10 single fixed Ink surface. The canvas never participates in document layout. */
-.inkstone-ink-host {
-  isolation: isolate;
-}
-
-.inkstone-ink-host.is-ink-fit {
-  overflow-x: hidden;
-}
-
-.inkstone-ink-workspace {
-  width: var(--inkstone-ink-logical-width);
-  min-height: var(--inkstone-ink-logical-height);
-  max-width: none;
-  margin-inline: auto;
-  zoom: var(--inkstone-ink-scale, 1);
-}
-
-.markdown-preview-view.is-readable-line-width .markdown-preview-sizer.inkstone-ink-workspace {
-  width: var(--inkstone-ink-logical-width);
-  max-width: none;
-}
-
-/* features / imperative Canvas and Preact Ink Toolbar */
-.inkstone-ink-surface {
-  inset: 0 auto auto 0;
-  overflow: hidden;
-  position: fixed;
-  pointer-events: none;
-  z-index: 8;
-}
-
-.inkstone-ink-surface.is-ink-presentation-handoff {
-  transition: opacity 140ms cubic-bezier(0.22, 1, 0.36, 1);
-  will-change: opacity;
-}
-
-.inkstone-ink-surface.is-ink-presentation-entering,
-.inkstone-ink-surface.is-ink-presentation-leaving {
-  opacity: 0;
-  pointer-events: none;
-}
-
-.inkstone-ink-active-stack {
-  inset: 0;
-  position: absolute;
-  pointer-events: none;
-}
-
-.inkstone-ink-canvas {
-  inset: 0;
-  position: absolute;
-  pointer-events: none;
-}
-
+/* features / Snapshot markup toolbar */
 .inkstone-ink-controls {
   --inkstone-ink-control-size: 36px;
   align-items: center;
@@ -2335,18 +2291,8 @@
   font-variant-numeric: tabular-nums;
 }
 
-.is-ink-mode .inkstone-ink-controls {
+.is-snapshot-markup-mode .inkstone-ink-controls {
   display: flex;
-}
-
-.is-ink-mode .inkstone-ink-workspace {
-  outline: 1px solid color-mix(in srgb, var(--interactive-accent) 38%, transparent);
-  outline-offset: -1px;
-}
-
-.is-ink-mode .inkstone-ink-surface {
-  outline: 1px solid color-mix(in srgb, var(--interactive-accent) 22%, transparent);
-  outline-offset: -1px;
 }
 
 .inkstone-ink-controls button {
@@ -2686,6 +2632,12 @@
   }
 }
 
+@container inkstone-sidebar (max-width: 280px) {
+  .inkstone-snapshot-masonry {
+    column-count: 1;
+  }
+}
+
 @media (max-width: 600px) {
   .inkstone-ink-controls {
     top: auto;
@@ -2717,6 +2669,18 @@
   }
 }
 
+body.is-mobile .inkstone-ink-controls {
+  top: auto;
+  right: max(8px, env(safe-area-inset-right));
+  bottom: max(8px, env(safe-area-inset-bottom));
+  left: max(8px, env(safe-area-inset-left));
+  max-width: calc(
+    100vw - max(8px, env(safe-area-inset-left)) - max(8px, env(safe-area-inset-right))
+  );
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
 .inkstone-ink-controls [hidden] {
   display: none !important;
 }
@@ -2735,50 +2699,336 @@
   box-shadow: var(--shadow-s);
 }
 
-.view-action[data-inkstone-ink-action='true'] {
-  position: relative;
-}
-
-.view-action[data-inkstone-ink-action='true'].is-preview {
-  color: var(--interactive-accent);
-  background: color-mix(in srgb, var(--interactive-accent) 11%, transparent);
-}
-
-.view-action[data-inkstone-ink-action='true'].is-active,
-.view-action[data-inkstone-ink-action='true'].is-active:hover {
-  color: var(--text-on-accent);
-  background: var(--interactive-accent);
-  box-shadow: inset 0 0 0 1px
-    color-mix(in srgb, var(--interactive-accent) 72%, var(--background-modifier-border));
-}
-
-.view-action[data-inkstone-ink-action='true'].has-hidden-ink::after {
-  content: '';
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 6px;
-  height: 6px;
-  background: var(--interactive-accent);
-  border: 1px solid var(--background-primary);
-  border-radius: 50%;
-}
-
-.view-action[data-inkstone-ink-action='true'].is-pending {
+/* features / bounded Snapshot Annotation editor */
+[data-inkstone-snapshot-action].is-pending {
   color: var(--interactive-accent);
   background: var(--background-modifier-hover);
-  box-shadow: inset 0 0 0 1px
-    color-mix(in srgb, var(--interactive-accent) 35%, var(--background-modifier-border));
   pointer-events: none;
 }
 
-.view-action[data-inkstone-ink-action='true'].is-pending svg {
+[data-inkstone-snapshot-action].is-pending svg {
   animation: inkstone-spin 800ms linear infinite;
 }
 
-.view-action[data-inkstone-ink-action='true'].is-error {
-  color: var(--text-error);
-  background: color-mix(in srgb, var(--background-modifier-error) 12%, transparent);
+.inkstone-snapshot-editor {
+  position: fixed;
+  z-index: var(--layer-modal);
+  inset: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  color: var(--text-normal);
+  background: var(--background-secondary);
+}
+
+body.is-frameless:not(.is-fullscreen):not(.is-mobile) .inkstone-snapshot-editor {
+  top: calc(var(--titlebar-height) / var(--zoom-factor));
+}
+
+body.is-frameless.is-hidden-frameless:not(.is-fullscreen):not(.is-mobile)
+  .inkstone-snapshot-editor {
+  top: calc(var(--header-height) - 1px);
+}
+
+body.is-mobile .inkstone-snapshot-editor {
+  --inkstone-snapshot-mobile-safe-top: max(24px, env(safe-area-inset-top));
+  box-sizing: border-box;
+  padding-top: var(--inkstone-snapshot-mobile-safe-top);
+}
+
+.inkstone-snapshot-editor__header {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: color-mix(in srgb, var(--background-primary) 92%, transparent);
+  box-shadow: 0 1px 8px rgb(0 0 0 / 6%);
+}
+
+.inkstone-snapshot-editor__close {
+  display: grid;
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  min-height: 40px;
+  flex: 0 0 40px;
+  place-items: center;
+  padding: 0;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-m);
+  box-shadow: none;
+}
+
+.inkstone-snapshot-editor__close:hover,
+.inkstone-snapshot-editor__close:focus-visible {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.inkstone-snapshot-editor__close > svg {
+  width: 20px;
+  height: 20px;
+}
+
+.inkstone-snapshot-editor__title {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inkstone-snapshot-editor__status {
+  max-width: min(34vw, 320px);
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inkstone-snapshot-editor__read-only {
+  min-height: 32px;
+  flex: 0 0 auto;
+  padding: 0 10px;
+  color: var(--interactive-accent);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  background: color-mix(in srgb, var(--interactive-accent) 10%, var(--background-primary));
+  border: 1px solid color-mix(in srgb, var(--interactive-accent) 32%, transparent);
+  border-radius: 999px;
+  box-shadow: none;
+}
+
+.inkstone-snapshot-editor__read-only:hover,
+.inkstone-snapshot-editor__read-only:focus-visible {
+  background: color-mix(in srgb, var(--interactive-accent) 16%, var(--background-primary));
+}
+
+.inkstone-snapshot-editor__viewport {
+  position: relative;
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+.inkstone-snapshot-editor__frame {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--inkstone-snapshot-width);
+  overflow: hidden;
+  aspect-ratio: var(--inkstone-snapshot-aspect);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  box-shadow:
+    0 18px 48px rgb(0 0 0 / 16%),
+    0 2px 8px rgb(0 0 0 / 8%);
+}
+
+.inkstone-snapshot-editor__frame > img,
+.inkstone-snapshot-editor__frame > canvas {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  inset: 0;
+}
+
+.inkstone-snapshot-editor__text-button {
+  min-height: 36px;
+}
+
+.inkstone-snapshot-editor__back-dialog {
+  position: absolute;
+  z-index: 5;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  gap: 14px;
+  width: min(420px, calc(100vw - 32px));
+  padding: 20px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-l);
+  background: var(--background-primary);
+  box-shadow: var(--shadow-l);
+  transform: translate(-50%, -50%);
+}
+
+.inkstone-snapshot-editor__back-dialog > p {
+  margin: 0;
+}
+
+.inkstone-snapshot-editor__back-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.inkstone-snapshot-card {
+  position: relative;
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 132px;
+  overflow: hidden;
+  background: var(--background-secondary);
+  border: 1px solid var(--inkstone-sidebar-card-border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-s);
+}
+
+.inkstone-snapshot-masonry {
+  min-width: 0;
+  max-width: 100%;
+  column-count: 2;
+  column-gap: 8px;
+}
+
+.inkstone-snapshot-row {
+  display: inline-block;
+  width: 100%;
+  margin-bottom: 8px;
+  break-inside: avoid;
+  vertical-align: top;
+}
+
+.inkstone-snapshot-card:hover {
+  border-color: color-mix(
+    in srgb,
+    var(--interactive-accent) 28%,
+    var(--inkstone-sidebar-card-border)
+  );
+}
+
+.inkstone-snapshot-card.is-active {
+  border-color: color-mix(in srgb, var(--interactive-accent) 58%, transparent);
+  box-shadow:
+    inset 3px 0 var(--interactive-accent),
+    var(--shadow-s);
+}
+
+.inkstone-snapshot-card__thumbnail {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  padding: 0;
+  color: var(--text-muted);
+  border: 0;
+  border-radius: inherit;
+  background: var(--background-secondary);
+  box-shadow: none;
+}
+
+.inkstone-snapshot-card__thumbnail > img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.inkstone-snapshot-card__summary {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  display: inline-flex;
+  min-height: 30px;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 9px;
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  border: 1px solid color-mix(in srgb, var(--background-modifier-border) 80%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--background-primary) 88%, transparent);
+  box-shadow: var(--shadow-s);
+  text-align: start;
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+  user-select: none;
+}
+
+.inkstone-snapshot-card__summary > svg {
+  width: 15px;
+  height: 15px;
+  color: var(--text-muted);
+}
+
+.inkstone-snapshot-card__actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: inline-grid;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  place-items: center;
+  padding: 0;
+  color: var(--text-normal);
+  border: 1px solid color-mix(in srgb, var(--background-modifier-border) 80%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--background-primary) 88%, transparent) !important;
+  box-shadow: var(--shadow-s);
+  backdrop-filter: blur(8px);
+}
+
+.inkstone-snapshot-source-pulse {
+  animation: inkstone-snapshot-source-pulse 900ms ease-out;
+}
+
+@keyframes inkstone-snapshot-source-pulse {
+  0%,
+  35% {
+    background: color-mix(in srgb, var(--interactive-accent) 24%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+  }
+  100% {
+    background: transparent;
+    box-shadow: none;
+  }
+}
+
+.inkstone-snapshot-editor__frame > img {
+  object-fit: fill;
+  pointer-events: none;
+  user-select: none;
+}
+
+.inkstone-snapshot-editor__frame > canvas {
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.inkstone-snapshot-editor__frame > canvas[data-inkstone-snapshot-interaction='select'] {
+  cursor: grab;
+}
+
+.inkstone-snapshot-editor__frame > canvas[data-inkstone-snapshot-interaction='select'].is-panning {
+  cursor: grabbing;
+}
+
+@media (max-width: 600px) {
+  .inkstone-snapshot-editor__header {
+    padding-inline: 8px;
+  }
+
+  .inkstone-snapshot-editor__status {
+    display: none;
+  }
 }
 
 @keyframes inkstone-spin {
@@ -2787,72 +3037,25 @@
   }
 }
 
-.inkstone-ink-rebase-dialog {
-  position: fixed;
-  z-index: var(--layer-modal);
-  top: 50%;
-  left: 50%;
-  display: grid;
-  gap: 12px;
-  width: min(520px, calc(100vw - 32px));
-  max-height: calc(100dvh - 32px);
-  padding: 18px;
-  overflow: auto;
-  color: var(--text-normal);
-  background: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-l);
-  box-shadow: var(--shadow-l);
-  transform: translate(-50%, -50%);
-}
-
-.inkstone-ink-rebase-dialog > h2,
-.inkstone-ink-rebase-dialog > p {
-  margin: 0;
-}
-
-.inkstone-ink-rebase-dialog > label {
-  display: grid;
-  gap: 6px;
-  font-weight: var(--font-semibold);
-}
-
-.inkstone-ink-rebase-dialog > canvas {
-  width: 100%;
-  max-height: 280px;
-  background: var(--background-secondary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-s);
-}
-
-.inkstone-ink-rebase-dialog__status {
-  min-height: 1.4em;
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-}
-
-.inkstone-ink-rebase-dialog__actions {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .inkstone-quick-toolbar {
     transition: none;
   }
 
-  .inkstone-ink-controls,
-  .inkstone-ink-surface {
+  .inkstone-ink-controls {
     scroll-behavior: auto;
     transition: none;
   }
 
-  .view-action[data-inkstone-ink-action='true'].is-pending svg {
+  [data-inkstone-snapshot-action].is-pending svg {
     animation: none;
   }
 
   .inkstone-sidebar__loading-icon > svg {
+    animation: none;
+  }
+
+  .inkstone-snapshot-source-pulse {
     animation: none;
   }
 }

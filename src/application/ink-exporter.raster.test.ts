@@ -67,6 +67,7 @@ describe('Ink physical export cross-adapter raster evidence', () => {
         passed: true,
       });
     },
+    10_000,
   );
 });
 

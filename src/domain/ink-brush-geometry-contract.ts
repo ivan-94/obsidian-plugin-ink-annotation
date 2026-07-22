@@ -1032,7 +1032,25 @@ function containsExtents(
   maximumX: number,
   maximumY: number,
 ): boolean {
-  const epsilon = Number.EPSILON * 64;
+  // `bounds.width`/`height` are produced by subtracting extrema and the right/bottom edges are
+  // reconstructed by adding them again. At normal document coordinates that round-trip can lose
+  // more than an absolute `Number.EPSILON`, even though both values describe the same canonical
+  // extent. Scale the tolerance by the compared coordinate magnitude so the check rejects real
+  // geometric under-coverage without rejecting ordinary IEEE-754 round-off.
+  const epsilon =
+    Number.EPSILON *
+    64 *
+    Math.max(
+      1,
+      Math.abs(bounds.x),
+      Math.abs(bounds.y),
+      Math.abs(bounds.x + bounds.width),
+      Math.abs(bounds.y + bounds.height),
+      Math.abs(minimumX),
+      Math.abs(minimumY),
+      Math.abs(maximumX),
+      Math.abs(maximumY),
+    );
   return (
     bounds.x <= minimumX + epsilon &&
     bounds.y <= minimumY + epsilon &&

@@ -1,10 +1,11 @@
 import type { InkCompiledBrushGeometry } from './ink-brush-geometry-contract';
 import { SharedInkStrokeGeometry } from './ink-shared-stroke-geometry';
 import { joinInkStrokeSurfaceFragments } from './ink-surface-layout';
-import { assertInkSurfaceRecord, type InkSurfaceRecord } from './ink-surface';
+import { assertInkSurfaceRecord, type InkStroke, type InkSurfaceRecord } from './ink-surface';
 
 const SHARED_GEOMETRY = new SharedInkStrokeGeometry();
 const MAX_THUMBNAIL_STROKES = 64;
+const THUMBNAIL_GEOMETRY_BY_STROKE = new WeakMap<InkStroke, InkCompiledBrushGeometry>();
 
 export interface InkSurfaceSummary {
   readonly conflict?: boolean;
@@ -142,9 +143,13 @@ function compileThumbnailScene(
   // TypeScript does not observe the assignment performed inside flatMap above.
   const surfaceOrigin = currentOrigin as unknown as number;
   const maximumY = surfaceOrigin + record.layout.logicalHeight;
-  const visibleStrokes = joinInkStrokeSurfaceFragments(fragments).filter((stroke) =>
-    strokeIntersectsVerticalRange(stroke, surfaceOrigin, maximumY),
-  );
+  const canReuseCanonicalStrokeIdentity =
+    ordered.length === 1 &&
+    surfaceOrigin === 0 &&
+    record.strokes.every((stroke) => stroke.linkedStrokeId === undefined);
+  const visibleStrokes = (
+    canReuseCanonicalStrokeIdentity ? record.strokes : joinInkStrokeSurfaceFragments(fragments)
+  ).filter((stroke) => strokeIntersectsVerticalRange(stroke, surfaceOrigin, maximumY));
   return {
     bounds: {
       height: record.layout.logicalHeight,
@@ -176,7 +181,13 @@ function compileThumbnailStrokes(
   strokes: InkSurfaceRecord['strokes'],
 ): readonly InkCompiledBrushGeometry[] {
   return sampleThumbnailStrokes(strokes.filter((stroke) => stroke.tool !== 'eraser')).map(
-    (stroke) => requireThumbnailGeometry(SHARED_GEOMETRY.compile(stroke)),
+    (stroke) => {
+      const cached = THUMBNAIL_GEOMETRY_BY_STROKE.get(stroke);
+      if (cached !== undefined) return cached;
+      const compiled = requireThumbnailGeometry(SHARED_GEOMETRY.compile(stroke));
+      THUMBNAIL_GEOMETRY_BY_STROKE.set(stroke, compiled);
+      return compiled;
+    },
   );
 }
 

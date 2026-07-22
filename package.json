@@ -1,30 +1,24 @@
 {
   "name": "inkstone-annotations",
   "version": "0.1.0",
-  "description": "Text and ink annotations for mutable Markdown in Obsidian.",
+  "description": "Text annotations and snapshot markup for mutable Markdown in Obsidian.",
   "engines": {
     "node": ">=20.19.0"
   },
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "npm run typecheck && node esbuild.config.mjs production && npm run check:mobile",
-    "build:physical-hat": "npm run typecheck && INKSTONE_UNPUBLISHED_PHYSICAL_INK_HAT=1 node esbuild.config.mjs production physical-hat && npm run check:mobile",
-    "build:local-performance-gate": "npm run typecheck && INKSTONE_LOCAL_PERFORMANCE_GATE=1 node esbuild.config.mjs production local-performance-gate && npm run check:mobile",
+    "build": "npm run typecheck && node esbuild.config.mjs production && npm run check:mobile && npm run check:retired-document-ink",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run test:performance && npm run build",
     "check:mobile": "node scripts/check-mobile-bundle.mjs",
+    "check:retired-document-ink": "node scripts/check-retired-document-ink.mjs",
     "dev": "node esbuild.config.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "gate:ink-local-obsidian": "node scripts/ink-local-obsidian-performance-gate.mjs",
     "install:dev": "node scripts/install-dev.mjs",
     "lint": "eslint .",
-    "measure:scale": "node scripts/run-scale-harness.mjs",
-    "measure:ink-baseline": "node scripts/run-ink-performance-baseline.mjs",
-    "prepare:physical-scale": "node scripts/run-physical-scale-fixture.mjs",
     "package:rc": "npm run check && node scripts/package-release.mjs && node scripts/verify-release-lifecycle.mjs",
     "prototype:s01": "node scripts/serve-prototype.mjs prototypes/s01-ui",
-    "prototype:s09": "node scripts/build-s09-prototype.mjs && node scripts/serve-prototype.mjs prototypes/s09-ink-spike",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage --exclude 'src/**/*.performance.test.ts'",
     "test:performance": "vitest run performance --coverage=false --maxWorkers=1",
@@ -50,6 +44,7 @@
   },
   "dependencies": {
     "@preact/signals": "^2.9.3",
+    "html-to-image": "1.11.13",
     "preact": "^10.29.7"
   }
 }

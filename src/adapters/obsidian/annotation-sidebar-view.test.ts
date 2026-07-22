@@ -3,7 +3,11 @@
 import type * as Obsidian from 'obsidian';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { VaultAnnotationIndex } from '../../domain/vault-annotation-index';
+import {
+  snapshotSummaryToIndexEntry,
+  VaultAnnotationIndex,
+} from '../../domain/vault-annotation-index';
+import { createSnapshotAnnotationSummaryFromIndexEntry } from '../../domain/snapshot-annotation-summary';
 import type { InkSurfaceRecord } from '../../domain/ink-surface';
 import { splitInkStrokeIntoSurfaceFragments } from '../../domain/ink-surface-layout';
 import { summarizeInkSurface } from '../../domain/ink-surface-summary';
@@ -54,7 +58,6 @@ describe('Annotation sidebar scope switching', () => {
         bulkDelete: () => Promise.resolve({ failed: [], succeeded: [] }),
         deleteAnnotation: () => Promise.resolve(),
         deleteInk: () => Promise.resolve(),
-        editInk: () => undefined,
         exportCurrentFile: () => undefined,
         exportInkPng: () => Promise.resolve(),
         exportInkReport: () => Promise.resolve(),
@@ -193,6 +196,63 @@ describe('Annotation sidebar scope switching', () => {
     await vi.waitFor(() => expect(inkRow?.textContent).toContain('2 strokes'));
     expect(container.querySelector('[data-inkstone-ink-row="surface-1"]')).toBe(inkRow);
     expect(container.querySelector('[data-annotation-id="text-1"]')).toBe(textRow);
+  });
+
+  it('keeps readable text annotations available when an Ink thumbnail cannot be compiled', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const issue = vi.fn();
+    const thumbnailFailure = new Error('Unsupported Ink Brush Geometry');
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: { ...sidebarCommands(), issue },
+      inkRepository: {
+        listSurfaceSummaries: () => Promise.reject(thumbnailFailure),
+      } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({
+            conflicts: [],
+            issues: [],
+            model: {
+              groups: [
+                {
+                  kind: 'heading' as const,
+                  rows: [
+                    {
+                      id: 'text-survives-ink-thumbnail-failure',
+                      marker: { kind: 'highlight' as const, styleId: 'highlight-sun' },
+                      notePreview: null,
+                      position: 0,
+                      quote: 'Readable text annotation',
+                      revision: 1,
+                      status: 'active' as const,
+                      tags: [],
+                      updatedAt: '2026-07-21T10:00:00.000Z',
+                    },
+                  ],
+                  title: 'Document',
+                },
+              ],
+              total: 1,
+            },
+          }),
+      } as never,
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {
+        rebuild: () => Promise.resolve({ indexed: 0, issues: [] }),
+        restoreCached: () => Promise.resolve(0),
+      } as never,
+    });
+
+    await view.onOpen();
+
+    expect(
+      container.querySelector('[data-annotation-id="text-survives-ink-thumbnail-failure"]'),
+    ).not.toBeNull();
+    expect(container.textContent).not.toContain("Couldn't read annotations locally.");
+    expect(container.textContent).toContain("1 file couldn't be read");
+    expect(issue).toHaveBeenCalledWith(thumbnailFailure);
   });
 
   it('replaces a fragment thumbnail with the repository joined note summary immediately', async () => {
@@ -400,7 +460,6 @@ describe('Annotation sidebar scope switching', () => {
         bulkDelete: () => Promise.resolve({ failed: [], succeeded: [] }),
         deleteAnnotation: () => Promise.resolve(),
         deleteInk: () => Promise.resolve(),
-        editInk: () => undefined,
         exportCurrentFile: () => undefined,
         exportInkPng: () => Promise.resolve(),
         exportInkReport: () => Promise.resolve(),
@@ -561,7 +620,6 @@ describe('Annotation sidebar scope switching', () => {
         bulkDelete: () => Promise.resolve({ failed: [], succeeded: [] }),
         deleteAnnotation: () => Promise.resolve(),
         deleteInk: () => Promise.resolve(),
-        editInk: () => undefined,
         exportCurrentFile: () => undefined,
         exportInkPng: () => Promise.resolve(),
         exportInkReport: () => Promise.resolve(),
@@ -858,6 +916,85 @@ describe('Annotation sidebar scope switching', () => {
     await view.onClose();
   });
 
+  it('shows a newly committed Snapshot immediately after its path-explicit mutation refresh', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    let entries: readonly ReturnType<typeof snapshotIndexEntry>[] = [];
+    const listIndexEntries = vi.fn(() => Promise.resolve(entries));
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: sidebarCommands(),
+      inkRepository: { listSurfaceSummaries: () => Promise.resolve([]) } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      snapshots: {
+        readSource: () => Promise.resolve('# Test'),
+        repository: { listIndexEntries },
+      },
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {
+        rebuild: () => Promise.resolve({ indexed: 0, issues: [], status: 'committed' }),
+        restoreCached: () => Promise.resolve(0),
+      } as never,
+    });
+    await view.onOpen();
+    expect(container.querySelector('[data-inkstone-snapshot-id="snapshot-new"]')).toBeNull();
+
+    entries = [snapshotIndexEntry()];
+    await view.refreshAfterCanonicalMutation('Note.md');
+
+    expect(container.querySelector('[data-inkstone-snapshot-id="snapshot-new"]')).not.toBeNull();
+    expect(listIndexEntries).toHaveBeenCalledTimes(2);
+    await view.onClose();
+  });
+
+  it('rebuilds an open Entire Vault view after a path-explicit Snapshot mutation', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const index = new VaultAnnotationIndex();
+    index.rebuild([]);
+    let includeSnapshot = false;
+    const rebuild = vi.fn(() => {
+      index.rebuild(
+        includeSnapshot
+          ? [
+              snapshotSummaryToIndexEntry(
+                createSnapshotAnnotationSummaryFromIndexEntry(snapshotIndexEntry(), '# Test'),
+                'note-1',
+              ),
+            ]
+          : [],
+      );
+      return Promise.resolve({ indexed: index.snapshot().length, issues: [], status: 'committed' });
+    });
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: sidebarCommands(),
+      inkRepository: { listSurfaceSummaries: () => Promise.resolve([]) } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      stylePresets: [],
+      vaultIndex: index,
+      vaultIndexBuilder: { rebuild, restoreCached: () => Promise.resolve(0) } as never,
+    });
+    await view.onOpen();
+    clickScope(container, 'Entire Vault');
+    await vi.waitFor(() => expect(rebuild).toHaveBeenCalledTimes(1));
+    expect(container.querySelector('[data-inkstone-vault-snapshot-id="snapshot-new"]')).toBeNull();
+
+    includeSnapshot = true;
+    await view.refreshAfterCanonicalMutation('Note.md');
+
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(
+      container.querySelector('[data-inkstone-vault-snapshot-id="snapshot-new"]'),
+    ).not.toBeNull();
+    await view.onClose();
+  });
+
   it('does not let an older Current file refresh repaint a row after deletion', async () => {
     const container = document.createElement('div');
     document.body.append(container);
@@ -955,7 +1092,6 @@ describe('Annotation sidebar scope switching', () => {
         bulkDelete: () => Promise.resolve({ failed: [], succeeded: [] }),
         deleteAnnotation: () => Promise.resolve(),
         deleteInk: () => Promise.resolve(),
-        editInk: () => undefined,
         exportCurrentFile: () => undefined,
         exportInkPng: () => Promise.resolve(),
         exportInkReport: () => Promise.resolve(),
@@ -1093,7 +1229,6 @@ function sidebarCommands() {
     bulkDelete: () => Promise.resolve({ failed: [], succeeded: [] }),
     deleteAnnotation: () => Promise.resolve(),
     deleteInk: () => Promise.resolve(),
-    editInk: () => undefined,
     exportCurrentFile: () => undefined,
     exportInkPng: () => Promise.resolve(),
     exportInkReport: () => Promise.resolve(),
@@ -1108,6 +1243,34 @@ function sidebarCommands() {
     restoreAnnotation: () => Promise.resolve(),
     restoreDeleted: () => Promise.resolve({ failed: [] }),
     restoreInk: () => Promise.resolve(),
+  };
+}
+
+function snapshotIndexEntry() {
+  const target = {
+    position: { end: 6, start: 0, unit: 'utf16-code-unit' as const },
+    quote: { exact: '# Test', prefix: '', suffix: '' },
+    scope: { headingPath: ['Test'] },
+    sourceRevision: 'source-a',
+  };
+  return {
+    assetSha256: 'a'.repeat(64),
+    capturedAt: '2026-07-22T05:00:00.000Z',
+    filePath: 'Note.md',
+    id: 'snapshot-new',
+    logicalHeight: 200,
+    logicalWidth: 300,
+    revision: 1,
+    schemaVersion: 1 as const,
+    source: {
+      coverage: [target],
+      focus: target,
+      headingPath: ['Test'],
+      sourceRevision: 'source-a',
+    },
+    status: 'active' as const,
+    strokeCount: 1,
+    updatedAt: '2026-07-22T05:01:00.000Z',
   };
 }
 

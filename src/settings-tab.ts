@@ -14,17 +14,6 @@ export class InkstoneSettingTab extends PluginSettingTab {
     this.containerEl.empty();
 
     new Setting(this.containerEl)
-      .setName('Show Ink preview by default')
-      .setDesc(
-        'Open notes with saved Ink in a read-only fixed-width preview. Turn this off to keep Obsidian Reading View raw until Ink editing starts.',
-      )
-      .addToggle((toggle) => {
-        toggle
-          .setValue(this.plugin.getSettings().showInkPreviewByDefault)
-          .onChange(async (enabled) => this.plugin.setShowInkPreviewByDefault(enabled));
-      });
-
-    new Setting(this.containerEl)
       .setName('Diagnostics')
       .setDesc(
         'Keep local timing samples. Annotation text, ink points, and file paths are never logged.',
@@ -33,23 +22,6 @@ export class InkstoneSettingTab extends PluginSettingTab {
         toggle
           .setValue(this.plugin.getSettings().diagnosticsEnabled)
           .onChange(async (enabled) => this.plugin.setDiagnosticsEnabled(enabled));
-      });
-
-    new Setting(this.containerEl)
-      .setName('Ink presentation renderer')
-      .setDesc(
-        'Main Canvas 2D is the verified fallback. Worker OffscreenCanvas 2D is an experimental S27 bake-off Adapter and applies after reloading the plugin.',
-      )
-      .addDropdown((dropdown) => {
-        dropdown
-          .addOption('main-canvas-2d', 'Main Canvas 2D')
-          .addOption('worker-offscreen-2d', 'Worker OffscreenCanvas 2D (experimental)')
-          .setValue(this.plugin.getSettings().inkPresentationAdapter)
-          .onChange(async (value) =>
-            this.plugin.setInkPresentationAdapter(
-              value === 'worker-offscreen-2d' ? 'worker-offscreen-2d' : 'main-canvas-2d',
-            ),
-          );
       });
 
     for (const preset of this.plugin.getSettings().stylePresets) {

@@ -6,7 +6,6 @@ import { ListItemFrame } from './list-item-frame';
 export function InkAnnotationListItem({
   model,
   onDeleteRequest,
-  onEdit,
   onExportPng,
   onExportSvg,
   onRestore,
@@ -15,7 +14,6 @@ export function InkAnnotationListItem({
 }: {
   readonly model: AnnotationListItemModel;
   readonly onDeleteRequest: () => void;
-  readonly onEdit: () => void;
   readonly onExportPng: () => void;
   readonly onExportSvg: () => void;
   readonly onRestore: () => void;
@@ -36,7 +34,6 @@ export function InkAnnotationListItem({
     <InkActions
       model={model}
       onDeleteRequest={onDeleteRequest}
-      onEdit={onEdit}
       onExportPng={onExportPng}
       onExportSvg={onExportSvg}
     />
@@ -57,7 +54,7 @@ export function InkAnnotationListItem({
         ? {}
         : {
             selection: {
-              label: `Select Ink ${model.id}`,
+              label: `Select Legacy Ink ${model.id}`,
               onToggle: selection.onToggle,
               selected: selection.selected,
             },
@@ -69,13 +66,11 @@ export function InkAnnotationListItem({
 function InkActions({
   model,
   onDeleteRequest,
-  onEdit,
   onExportPng,
   onExportSvg,
 }: {
   readonly model: AnnotationListItemModel;
   readonly onDeleteRequest: () => void;
-  readonly onEdit: () => void;
   readonly onExportPng: () => void;
   readonly onExportSvg: () => void;
 }) {
@@ -84,18 +79,17 @@ function InkActions({
       className="inkstone-icon-button inkstone-list-item__action-trigger"
       dataAttributes={{ 'data-inkstone-ink-actions': model.id }}
       items={[
-        { icon: 'pen-line', id: 'edit', onSelect: onEdit, title: 'Edit' },
         { icon: 'file-code-2', id: 'export-svg', onSelect: onExportSvg, title: 'Export SVG' },
         { icon: 'image-down', id: 'export-png', onSelect: onExportPng, title: 'Export PNG' },
         {
           icon: 'trash-2',
           id: 'delete',
           onSelect: onDeleteRequest,
-          title: 'Delete Ink surface…',
+          title: 'Delete Legacy Ink surface…',
           warning: true,
         },
       ]}
-      label={`Open Ink actions for ${model.title}`}
+      label={`Open Legacy Ink actions for ${model.title}`}
     />
   );
 }

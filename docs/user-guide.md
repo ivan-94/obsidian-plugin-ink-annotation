@@ -27,19 +27,22 @@ v1；不要用旧版插件打开未来版本已经迁移的数据，除非该版
 - 锚点无法唯一恢复时会显示为
   `unanchored`，不会静默绑定到猜测文本。使用 Inspector 的 repair 流程预览并确认新目标。
 
-## Ink Mode
+## 截图涂鸦
 
-- 运行 `Toggle Ink Mode` 进入或退出；`Exit Ink Mode` 可强制退出。
-- 支持 Pen、Highlighter、整笔 Eraser、Color、Width、Undo、Redo。
-- Ink 绑定到有界 Markdown section surface。版式变化时可能进入
-  `needs-rebase`，必须预览并确认；取消不会覆盖原 vector 数据。
-- 本设备最后使用的工具、颜色和粗细保存在设备 local storage，不通过 iCloud 同步。
+- 在 Reading
+  View 使用相机入口截取当前可见内容，随后在稳定图片上涂鸦；Markdown 后续排版变化不会移动图片上的笔迹。
+- 支持 Pen、Highlighter、整笔 Eraser、Color、Width、Undo、Redo，以及缩放和平移画布。
+- 完成后，截图、笔迹与 Markdown 锚点一同写入 Vault-local sidecar；Current file 会立即出现对应卡片。
+- 点击卡片进入只读预览，再点击画布或 `Edit` 进入编辑。Entire Vault 可跨文件搜索并定位截图涂鸦。
+- 旧版 Live Markdown Ink 已停止创建和编辑。已有旧 Ink
+  sidecar 不会被删除，仍可在侧栏中只读查看元数据并导出。
 
 ## 侧栏与导出
 
 - `Open annotations for current file` 打开侧栏；可切换当前文件和 Entire Vault。
-- 当前文件支持文字标注和 Ink 缩略图、定位、编辑、删除/恢复和导出。
-- Entire Vault 会懒加载文字与 Ink 的派生索引。Ink 只进入标题、状态、revision、stroke
+- 当前文件支持文字标注、截图涂鸦缩略图、定位、编辑、删除/恢复和导出；旧版 Ink 仅保留读取与导出兼容。
+- Entire
+  Vault 会懒加载文字、截图涂鸦与旧版 Ink 的派生索引。旧版 Ink 只进入标题、状态、revision、stroke
   count 等列表元数据，vector
   points 与缩略图 SVG 不会进入全库索引。可搜索、筛选、定位、复制、按 revision 安全删除，并与文字记录一起导出；批量标签和样式只适用于文字记录。
 - 发现同一文字标注或 Ink surface 的 iCloud 同 revision 冲突时，侧栏会显示
@@ -55,8 +58,5 @@ v1；不要用旧版插件打开未来版本已经迁移的数据，除非该版
 
 ## 本地诊断
 
-诊断默认关闭。显式启用后可运行 `Show diagnostics` 查看本地 timing；在 Ink
-Mode 绘制时还会显示最近最多 240 个 input-to-paint 样本的 P50、P95、最大值和样本数。运行
-`Capture memory diagnostics checkpoint` 可在空闲、长文档、Entire Vault 或 Ink
-Mode 状态记录 Chromium 暴露的 JS heap MB 值。若当前 Obsidian runtime 不支持
-`performance.memory`，插件会明确显示 unavailable。诊断不记录正文、路径、笔迹 points，也不会上传数据。
+诊断默认关闭。显式启用后可运行 `Show diagnostics`
+查看本地 timing。诊断不记录正文、路径、笔迹 points，也不会上传数据。
