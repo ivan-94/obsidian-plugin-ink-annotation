@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { MarkdownView } from 'obsidian';
+import { MarkdownView, type TFile } from 'obsidian';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { SnapshotCaptureBackend } from './snapshot-capture-backend';
@@ -70,6 +70,135 @@ describe('Snapshot Annotation desktop core flow', () => {
 
     await expect(manager.reopen('Notes/Test.md', 'snapshot-sidebar')).resolves.toBe(true);
     expect(document.querySelector('[data-inkstone-snapshot-editor]')).not.toBeNull();
+    manager.dispose();
+  });
+
+  it('opens the Snapshot note before going to its source from the Entire Vault sidebar', async () => {
+    document.body.replaceChildren();
+    const pngBytes = pngHeader(600, 400);
+    const session = await SnapshotAnnotationSession.create({
+      backend: { id: 'fake', version: '1' },
+      capturedAt: '2026-07-22T00:00:00.000Z',
+      filePath: 'Notes/Test.md',
+      id: 'snapshot-go-to-source',
+      logicalHeight: 200,
+      logicalWidth: 300,
+      noteId: 'note-a',
+      pixelHeight: 400,
+      pixelRatio: 2,
+      pixelWidth: 600,
+      pngBytes,
+      source: {
+        coverage: [target()],
+        focus: target(),
+        headingPath: ['Test'],
+        sourceRevision: 'source-a',
+      },
+    });
+    const repository = new SnapshotAnnotationRepository(new MemorySnapshotFileStore());
+    await repository.create(session.snapshot().record, pngBytes);
+    const contentEl = document.createElement('div');
+    const sizer = document.createElement('div');
+    sizer.className = 'markdown-preview-sizer';
+    const heading = document.createElement('h1');
+    heading.textContent = 'Test';
+    const scrollIntoView = vi.fn();
+    heading.scrollIntoView = scrollIntoView;
+    sizer.append(heading);
+    contentEl.append(sizer);
+    const file = { path: 'Notes/Test.md' } as TFile;
+    const view = Object.assign(Object.create(MarkdownView.prototype) as MarkdownView, {
+      contentEl,
+      file,
+      getMode: () => 'preview' as const,
+    });
+    const openFile = vi.fn(() => Promise.resolve());
+    const manager = new ObsidianSnapshotAnnotationManager({
+      app: {
+        vault: {
+          cachedRead: () => Promise.resolve('# Test'),
+          getFileByPath: () => file,
+        },
+        workspace: {
+          getActiveViewOfType: () => null,
+          getLeaf: () => ({ openFile, view }),
+        },
+      },
+      backendId: 'unused',
+      captureBackends: new SnapshotCaptureBackendRegistry([]),
+      createCaptureSubject: () => leaseSnapshotCaptureSubject({ kind: 'fake' }),
+      document,
+      editor: { dispose: vi.fn() } as unknown as SnapshotAnnotationEditor,
+      repository,
+      textRepository: { getOrCreateNote: vi.fn() },
+    });
+
+    await expect(manager.jumpToSource('Notes/Test.md', 'snapshot-go-to-source')).resolves.toBe(
+      true,
+    );
+    expect(openFile).toHaveBeenCalledWith(file);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'center' });
+    manager.dispose();
+  });
+
+  it('selects the Snapshot source when its note opens in an editing view', async () => {
+    document.body.replaceChildren();
+    const pngBytes = pngHeader(600, 400);
+    const session = await SnapshotAnnotationSession.create({
+      backend: { id: 'fake', version: '1' },
+      capturedAt: '2026-07-22T00:00:00.000Z',
+      filePath: 'Notes/Test.md',
+      id: 'snapshot-editing-source',
+      logicalHeight: 200,
+      logicalWidth: 300,
+      noteId: 'note-a',
+      pixelHeight: 400,
+      pixelRatio: 2,
+      pixelWidth: 600,
+      pngBytes,
+      source: {
+        coverage: [target()],
+        focus: target(),
+        headingPath: ['Test'],
+        sourceRevision: 'source-a',
+      },
+    });
+    const repository = new SnapshotAnnotationRepository(new MemorySnapshotFileStore());
+    await repository.create(session.snapshot().record, pngBytes);
+    const setSelection = vi.fn();
+    const scrollIntoView = vi.fn();
+    const view = Object.assign(Object.create(MarkdownView.prototype) as MarkdownView, {
+      contentEl: document.createElement('div'),
+      editor: {
+        offsetToPos: (offset: number) => ({ ch: offset, line: 0 }),
+        scrollIntoView,
+        setSelection,
+      },
+      file: { path: 'Notes/Test.md' },
+      getMode: () => 'source' as const,
+    });
+    const manager = new ObsidianSnapshotAnnotationManager({
+      app: {
+        vault: { cachedRead: () => Promise.resolve('# Test') },
+        workspace: { getActiveViewOfType: () => view },
+      },
+      backendId: 'unused',
+      captureBackends: new SnapshotCaptureBackendRegistry([]),
+      createCaptureSubject: () => leaseSnapshotCaptureSubject({ kind: 'fake' }),
+      document,
+      editor: { dispose: vi.fn() } as unknown as SnapshotAnnotationEditor,
+      repository,
+      textRepository: { getOrCreateNote: vi.fn() },
+    });
+
+    await expect(manager.jumpToSource('Notes/Test.md', 'snapshot-editing-source')).resolves.toBe(
+      true,
+    );
+    expect(setSelection).toHaveBeenCalledWith({ ch: 2, line: 0 }, { ch: 6, line: 0 });
+    expect(scrollIntoView).toHaveBeenCalledWith(
+      { from: { ch: 2, line: 0 }, to: { ch: 6, line: 0 } },
+      true,
+    );
     manager.dispose();
   });
 

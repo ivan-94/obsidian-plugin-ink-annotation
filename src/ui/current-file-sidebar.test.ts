@@ -459,6 +459,95 @@ describe('current-file sidebar', () => {
     });
   });
 
+  it('selects a Snapshot card instead of previewing it in Current file selection mode', async () => {
+    const container = document.createElement('div');
+    const preview = vi.fn();
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onPreviewSnapshot: preview,
+      onSelect: () => undefined,
+    });
+    sidebar.render({ groups: [], total: 0 }, undefined, [], [snapshotSummary()]);
+
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
+    await vi.waitFor(() =>
+      expect(
+        container.querySelector('button[role="checkbox"][aria-label="Select Snapshot snapshot-a"]'),
+      ).not.toBeNull(),
+    );
+
+    expect(
+      container
+        .querySelector('button[role="checkbox"][aria-label="Select Snapshot snapshot-a"]')
+        ?.getAttribute('aria-checked'),
+    ).toBe('false');
+    expect(container.querySelector('[data-inkstone-snapshot-actions]')).toBeNull();
+    container.querySelector<HTMLButtonElement>('.inkstone-snapshot-card__thumbnail')?.click();
+
+    expect(preview).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(
+        container
+          .querySelector('[data-inkstone-snapshot-id="snapshot-a"]')
+          ?.getAttribute('aria-selected'),
+      ).toBe('true');
+      expect(
+        container
+          .querySelector('button[role="checkbox"][aria-label="Select Snapshot snapshot-a"]')
+          ?.getAttribute('aria-checked'),
+      ).toBe('true');
+      expect(container.querySelector('.inkstone-bulk-action-dock')?.textContent).toContain(
+        '1 selected',
+      );
+    });
+  });
+
+  it('keeps text-only bulk actions disabled for a selected Snapshot', async () => {
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onSelect: () => undefined,
+    });
+    sidebar.render({ groups: [], total: 0 }, undefined, [], [snapshotSummary()]);
+
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
+    await vi.waitFor(() =>
+      expect(
+        container.querySelector<HTMLButtonElement>(
+          'button[role="checkbox"][aria-label="Select Snapshot snapshot-a"]',
+        ),
+      ).not.toBeNull(),
+    );
+    container
+      .querySelector<HTMLButtonElement>(
+        'button[role="checkbox"][aria-label="Select Snapshot snapshot-a"]',
+      )
+      ?.click();
+
+    await vi.waitFor(() =>
+      expect(container.querySelector('.inkstone-bulk-action-dock')?.textContent).toContain(
+        '1 selected',
+      ),
+    );
+    expect(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Tag selected"]')?.disabled,
+    ).toBe(true);
+    expect(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Style selected"]')?.disabled,
+    ).toBe(true);
+    expect(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Copy selected"]')?.disabled,
+    ).toBe(false);
+    expect(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Export selected"]')?.disabled,
+    ).toBe(false);
+    expect(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.disabled,
+    ).toBe(false);
+  });
+
   it('offers Current file selections the same five bulk actions', async () => {
     const copied: unknown[] = [];
     let finishCopy: (() => void) | undefined;
@@ -540,6 +629,7 @@ describe('current-file sidebar', () => {
       expect(container.querySelector('button[aria-label="Done selecting"]')).toBeNull();
       expect(container.querySelector('input[type="checkbox"]')).toBeNull();
       expect(container.querySelector('button[aria-label="More actions"]')).not.toBeNull();
+      expect(container.querySelector('[data-annotation-id="active-1"]')).toBeNull();
     });
   });
 
@@ -762,11 +852,13 @@ describe('current-file sidebar', () => {
     expect(container.querySelector('[aria-label="Delete Snapshot"]')).toBeNull();
 
     container.querySelector<HTMLButtonElement>('[aria-label^="Preview Snapshot"]')?.click();
-    const strokeCount = container.querySelector<HTMLElement>('[data-inkstone-snapshot-strokes]');
-    expect(strokeCount?.tagName).toBe('SPAN');
+    const strokeCount = container.querySelector<HTMLButtonElement>(
+      '[data-inkstone-snapshot-strokes]',
+    );
+    expect(strokeCount?.tagName).toBe('BUTTON');
     expect(container.querySelector('[aria-label^="Jump to Snapshot source"]')).toBeNull();
     strokeCount?.click();
-    expect(source).not.toHaveBeenCalled();
+    expect(source).toHaveBeenCalledOnce();
     clickActionMenuItem(
       container,
       'Open actions for Snapshot captured 2026-07-22T00:00:00.000Z',
@@ -788,10 +880,32 @@ describe('current-file sidebar', () => {
       'Delete Snapshot',
     );
     expect(preview).toHaveBeenCalledOnce();
-    expect(source).toHaveBeenCalledOnce();
+    expect(source).toHaveBeenCalledTimes(2);
     expect(edit).toHaveBeenCalledOnce();
     expect(exported).toHaveBeenCalledOnce();
     expect(deleted).toHaveBeenCalledOnce();
+  });
+
+  it('renders a visible source-state icon for a changed Snapshot source', () => {
+    const container = document.createElement('div');
+    const sidebar = new CurrentFileSidebar({
+      container,
+      document,
+      onSelect: () => undefined,
+    });
+
+    sidebar.render(
+      { groups: [], total: 0 },
+      undefined,
+      [],
+      [{ ...snapshotSummary(), linkState: 'source-changed' }],
+    );
+
+    const icon = container.querySelector<HTMLElement>(
+      '[data-inkstone-snapshot-strokes] [data-inkstone-icon]',
+    );
+    expect(icon?.dataset.inkstoneIcon).toBe('unlink');
+    expect(icon?.querySelector('svg')).not.toBeNull();
   });
 
   it('groups Snapshot cards into one masonry surface per heading', () => {

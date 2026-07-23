@@ -205,6 +205,13 @@ export class SidecarRepository {
     return reconciled;
   }
 
+  async readNoteMeta(filePath: string): Promise<NoteMeta | null> {
+    const normalizedPath = normalizeVaultPath(filePath);
+    const pathHash = await hashText(normalizedPath);
+    const contents = await this.store.read(`${SIDECAR_ROOT}/${pathHash}/meta.json`);
+    return contents === null ? null : decodeNoteMeta(contents, normalizedPath, pathHash);
+  }
+
   async reconcileObservedRename(input: {
     readonly newPath: string;
     readonly now: string;
@@ -504,10 +511,16 @@ export class SidecarRepository {
       /^\.obsidian-annotations\/v1\/notes\/([a-f0-9]{64})\/annotations\/[^/]+\.json$/u.exec(
         normalizedSidecarPath,
       );
-    const pathHash = match?.[1];
-    if (pathHash === undefined) {
-      return null;
-    }
+    return match === null ? null : this.resolveFilePathForSidecar(normalizedSidecarPath);
+  }
+
+  /** Resolves any known note-owned sidecar without interpreting a derived filename as authority. */
+  async resolveFilePathForSidecar(sidecarPath: string): Promise<string | null> {
+    const normalizedSidecarPath = sidecarPath.replaceAll('\\', '/');
+    const pathHash = /^\.obsidian-annotations\/v1\/notes\/([a-f0-9]{64})(?:\/|$)/u.exec(
+      normalizedSidecarPath,
+    )?.[1];
+    if (pathHash === undefined) return null;
 
     try {
       const contents = await this.store.read(`${SIDECAR_ROOT}/${pathHash}/meta.json`);

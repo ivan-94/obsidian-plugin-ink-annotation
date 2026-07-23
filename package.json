@@ -12,15 +12,17 @@
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run test:performance && npm run build",
     "check:mobile": "node scripts/check-mobile-bundle.mjs",
     "check:retired-document-ink": "node scripts/check-retired-document-ink.mjs",
+    "check:vault-catalog-bounds": "node scripts/check-vault-catalog-bounds.mjs",
     "dev": "node esbuild.config.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "install:dev": "node scripts/install-dev.mjs",
+    "gate:vault-catalog-local": "node scripts/gate-vault-catalog-local.mjs",
     "lint": "eslint .",
     "package:rc": "npm run check && node scripts/package-release.mjs && node scripts/verify-release-lifecycle.mjs",
     "prototype:s01": "node scripts/serve-prototype.mjs prototypes/s01-ui",
-    "test": "vitest run",
-    "test:coverage": "vitest run --coverage --exclude 'src/**/*.performance.test.ts'",
+    "test": "vitest run --exclude 'src/**/*.gate.test.ts'",
+    "test:coverage": "vitest run --coverage --exclude 'src/**/*.performance.test.ts' --exclude 'src/**/*.gate.test.ts'",
     "test:performance": "vitest run performance --coverage=false --maxWorkers=1",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
@@ -44,6 +46,7 @@
   },
   "dependencies": {
     "@preact/signals": "^2.9.3",
+    "dexie": "4.4.4",
     "html-to-image": "1.11.13",
     "preact": "^10.29.7"
   }

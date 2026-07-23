@@ -262,6 +262,32 @@ describe('Snapshot Annotation editor lifecycle', () => {
     expect(document.querySelector('[data-inkstone-snapshot-editor]')).toBeNull();
   });
 
+  it('shows an explicit Close action on desktop and protects unsaved work', async () => {
+    document.body.replaceChildren();
+    const session = await sessionWithStroke();
+    const onClose = vi.fn();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext());
+    const editor = new SnapshotAnnotationEditor({
+      createObjectUrl: () => 'data:image/png;base64,fixture',
+      document,
+      revokeObjectUrl: () => undefined,
+    });
+    editor.open({
+      onClose,
+      onDone: () => Promise.resolve(),
+      pngBytes: pngHeader(600, 400),
+      session,
+    });
+
+    const close = document.querySelector<HTMLButtonElement>('[data-inkstone-snapshot-close]');
+    expect(close?.getAttribute('aria-label')).toBe('Close Snapshot editor');
+    close?.click();
+
+    expect(document.querySelector('[data-inkstone-snapshot-back-dialog]')).not.toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    editor.dispose();
+  });
+
   it('shows a touch-sized Close action inside the mobile safe header', async () => {
     document.body.replaceChildren();
     document.body.classList.add('is-mobile');

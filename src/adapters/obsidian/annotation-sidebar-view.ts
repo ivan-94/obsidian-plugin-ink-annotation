@@ -1,13 +1,15 @@
 import { ItemView, type WorkspaceLeaf } from 'obsidian';
 
 import type { AnnotationService } from '../../application/annotation-service';
+import type { VaultCatalogQueryPort } from '../../application/vault-catalog';
 import type { VaultIndexBuilder } from '../../application/vault-index-builder';
 import type { VaultAnnotationIndex } from '../../domain/vault-annotation-index';
 import {
   inkSummaryToIndexEntry,
+  snapshotIndexEntryToSummary,
   textRecordToIndexEntry,
 } from '../../domain/vault-annotation-index';
-import { annotationTargetText, type TextAnnotationRecord } from '../../domain/text-annotation';
+import { annotationTargetText } from '../../domain/text-annotation';
 import type { StylePreset } from '../../domain/style-preset';
 import type { CurrentFileAnnotationList } from '../../domain/current-file-annotation-list';
 import { CurrentFileSidebar } from '../../ui/current-file-sidebar';
@@ -71,9 +73,9 @@ export class AnnotationSidebarView extends ItemView {
   private readonly service: AnnotationService;
   private readonly snapshots:
     | {
-        readonly delete: (summary: SnapshotAnnotationSummary) => void;
+        readonly delete: (summary: SnapshotAnnotationSummary) => Promise<void>;
         readonly edit: (summary: SnapshotAnnotationSummary) => void;
-        readonly exportPng: (summary: SnapshotAnnotationSummary) => void;
+        readonly exportPng: (summary: SnapshotAnnotationSummary) => void | Promise<void>;
         readonly jump: (summary: SnapshotAnnotationSummary) => void;
         readonly preview: (summary: SnapshotAnnotationSummary) => void;
         readonly readSource: (filePath: string) => Promise<string>;
@@ -84,12 +86,16 @@ export class AnnotationSidebarView extends ItemView {
       }
     | undefined;
   private readonly stylePresets: readonly StylePreset[];
-  private readonly vaultIndex: VaultAnnotationIndex;
-  private readonly vaultIndexBuilder: VaultIndexBuilder;
-  private vaultBuildAbort: AbortController | null = null;
+  private readonly vaultCatalog: VaultCatalogQueryPort | undefined;
+  private readonly legacyVaultIndex: VaultAnnotationIndex | undefined;
+  private readonly legacyVaultIndexBuilder: VaultIndexBuilder | undefined;
+  private legacyVaultAbort: AbortController | null = null;
+  private legacyVaultFresh = false;
+  private legacyVaultRestoreAttempted = false;
+  private readonly closeVaultCatalog: () => void;
+  private readonly markVaultCatalogDirty: (filePath: string) => void;
+  private readonly requestVaultCatalogReconcile: () => void;
   private vaultComponent: VaultAnnotationSidebar | null = null;
-  private vaultIndexFresh = false;
-  private vaultRestoreAttempted = false;
   private vaultContentEl: HTMLElement | null = null;
   private vaultHeaderActionsEl: HTMLElement | null = null;
 
@@ -103,9 +109,9 @@ export class AnnotationSidebarView extends ItemView {
       >;
       readonly service: AnnotationService;
       readonly snapshots?: {
-        readonly delete?: (summary: SnapshotAnnotationSummary) => void;
+        readonly delete?: (summary: SnapshotAnnotationSummary) => Promise<void>;
         readonly edit?: (summary: SnapshotAnnotationSummary) => void;
-        readonly exportPng?: (summary: SnapshotAnnotationSummary) => void;
+        readonly exportPng?: (summary: SnapshotAnnotationSummary) => void | Promise<void>;
         readonly jump?: (summary: SnapshotAnnotationSummary) => void;
         readonly preview?: (summary: SnapshotAnnotationSummary) => void;
         readonly readSource: (filePath: string) => Promise<string>;
@@ -115,8 +121,12 @@ export class AnnotationSidebarView extends ItemView {
         readonly thumbnail?: (summary: SnapshotAnnotationSummary) => Promise<string | null>;
       };
       readonly stylePresets: readonly StylePreset[];
-      readonly vaultIndex: VaultAnnotationIndex;
-      readonly vaultIndexBuilder: VaultIndexBuilder;
+      readonly closeVaultCatalog?: () => void;
+      readonly markVaultCatalogDirty?: (filePath: string) => void;
+      readonly requestVaultCatalogReconcile?: () => void;
+      readonly vaultCatalog?: VaultCatalogQueryPort;
+      readonly vaultIndex?: VaultAnnotationIndex;
+      readonly vaultIndexBuilder?: VaultIndexBuilder;
     },
   ) {
     super(leaf);
@@ -132,7 +142,7 @@ export class AnnotationSidebarView extends ItemView {
       input.snapshots === undefined
         ? undefined
         : {
-            delete: input.snapshots.delete ?? (() => undefined),
+            delete: input.snapshots.delete ?? (() => Promise.resolve()),
             edit: input.snapshots.edit ?? (() => undefined),
             exportPng: input.snapshots.exportPng ?? (() => undefined),
             jump: input.snapshots.jump ?? (() => undefined),
@@ -144,8 +154,15 @@ export class AnnotationSidebarView extends ItemView {
             thumbnail: input.snapshots.thumbnail ?? (() => Promise.resolve(null)),
           };
     this.stylePresets = input.stylePresets;
-    this.vaultIndex = input.vaultIndex;
-    this.vaultIndexBuilder = input.vaultIndexBuilder;
+    this.vaultCatalog = input.vaultCatalog;
+    this.legacyVaultIndex = input.vaultIndex;
+    this.legacyVaultIndexBuilder = input.vaultIndexBuilder;
+    if (this.vaultCatalog === undefined && this.legacyVaultIndex === undefined) {
+      throw new Error('Annotation Sidebar requires a Vault Catalog.');
+    }
+    this.closeVaultCatalog = input.closeVaultCatalog ?? (() => undefined);
+    this.markVaultCatalogDirty = input.markVaultCatalogDirty ?? (() => undefined);
+    this.requestVaultCatalogReconcile = input.requestVaultCatalogReconcile ?? (() => undefined);
   }
 
   getViewType(): string {
@@ -173,8 +190,7 @@ export class AnnotationSidebarView extends ItemView {
         void this.refreshCurrentFile();
       },
       onRetryVault: () => {
-        this.vaultIndexFresh = false;
-        void this.refreshVaultIndex();
+        void this.refreshVaultCatalog();
       },
       onRestoreRecentDeletion: () => {
         void this.restoreRecentDeletion();
@@ -198,8 +214,9 @@ export class AnnotationSidebarView extends ItemView {
   }
 
   override onClose(): Promise<void> {
-    this.vaultBuildAbort?.abort();
-    this.vaultBuildAbort = null;
+    this.legacyVaultAbort?.abort();
+    this.legacyVaultAbort = null;
+    this.closeVaultCatalog();
     this.clearRecentDeletion();
     this.currentComponent?.dispose();
     this.currentComponent = null;
@@ -249,9 +266,10 @@ export class AnnotationSidebarView extends ItemView {
 
   async refreshAfterCanonicalSidecarChange(): Promise<void> {
     this.currentFileStale = true;
-    this.vaultIndexFresh = false;
+    this.legacyVaultFresh = false;
+    this.requestVaultCatalogReconcile();
     if (this.sidebarStore.scope.value === 'entire-vault') {
-      await this.refreshVaultIndex();
+      void this.refreshVaultCatalog();
       return;
     }
     await this.refreshCurrentFile();
@@ -259,12 +277,9 @@ export class AnnotationSidebarView extends ItemView {
 
   async refreshAfterCanonicalMutation(filePath: string): Promise<void> {
     const currentFilePath = this.commands.getCurrentFilePath();
-    this.vaultIndexFresh = false;
-    if (this.currentCache?.filePath === filePath || currentFilePath === filePath) {
-      this.currentFileStale = true;
-    }
+    this.markCanonicalMutation(filePath, currentFilePath);
     if (this.sidebarStore.scope.value === 'entire-vault') {
-      await this.refreshVaultIndex();
+      void this.refreshVaultCatalog();
       return;
     }
     if (
@@ -318,6 +333,7 @@ export class AnnotationSidebarView extends ItemView {
 
   private async showCurrentFile(): Promise<void> {
     this.sidebarStore.setScope('current-file');
+    this.closeVaultCatalog();
     if (this.currentComponent !== null) {
       if (
         this.currentFileStale ||
@@ -369,6 +385,7 @@ export class AnnotationSidebarView extends ItemView {
       },
       onBulkDelete: async (selection) => {
         const outcome = await this.commands.bulkDelete(selection);
+        this.markCanonicalMutations(outcome.succeeded);
         this.showRecentDeletion(outcome.succeeded);
         return {
           failed: selection.filter((item) =>
@@ -379,48 +396,80 @@ export class AnnotationSidebarView extends ItemView {
         };
       },
       onBulkExport: async (selection, invoker) => {
-        const entries = await Promise.all(
-          selection.map(async (item) => {
-            if (item.type !== 'ink') {
-              const [record] = await this.service.getAnnotationsById(item.filePath, [item.id]);
-              return record === undefined ? [] : [textRecordToIndexEntry(record)];
-            }
-            const [surface, loaded] = await Promise.all([
-              this.inkRepository.readSurface(item.filePath, item.id),
-              this.inkRepository.listSurfaces(item.filePath),
-            ]);
-            return surface === null
-              ? []
-              : [
-                  inkSummaryToIndexEntry(
-                    summarizeInkSurface(surface, { relatedRecords: loaded.records }),
-                    surface.noteId,
-                  ),
-                ];
+        const snapshotSelection = selection.filter((item) => item.type === 'snapshot');
+        await Promise.all(
+          snapshotSelection.map(async (item) => {
+            const summary = this.sidebarStore.current.snapshotSummaries
+              .peek()
+              .find(
+                (candidate) => candidate.filePath === item.filePath && candidate.id === item.id,
+              );
+            if (summary !== undefined) await this.snapshots?.exportPng(summary);
           }),
         );
-        this.commands.exportVaultEntries(entries.flat(), invoker);
+        const entries = await Promise.all(
+          selection
+            .filter((item) => item.type !== 'snapshot')
+            .map(async (item) => {
+              if (item.type !== 'ink') {
+                const [record] = await this.service.getAnnotationsById(item.filePath, [item.id]);
+                return record === undefined ? [] : [textRecordToIndexEntry(record)];
+              }
+              const [surface, loaded] = await Promise.all([
+                this.inkRepository.readSurface(item.filePath, item.id),
+                this.inkRepository.listSurfaces(item.filePath),
+              ]);
+              return surface === null
+                ? []
+                : [
+                    inkSummaryToIndexEntry(
+                      summarizeInkSurface(surface, { relatedRecords: loaded.records }),
+                      surface.noteId,
+                    ),
+                  ];
+            }),
+        );
+        const exportEntries = entries.flat();
+        if (exportEntries.length > 0) this.commands.exportVaultEntries(exportEntries, invoker);
       },
       onEntireVault: () => this.showEntireVault(),
-      onDeleteAnnotation: (annotationId, expectedRevision) => {
+      onDeleteAnnotation: (annotationId, expectedRevision, type) => {
         const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
-          void this.commands
-            .deleteAnnotation(filePath, annotationId, expectedRevision)
-            .catch(this.commands.issue);
+          void this.commands.deleteAnnotation(filePath, annotationId, expectedRevision).then(() => {
+            const item: AnnotationSidebarDeletedItem = {
+              deletedRevision: expectedRevision + 1,
+              filePath,
+              id: annotationId,
+              type,
+            };
+            this.markCanonicalMutations([item]);
+            this.currentComponent?.removeEntries([item]);
+            this.showRecentDeletion([item]);
+          }, this.commands.issue);
         }
       },
       onDeleteInk: (surfaceId, expectedRevision) => {
         const filePath = this.commands.getCurrentFilePath();
         if (filePath !== null) {
-          void this.commands
-            .deleteInk(filePath, surfaceId, expectedRevision)
-            .then(() => this.refreshCurrentFile(), this.commands.issue);
+          void this.commands.deleteInk(filePath, surfaceId, expectedRevision).then(() => {
+            const item: AnnotationSidebarDeletedItem = {
+              deletedRevision: expectedRevision + 1,
+              filePath,
+              id: surfaceId,
+              type: 'ink',
+            };
+            this.markCanonicalMutations([item]);
+            this.currentComponent?.removeEntries([item]);
+            this.showRecentDeletion([item]);
+          }, this.commands.issue);
         }
       },
-      onDeleteSnapshot: (summary) => this.snapshots?.delete(summary),
+      onDeleteSnapshot: (summary) => this.deleteSnapshot(summary),
       onEditSnapshot: (summary) => this.snapshots?.edit(summary),
-      onExportSnapshot: (summary) => this.snapshots?.exportPng(summary),
+      onExportSnapshot: (summary) => {
+        void Promise.resolve(this.snapshots?.exportPng(summary)).catch(this.commands.issue);
+      },
       onPreviewSnapshot: (summary) => this.snapshots?.preview(summary),
       onRelinkSnapshot: (summary) => this.snapshots?.relink(summary),
       onRestoreSnapshot: (summary) => this.snapshots?.restore(summary),
@@ -597,14 +646,12 @@ export class AnnotationSidebarView extends ItemView {
   private async showEntireVault(): Promise<void> {
     this.sidebarStore.setScope('entire-vault');
     if (this.vaultComponent !== null) {
-      await this.refreshVaultIndex();
+      await this.refreshVaultCatalog();
       return;
     }
     this.conflictDialog.close(false);
     this.currentConflicts = [];
     this.currentInkConflicts = [];
-    this.vaultBuildAbort?.abort();
-    this.vaultBuildAbort = null;
     const retainFailures = <T extends { readonly filePath: string; readonly id: string }>(
       selection: readonly T[],
       failed: readonly { readonly filePath: string; readonly id: string }[],
@@ -614,33 +661,19 @@ export class AnnotationSidebarView extends ItemView {
           (candidate) => candidate.filePath === item.filePath && candidate.id === item.id,
         ),
       );
-    const updateIndex = (records: readonly TextAnnotationRecord[]): void => {
-      for (const record of records) {
-        const styleName =
-          record.mark === undefined
-            ? undefined
-            : this.vaultIndex.snapshot().find((entry) => entry.styleId === record.mark?.styleId)
-                ?.styleName;
-        this.vaultIndex.upsert(
-          textRecordToIndexEntry(record, {
-            ...(styleName === undefined ? {} : { styleName }),
-          }),
-        );
-      }
-    };
     const component = new VaultAnnotationSidebar({
+      ...(this.vaultCatalog === undefined
+        ? { index: this.legacyVaultIndex as VaultAnnotationIndex }
+        : { catalog: this.vaultCatalog }),
       container: this.getVaultContentEl(),
       document: this.contentEl.ownerDocument,
       headerContainer: this.getVaultHeaderActionsEl(),
-      index: this.vaultIndex,
       onBulkAddTags: async (selection, tags) => {
         const outcome = await this.service.bulkAddTags(selection, tags);
-        updateIndex(outcome.succeeded);
         return { failed: retainFailures(selection, outcome.failed) };
       },
       onBulkChangeStyle: async (selection, styleId) => {
         const outcome = await this.service.bulkChangeStyle(selection, styleId);
-        updateIndex(outcome.succeeded);
         return { failed: retainFailures(selection, outcome.failed) };
       },
       onBulkCopy: async (entries) => {
@@ -659,13 +692,16 @@ export class AnnotationSidebarView extends ItemView {
       },
       onBulkDelete: async (selection) => {
         const outcome = await this.commands.bulkDelete(selection);
-        for (const record of outcome.succeeded) {
-          if (record.noteId === undefined) continue;
-          this.vaultIndex.removeAtOrBelow({
-            id: record.id,
-            maximumRevision: record.deletedRevision - 1,
-            noteId: record.noteId,
-          });
+        this.markCanonicalMutations(outcome.succeeded);
+        if (this.legacyVaultIndex !== undefined) {
+          for (const record of outcome.succeeded) {
+            if (record.noteId === undefined) continue;
+            this.legacyVaultIndex.removeAtOrBelow({
+              id: record.id,
+              maximumRevision: record.deletedRevision - 1,
+              noteId: record.noteId,
+            });
+          }
         }
         this.showRecentDeletion(outcome.succeeded);
         return {
@@ -673,14 +709,25 @@ export class AnnotationSidebarView extends ItemView {
         };
       },
       onCurrentFile: () => this.showCurrentFile(),
-      onDeleteSnapshot: (summary) => this.snapshots?.delete(summary),
+      onDeleteSnapshot: (summary) => this.deleteSnapshot(summary),
       onEdit: (entry, invoker) => {
         if (entry.type === 'ink') return;
         this.commands.inspectAnnotation(entry.id, invoker);
       },
       onEditSnapshot: (summary) => this.snapshots?.edit(summary),
-      onExport: this.commands.exportVaultEntries,
-      onExportSnapshot: (summary) => this.snapshots?.exportPng(summary),
+      onExport: (entries, invoker) => {
+        const regularEntries = entries.filter((entry) => entry.type !== 'snapshot');
+        if (regularEntries.length > 0) this.commands.exportVaultEntries(regularEntries, invoker);
+        const snapshotEntries = entries.filter((entry) => entry.type === 'snapshot');
+        void Promise.all(
+          snapshotEntries.map((entry) =>
+            Promise.resolve(this.snapshots?.exportPng(snapshotIndexEntryToSummary(entry))),
+          ),
+        ).catch(this.commands.issue);
+      },
+      onExportSnapshot: (summary) => {
+        void Promise.resolve(this.snapshots?.exportPng(summary)).catch(this.commands.issue);
+      },
       onOpen: (entry) => this.commands.navigateToVaultAnnotation(entry),
       onPreviewSnapshot: (summary) => this.snapshots?.preview(summary),
       onRelinkSnapshot: (summary) => this.snapshots?.relink(summary),
@@ -693,12 +740,8 @@ export class AnnotationSidebarView extends ItemView {
       styleOptions: this.stylePresets.map((preset) => [preset.id, preset.name ?? preset.id]),
     });
     this.vaultComponent = component;
-    if (this.vaultIndex.isReady()) {
-      component.showReady();
-    } else {
-      component.showBuilding({ completed: 0, total: 0 });
-    }
-    await this.refreshVaultIndex();
+    component.showReady();
+    await this.refreshVaultCatalog();
   }
 
   private getCurrentContentEl(): HTMLElement {
@@ -729,48 +772,86 @@ export class AnnotationSidebarView extends ItemView {
     return this.vaultHeaderActionsEl;
   }
 
-  private async refreshVaultIndex(): Promise<void> {
+  private async refreshVaultCatalog(): Promise<void> {
     const component = this.vaultComponent;
-    if (component === null || this.vaultIndexFresh) return;
-    this.vaultBuildAbort?.abort();
-    const abort = new AbortController();
-    this.vaultBuildAbort = abort;
-    let hasUsableIndex = this.vaultIndex.isReady();
-    try {
-      if (!hasUsableIndex && !this.vaultRestoreAttempted) {
-        this.vaultRestoreAttempted = true;
-        await this.vaultIndexBuilder.restoreCached();
-        hasUsableIndex = this.vaultIndex.isReady();
-      }
-      if (hasUsableIndex) {
-        component.showReady();
-      } else {
-        component.showBuilding({ completed: 0, total: 0 });
-      }
-      const rebuild = await this.vaultIndexBuilder.rebuild({
-        onProgress: (progress) => {
-          if (!abort.signal.aborted && !hasUsableIndex && this.vaultComponent === component) {
-            component.showBuilding(progress);
-          }
-        },
-        signal: abort.signal,
-      });
-      if (!abort.signal.aborted && this.vaultComponent === component) {
-        this.vaultIndexFresh = rebuild.status !== 'superseded';
-        component.showReady();
-      }
-    } catch (error) {
-      if (!abort.signal.aborted && this.vaultComponent === component) {
-        this.commands.issue(error);
-        if (hasUsableIndex) {
-          component.showReady();
-        } else {
-          component.showUnavailable(storageFailureMessage(error));
+    if (component === null) return;
+    if (this.vaultCatalog === undefined) {
+      const builder = this.legacyVaultIndexBuilder;
+      const index = this.legacyVaultIndex;
+      if (builder === undefined || index === undefined || this.legacyVaultFresh) return;
+      this.legacyVaultAbort?.abort();
+      const abort = new AbortController();
+      this.legacyVaultAbort = abort;
+      let hasUsableIndex = index.isReady();
+      try {
+        if (!hasUsableIndex && !this.legacyVaultRestoreAttempted) {
+          this.legacyVaultRestoreAttempted = true;
+          await builder.restoreCached();
+          hasUsableIndex = index.isReady();
         }
+        if (hasUsableIndex) component.showReady();
+        else component.showBuilding({ completed: 0, total: 0 });
+        const rebuild = await builder.rebuild({
+          onProgress: (progress) => {
+            if (!hasUsableIndex && this.vaultComponent === component) {
+              component.showBuilding(progress);
+            }
+          },
+          signal: abort.signal,
+        });
+        if (!abort.signal.aborted && this.vaultComponent === component) {
+          this.legacyVaultFresh = rebuild.status !== 'superseded';
+          component.showReady();
+        }
+      } catch (error) {
+        if (abort.signal.aborted) return;
+        this.commands.issue(error);
+        if (hasUsableIndex) component.showReady();
+        else component.showUnavailable(storageFailureMessage(error));
+      } finally {
+        if (this.legacyVaultAbort === abort) this.legacyVaultAbort = null;
       }
-    } finally {
-      if (this.vaultBuildAbort === abort) this.vaultBuildAbort = null;
+      return;
     }
+    try {
+      component.showReady();
+      await component.refreshCatalog();
+    } catch (error) {
+      if (this.vaultComponent === component) {
+        this.commands.issue(error);
+        component.showUnavailable(storageFailureMessage(error));
+      }
+    }
+  }
+
+  private markCanonicalMutation(filePath: string, currentFilePath: string | null): void {
+    this.legacyVaultFresh = false;
+    this.markVaultCatalogDirty(filePath);
+    if (this.currentCache?.filePath === filePath || currentFilePath === filePath) {
+      this.currentFileStale = true;
+    }
+  }
+
+  private markCanonicalMutations(items: readonly { readonly filePath: string }[]): void {
+    const currentFilePath = this.commands.getCurrentFilePath();
+    for (const filePath of new Set(items.map(({ filePath }) => filePath))) {
+      this.markCanonicalMutation(filePath, currentFilePath);
+    }
+  }
+
+  private deleteSnapshot(summary: SnapshotAnnotationSummary): void {
+    if (this.snapshots === undefined) return;
+    void this.snapshots.delete(summary).then(async () => {
+      await this.refreshAfterCanonicalMutation(summary.filePath);
+      const item: AnnotationSidebarDeletedItem = {
+        deletedRevision: summary.revision + 1,
+        filePath: summary.filePath,
+        id: summary.id,
+        type: 'snapshot',
+      };
+      this.currentComponent?.removeEntries([item]);
+      this.showRecentDeletion([item]);
+    }, this.commands.issue);
   }
 
   private showConflictDialog(invoker: HTMLElement): void {

@@ -2885,7 +2885,7 @@ body.is-mobile .inkstone-snapshot-editor {
   background: var(--background-secondary);
   border: 1px solid var(--inkstone-sidebar-card-border);
   border-radius: 12px;
-  box-shadow: var(--shadow-s);
+  box-shadow: none;
 }
 
 .inkstone-snapshot-masonry {
@@ -2913,9 +2913,7 @@ body.is-mobile .inkstone-snapshot-editor {
 
 .inkstone-snapshot-card.is-active {
   border-color: color-mix(in srgb, var(--interactive-accent) 58%, transparent);
-  box-shadow:
-    inset 3px 0 var(--interactive-accent),
-    var(--shadow-s);
+  box-shadow: none;
 }
 
 .inkstone-snapshot-card__thumbnail {
@@ -2954,11 +2952,15 @@ body.is-mobile .inkstone-snapshot-editor {
   border: 1px solid color-mix(in srgb, var(--background-modifier-border) 80%, transparent);
   border-radius: 8px;
   background: color-mix(in srgb, var(--background-primary) 88%, transparent);
-  box-shadow: var(--shadow-s);
+  box-shadow: none !important;
   text-align: start;
   backdrop-filter: blur(8px);
-  pointer-events: none;
+  cursor: pointer;
   user-select: none;
+}
+
+.inkstone-snapshot-card__summary:disabled {
+  cursor: default;
 }
 
 .inkstone-snapshot-card__summary > svg {
@@ -2982,8 +2984,58 @@ body.is-mobile .inkstone-snapshot-editor {
   border: 1px solid color-mix(in srgb, var(--background-modifier-border) 80%, transparent);
   border-radius: 999px;
   background: color-mix(in srgb, var(--background-primary) 88%, transparent) !important;
-  box-shadow: var(--shadow-s);
+  box-shadow: none !important;
   backdrop-filter: blur(8px);
+}
+
+.inkstone-snapshot-card__selection {
+  position: absolute;
+  z-index: 2;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  place-items: center;
+  padding: 0 !important;
+  margin: 0;
+  color: transparent !important;
+  appearance: none;
+  background: color-mix(in srgb, var(--background-primary) 92%, transparent) !important;
+  border: 1px solid color-mix(in srgb, var(--text-muted) 42%, transparent) !important;
+  border-radius: 999px;
+  box-shadow: none !important;
+  backdrop-filter: blur(8px);
+}
+
+.inkstone-snapshot-card__selection:hover {
+  background: color-mix(in srgb, var(--background-primary) 96%, transparent) !important;
+  border-color: color-mix(in srgb, var(--interactive-accent) 58%, transparent) !important;
+}
+
+.inkstone-snapshot-card__selection:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.inkstone-snapshot-card__selection.is-selected {
+  color: var(--text-on-accent) !important;
+  background: var(--interactive-accent) !important;
+  border-color: var(--interactive-accent) !important;
+}
+
+.inkstone-snapshot-card__selection > .inkstone-icon-button__icon,
+.inkstone-snapshot-card__selection > .inkstone-icon-button__icon > svg {
+  width: 18px;
+  height: 18px;
+}
+
+.inkstone-snapshot-card.is-selected {
+  border-color: var(--interactive-accent);
+  outline: 1px solid color-mix(in srgb, var(--interactive-accent) 24%, transparent);
+  outline-offset: -2px;
 }
 
 .inkstone-snapshot-source-pulse {

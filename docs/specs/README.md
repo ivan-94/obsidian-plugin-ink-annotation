@@ -24,7 +24,8 @@ Inkstone Annotations plugin.
 - [Ink shared scene, deterministic layout, and atomic camera](2026-07-21-ink-shared-scene-layout-and-atomic-camera.md)
 - [Ink iPad immediate usability patch](2026-07-22-ink-ipad-immediate-usability-patch.md)
 - [Snapshot Annotation capture and markup](2026-07-22-snapshot-annotation-capture-and-markup.md)
-- [Entire Vault demand-bounded local index and automated Gate](2026-07-19-entire-vault-demand-bounded-index.md)
+- [Parser-backed Text Source Projection and powerful Reading selection](2026-07-23-parser-backed-text-source-projection.md)
+- [Entire Vault demand-bounded local Catalog and automated Gate — reassessed 2026-07-23](2026-07-19-entire-vault-demand-bounded-index.md)
 - [Preact UI architecture refactor specification](2026_07_15_refactor_to_preact.md)
 
 Historical plan updates that have already been reconciled into the master plan are retained here for
@@ -52,6 +53,10 @@ are no longer valid sources of truth.
 
 - User instruction in the current Codex task on 2026-07-15: place every plan and specification for
   this plugin under `/Users/ivan/workspace/ai/obsidian-annotation-plugin/docs/specs`.
+- User approval on 2026-07-23 of the Entire Vault reassessment recommendations: recent-20 default,
+  Markdown-dependent Snapshot freshness, page-local Select all, and bounded stream export-all.
+- User instruction on 2026-07-23 to specify the recommended systematic replacement for the
+  restrictive Reading View selection mapper.
 - `AGENTS.md` source-of-truth policy.
 - All authoritative documents indexed above.
 - `/Users/ivan/.agents/docs/agents/workflows.md` and
@@ -79,6 +84,7 @@ are no longer valid sources of truth.
 - `docs/specs/2026-07-21-ink-shared-scene-layout-and-atomic-camera.md`
 - `docs/specs/2026-07-22-ink-ipad-immediate-usability-patch.md`
 - `docs/specs/2026-07-22-snapshot-annotation-capture-and-markup.md`
+- `docs/specs/2026-07-23-parser-backed-text-source-projection.md`
 - `docs/specs/2026-07-19-entire-vault-demand-bounded-index.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`
 - `docs/specs/2026-07-15-preact-execution-plan-update.md`
@@ -91,8 +97,10 @@ are no longer valid sources of truth.
   the historical design and master execution documents.
 - Historical Slice evidence remains in `docs/delivery/slices/` and links back to the local master
   execution plan.
-- The 2026-07-19 Entire Vault specification supersedes the earlier full-memory index assumptions
-  while preserving canonical sidecars and deferring UI cutover to separately authorized work.
+- The Entire Vault specification, reassessed on 2026-07-23, supersedes the earlier full-memory index
+  assumptions while preserving canonical sidecars and deferring UI cutover to separately authorized
+  work. It treats Snapshot `record.json` as canonical, Snapshot `summary.json` as a hint, current
+  Markdown as a link-projection dependency, and Snapshot Capture Assets as outside Catalog reads.
 - The 2026-07-20 explicit-commit specification supersedes automatic foreground Draft and short-idle
   canonical persistence: foreground Ink Mode is memory-only until Done or sustained inactivity,
   while background/inactivity save is explicitly best-effort. The same specification narrows Canvas
@@ -121,6 +129,10 @@ are no longer valid sources of truth.
   replaceable backend: the core desktop vertical slice starts with Electron, later Slices add
   open-source and self-developed DOM backends, and physical-iPad acceptance selects platform
   defaults before cutover. Legacy document-world Ink remains readable and exportable.
+- The 2026-07-23 Text Source Projection specification replaces hand-scanned Markdown block
+  candidates with one parser-backed bidirectional projection shared by selection creation, highlight
+  restoration, and Snapshot source binding. It keeps compound source anchors, typed fail-closed
+  behavior, bounded revision caches, and explicit Snapshot fallback for generated content.
 - Supporting design images moved with the plan so all relative references remain repository-local.
 
 ### Verification evidence

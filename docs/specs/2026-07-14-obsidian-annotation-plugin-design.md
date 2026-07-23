@@ -831,9 +831,9 @@ Behavior:
   reachable by the Obsidian command system.
 - Bulk deletion, permanent tombstone cleanup, and deleting an entire Ink surface require a
   confirmation dialog that states scope and item count.
-- After a confirmed Ink-surface deletion, the current-file sidebar shows `Restore` for 5 seconds
-  from `deletedAt`, then removes the deleted row. The canonical tombstone remains stored for iCloud
-  conflict safety even after the transient restore affordance disappears.
+- After a confirmed Ink-surface deletion, the current-file sidebar removes the row immediately and
+  exposes `Restore` through the shared five-second deletion receipt. The canonical tombstone remains
+  stored for iCloud conflict safety after the transient restore affordance disappears.
 - Deleting or restoring an Ink surface immediately rebuilds the active Ink workspace from canonical
   active surfaces so deleted strokes never remain painted and restored strokes return on the current
   or next Ink entry without an app reload.

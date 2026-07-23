@@ -41,7 +41,11 @@ export interface CurrentFileSidebarAppProps {
     selection: readonly CurrentBulkSelectionEntry[],
     invoker: HTMLElement,
   ) => Promise<void>;
-  readonly onDeleteAnnotation: (annotationId: string, expectedRevision: number) => void;
+  readonly onDeleteAnnotation: (
+    annotationId: string,
+    expectedRevision: number,
+    type: 'highlight' | 'note' | 'underline',
+  ) => void;
   readonly onDeleteInk: (surfaceId: string, expectedRevision: number) => void;
   readonly onEntireVault: () => void | Promise<void>;
   readonly onExportCurrentFile: (invoker: HTMLElement) => void;
@@ -116,6 +120,9 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
   const matches = (value: string): boolean =>
     query.length === 0 || value.toLocaleLowerCase().includes(query);
   const selectableKeys = [
+    ...snapshotSummaries
+      .filter((summary) => matches(snapshotSearchText(summary)))
+      .map((summary) => currentSelectionKey('snapshot', summary.id)),
     ...inkSummaries
       .filter((summary) => matches(inkSearchText(summary)))
       .map((summary) => currentSelectionKey('ink', summary.id)),
@@ -127,6 +134,17 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
   ];
   const filePath = state.filePath.value ?? inkSummaries[0]?.filePath ?? '';
   const bulkEntries: readonly CurrentBulkSelectionEntry[] = [
+    ...snapshotSummaries
+      .filter((summary) => matches(snapshotSearchText(summary)))
+      .map((summary) => ({
+        body: `${summary.strokeCount} ${summary.strokeCount === 1 ? 'stroke' : 'strokes'}`,
+        expectedRevision: summary.revision,
+        filePath: summary.filePath,
+        id: summary.id,
+        key: currentSelectionKey('snapshot', summary.id),
+        quote: `Snapshot · ${summary.headingPath.join(' › ') || 'Document'}`,
+        type: 'snapshot' as const,
+      })),
     ...inkSummaries
       .filter((summary) => matches(inkSearchText(summary)))
       .map((summary) => ({
@@ -255,7 +273,9 @@ export function CurrentFileSidebarApp(props: CurrentFileSidebarAppProps) {
                       <div hidden={!matches(textSearchText(row))} key={model.key}>
                         <TextAnnotationListItem
                           model={model}
-                          onDelete={() => props.onDeleteAnnotation(row.id, row.revision)}
+                          onDelete={() =>
+                            props.onDeleteAnnotation(row.id, row.revision, row.marker.kind)
+                          }
                           onInspect={(invoker) => props.onInspect(row.id, invoker)}
                           {...(props.onRepairAnnotation === undefined
                             ? {}
@@ -345,6 +365,21 @@ function SnapshotAnnotationGroups({
               onRelink={props.onRelinkSnapshot}
               onRestore={props.onRestoreSnapshot}
               onSelectSource={props.onSelectSnapshotSource}
+              {...(props.state.selectionMode.value
+                ? {
+                    selection: {
+                      label: `Select Snapshot ${summary.id}`,
+                      onToggle: () =>
+                        toggleCurrentSelection(
+                          props.state,
+                          currentSelectionKey('snapshot', summary.id),
+                        ),
+                      selected: props.state.selectedKeys.value.has(
+                        currentSelectionKey('snapshot', summary.id),
+                      ),
+                    },
+                  }
+                : {})}
               style={{ aspectRatio: `${summary.logicalWidth} / ${summary.logicalHeight}` }}
               summary={summary}
             />
@@ -413,7 +448,7 @@ function CurrentBulkActionDock({
   return (
     <BulkActionDock
       copyFeedback={state.bulkFeedback.value}
-      hasInk={entries.some((entry) => entry.type === 'ink')}
+      hasInk={entries.some((entry) => entry.type === 'ink' || entry.type === 'snapshot')}
       onCopy={copy}
       onDelete={() => open('delete')}
       onExport={(invoker) => runTransient(onBulkExport(entries, invoker))}
@@ -717,7 +752,7 @@ function visibleUntil(deletedAt: string | undefined, now: number): boolean {
   return Number.isFinite(timestamp) && now < timestamp + 5_000;
 }
 
-function currentSelectionKey(kind: 'ink' | 'text', id: string): string {
+function currentSelectionKey(kind: 'ink' | 'snapshot' | 'text', id: string): string {
   return `${kind}:${id}`;
 }
 

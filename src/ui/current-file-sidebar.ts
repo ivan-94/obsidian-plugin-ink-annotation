@@ -47,7 +47,11 @@ export class CurrentFileSidebar {
     selection: readonly CurrentBulkSelectionEntry[],
     invoker: HTMLElement,
   ) => Promise<void>;
-  private readonly onDeleteAnnotation: (annotationId: string, expectedRevision: number) => void;
+  private readonly onDeleteAnnotation: (
+    annotationId: string,
+    expectedRevision: number,
+    type: 'highlight' | 'note' | 'underline',
+  ) => void;
   private readonly onDeleteInk: (surfaceId: string, expectedRevision: number) => void;
   private readonly onEntireVault: () => void | Promise<void>;
   private readonly onExportCurrentFile: (invoker: HTMLElement) => void;
@@ -96,7 +100,11 @@ export class CurrentFileSidebar {
       selection: readonly CurrentBulkSelectionEntry[],
       invoker: HTMLElement,
     ) => Promise<void>;
-    readonly onDeleteAnnotation?: (annotationId: string, expectedRevision: number) => void;
+    readonly onDeleteAnnotation?: (
+      annotationId: string,
+      expectedRevision: number,
+      type: 'highlight' | 'note' | 'underline',
+    ) => void;
     readonly onInspect?: (annotationId: string, invoker: HTMLElement) => void;
     readonly onRepairAnnotation?: (annotationId: string, invoker: HTMLElement) => void;
     readonly onDeleteInk?: (surfaceId: string, expectedRevision: number) => void;
@@ -132,7 +140,13 @@ export class CurrentFileSidebar {
     this.onBulkAddTags = input.onBulkAddTags ?? (() => Promise.resolve({ failed: [] }));
     this.onBulkChangeStyle = input.onBulkChangeStyle ?? (() => Promise.resolve({ failed: [] }));
     this.onBulkCopy = input.onBulkCopy ?? (() => Promise.resolve());
-    this.onBulkDelete = input.onBulkDelete ?? (() => Promise.resolve({ failed: [] }));
+    const onBulkDelete = input.onBulkDelete ?? (() => Promise.resolve({ failed: [] }));
+    this.onBulkDelete = async (selection) => {
+      const outcome = await onBulkDelete(selection);
+      const failedKeys = new Set(outcome.failed.map(({ key }) => key));
+      this.removeEntries(selection.filter(({ key }) => !failedKeys.has(key)));
+      return outcome;
+    };
     this.onBulkExport = input.onBulkExport ?? (() => Promise.resolve());
     this.onDeleteAnnotation = input.onDeleteAnnotation ?? (() => undefined);
     this.onDeleteInk = input.onDeleteInk ?? (() => undefined);
@@ -236,6 +250,53 @@ export class CurrentFileSidebar {
     this.renderIsland();
   }
 
+  removeEntries(entries: readonly Pick<CurrentBulkSelectionEntry, 'id' | 'type'>[]): void {
+    if (entries.length === 0) return;
+    const removedKeys = new Set(entries.map(currentSidebarEntryKey));
+    const model = {
+      groups: this.state.model.value.groups
+        .map((group) => ({
+          ...group,
+          rows: group.rows.filter((row) => !removedKeys.has(`text:${row.id}`)),
+        }))
+        .filter((group) => group.rows.length > 0),
+      total: 0,
+    };
+    const nextModel = {
+      ...model,
+      total: model.groups.reduce((total, group) => total + group.rows.length, 0),
+    };
+    const inkSummaries = this.state.inkSummaries.value.filter(
+      (summary) => !removedKeys.has(`ink:${summary.id}`),
+    );
+    const snapshotSummaries = this.state.snapshotSummaries.value.filter(
+      (summary) => !removedKeys.has(`snapshot:${summary.id}`),
+    );
+    batch(() => {
+      this.state.model.value = nextModel;
+      this.state.inkSummaries.value = inkSummaries;
+      this.state.snapshotSummaries.value = snapshotSummaries;
+      if (
+        this.state.activeAnnotationId.value !== null &&
+        removedKeys.has(`text:${this.state.activeAnnotationId.value}`)
+      ) {
+        this.state.activeAnnotationId.value = null;
+      }
+      if (
+        this.state.activeSnapshotId.value !== null &&
+        removedKeys.has(`snapshot:${this.state.activeSnapshotId.value}`)
+      ) {
+        this.state.activeSnapshotId.value = null;
+      }
+      this.state.restoreDeadline.value = nextRestoreDeadline(
+        nextModel,
+        inkSummaries,
+        snapshotSummaries,
+        Date.now(),
+      );
+    });
+  }
+
   private props(): CurrentFileSidebarAppProps {
     return {
       document: this.document,
@@ -289,6 +350,10 @@ export class CurrentFileSidebar {
     }
     this.container.scrollTop = this.state.scrollOffset.value;
   }
+}
+
+function currentSidebarEntryKey(entry: Pick<CurrentBulkSelectionEntry, 'id' | 'type'>): string {
+  return `${entry.type === 'ink' || entry.type === 'snapshot' ? entry.type : 'text'}:${entry.id}`;
 }
 
 function nextRestoreDeadline(

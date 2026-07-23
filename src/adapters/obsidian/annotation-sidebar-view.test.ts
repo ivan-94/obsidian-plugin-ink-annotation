@@ -7,6 +7,10 @@ import {
   snapshotSummaryToIndexEntry,
   VaultAnnotationIndex,
 } from '../../domain/vault-annotation-index';
+import {
+  catalogEntryFromIndexEntry,
+  type VaultCatalogQueryPort,
+} from '../../application/vault-catalog';
 import { createSnapshotAnnotationSummaryFromIndexEntry } from '../../domain/snapshot-annotation-summary';
 import type { InkSurfaceRecord } from '../../domain/ink-surface';
 import { splitInkStrokeIntoSurfaceFragments } from '../../domain/ink-surface-layout';
@@ -766,6 +770,378 @@ describe('Annotation sidebar scope switching', () => {
       .querySelector<HTMLButtonElement>('button[aria-label="Restore deleted annotations"]')
       ?.click();
     await vi.waitFor(() => expect(restoreDeleted).toHaveBeenCalledWith([deletedItem]));
+    await view.onClose();
+  });
+
+  it('routes a selected Current file Snapshot through bulk delete and shared Restore', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const deletedItem = {
+      deletedRevision: 2,
+      filePath: 'Note.md',
+      id: 'snapshot-new',
+      noteId: 'note-1',
+      type: 'snapshot' as const,
+    };
+    const bulkDelete = vi.fn(() => Promise.resolve({ failed: [], succeeded: [deletedItem] }));
+    const exportPng = vi.fn(() => Promise.resolve());
+    const restoreDeleted = vi.fn(() => Promise.resolve({ failed: [] }));
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: { ...sidebarCommands(), bulkDelete, restoreDeleted },
+      inkRepository: { listSurfaceSummaries: () => Promise.resolve([]) } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      snapshots: {
+        exportPng,
+        readSource: () => Promise.resolve('# Test'),
+        repository: { listIndexEntries: () => Promise.resolve([snapshotIndexEntry()]) },
+      },
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {
+        rebuild: () => Promise.resolve({ indexed: 0, issues: [] }),
+        restoreCached: () => Promise.resolve(0),
+      } as never,
+    });
+    await view.onOpen();
+
+    const currentHeaderActions = container.querySelector<HTMLElement>(
+      '[data-inkstone-sidebar-header-actions="current-file"]',
+    );
+    if (currentHeaderActions === null) throw new Error('Missing Current file header actions.');
+    clickActionMenuItem(currentHeaderActions, 'More actions', 'Select multiple…');
+    await vi.waitFor(() =>
+      expect(
+        container.querySelector(
+          'button[role="checkbox"][aria-label="Select Snapshot snapshot-new"]',
+        ),
+      ).not.toBeNull(),
+    );
+    container
+      .querySelector<HTMLButtonElement>(
+        'button[role="checkbox"][aria-label="Select Snapshot snapshot-new"]',
+      )
+      ?.click();
+    await vi.waitFor(() =>
+      expect(
+        container.querySelector('button[aria-label="Delete selected"]')?.hasAttribute('disabled'),
+      ).toBe(false),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Export selected"]')?.click();
+    await vi.waitFor(() =>
+      expect(exportPng).toHaveBeenCalledWith(
+        expect.objectContaining({ filePath: 'Note.md', id: 'snapshot-new' }),
+      ),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('button[aria-label="Confirm bulk delete"]')).not.toBeNull(),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
+
+    await vi.waitFor(() =>
+      expect(bulkDelete).toHaveBeenCalledWith([
+        expect.objectContaining({
+          expectedRevision: 1,
+          filePath: 'Note.md',
+          id: 'snapshot-new',
+          type: 'snapshot',
+        }),
+      ]),
+    );
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-inkstone-snapshot-id="snapshot-new"]')).toBeNull(),
+    );
+    await vi.waitFor(() => expect(container.textContent).toContain('1 annotation deleted'));
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Restore deleted annotations"]')
+      ?.click();
+    await vi.waitFor(() => expect(restoreDeleted).toHaveBeenCalledWith([deletedItem]));
+    await view.onClose();
+  });
+
+  it('removes a Snapshot after dropdown deletion and exposes the shared Restore receipt', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const deleteSnapshot = vi.fn(() => Promise.resolve());
+    const restoreDeleted = vi.fn(() => Promise.resolve({ failed: [] }));
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: { ...sidebarCommands(), restoreDeleted },
+      inkRepository: { listSurfaceSummaries: () => Promise.resolve([]) } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      snapshots: {
+        delete: deleteSnapshot,
+        readSource: () => Promise.resolve('# Test'),
+        repository: { listIndexEntries: () => Promise.resolve([snapshotIndexEntry()]) },
+      },
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {
+        rebuild: () => Promise.resolve({ indexed: 0, issues: [] }),
+        restoreCached: () => Promise.resolve(0),
+      } as never,
+    });
+    await view.onOpen();
+
+    clickActionMenuItem(
+      container,
+      'Open actions for Snapshot captured 2026-07-22T05:00:00.000Z',
+      'Delete Snapshot',
+    );
+
+    await vi.waitFor(() => expect(deleteSnapshot).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-inkstone-snapshot-id="snapshot-new"]')).toBeNull(),
+    );
+    await vi.waitFor(() => expect(container.textContent).toContain('1 annotation deleted'));
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Restore deleted annotations"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(restoreDeleted).toHaveBeenCalledWith([
+        {
+          deletedRevision: 2,
+          filePath: 'Note.md',
+          id: 'snapshot-new',
+          type: 'snapshot',
+        },
+      ]),
+    );
+    await view.onClose();
+  });
+
+  it('removes a text annotation after dropdown deletion and exposes the shared Restore receipt', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const deleteAnnotation = vi.fn(() => Promise.resolve());
+    const restoreDeleted = vi.fn(() => Promise.resolve({ failed: [] }));
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: { ...sidebarCommands(), deleteAnnotation, restoreDeleted },
+      inkRepository: { listSurfaceSummaries: () => Promise.resolve([]) } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({
+            conflicts: [],
+            issues: [],
+            model: {
+              groups: [
+                {
+                  kind: 'heading' as const,
+                  rows: [
+                    {
+                      id: 'dropdown-text',
+                      marker: { kind: 'underline' as const, styleId: 'highlight-mint' },
+                      notePreview: null,
+                      position: 0,
+                      quote: 'Delete me',
+                      revision: 1,
+                      status: 'active' as const,
+                      tags: [],
+                      updatedAt: '2026-07-23T01:00:00.000Z',
+                    },
+                  ],
+                  title: 'Document',
+                },
+              ],
+              total: 1,
+            },
+          }),
+      } as never,
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {
+        rebuild: () => Promise.resolve({ indexed: 0, issues: [] }),
+        restoreCached: () => Promise.resolve(0),
+      } as never,
+    });
+    await view.onOpen();
+
+    clickActionMenuItem(container, 'Open actions for Delete me', 'Delete');
+
+    await vi.waitFor(() =>
+      expect(deleteAnnotation).toHaveBeenCalledWith('Note.md', 'dropdown-text', 1),
+    );
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-annotation-id="dropdown-text"]')).toBeNull(),
+    );
+    await vi.waitFor(() => expect(container.textContent).toContain('1 annotation deleted'));
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Restore deleted annotations"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(restoreDeleted).toHaveBeenCalledWith([
+        {
+          deletedRevision: 2,
+          filePath: 'Note.md',
+          id: 'dropdown-text',
+          type: 'underline',
+        },
+      ]),
+    );
+    await view.onClose();
+  });
+
+  it('removes Legacy Ink after dropdown deletion and exposes the shared Restore receipt', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const deleteInk = vi.fn(() => Promise.resolve());
+    const restoreDeleted = vi.fn(() => Promise.resolve({ failed: [] }));
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: { ...sidebarCommands(), deleteInk, restoreDeleted },
+      inkRepository: {
+        listSurfaceSummaries: () => Promise.resolve([summarizeInkSurface(inkSurface(1))]),
+      } as never,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      stylePresets: [],
+      vaultIndex: new VaultAnnotationIndex(),
+      vaultIndexBuilder: {
+        rebuild: () => Promise.resolve({ indexed: 0, issues: [] }),
+        restoreCached: () => Promise.resolve(0),
+      } as never,
+    });
+    await view.onOpen();
+
+    container.querySelector<HTMLButtonElement>('[data-inkstone-ink-actions="surface-1"]')?.click();
+    document.body
+      .querySelector<HTMLButtonElement>(
+        '[data-obsidian-test-menu] button[aria-label="Delete Legacy Ink surface…"]',
+      )
+      ?.click();
+    await vi.waitFor(() =>
+      expect(
+        container.querySelector('[aria-label="Confirm delete Legacy Ink surface"]'),
+      ).not.toBeNull(),
+    );
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Confirm delete Legacy Ink surface"]')
+      ?.click();
+
+    await vi.waitFor(() => expect(deleteInk).toHaveBeenCalledWith('Note.md', 'surface-1', 1));
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-inkstone-ink-row="surface-1"]')).toBeNull(),
+    );
+    await vi.waitFor(() => expect(container.textContent).toContain('1 annotation deleted'));
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Restore deleted annotations"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(restoreDeleted).toHaveBeenCalledWith([
+        {
+          deletedRevision: 2,
+          filePath: 'Note.md',
+          id: 'surface-1',
+          type: 'ink',
+        },
+      ]),
+    );
+    await view.onClose();
+  });
+
+  it('marks a bounded Catalog path dirty and removes a bulk-deleted Snapshot from the open page', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const summary = createSnapshotAnnotationSummaryFromIndexEntry(snapshotIndexEntry(), '# Test');
+    let entries = [catalogEntryFromIndexEntry(snapshotSummaryToIndexEntry(summary, 'note-1'))];
+    const markVaultCatalogDirty = vi.fn(() => {
+      entries = [];
+    });
+    const bulkDelete = vi.fn(() =>
+      Promise.resolve({
+        failed: [],
+        succeeded: [
+          {
+            deletedRevision: 2,
+            filePath: 'Note.md',
+            id: 'snapshot-new',
+            noteId: 'note-1',
+            type: 'snapshot' as const,
+          },
+        ],
+      }),
+    );
+    const vaultCatalog: VaultCatalogQueryPort = {
+      entriesForNote: vi.fn(() =>
+        Promise.resolve({
+          entries,
+          hasMore: false as const,
+          meta: { freshness: 'current' as const, projectionEpoch: 1 },
+          state: 'ready' as const,
+        }),
+      ),
+      recentNotes: vi.fn(() =>
+        Promise.resolve({
+          meta: { freshness: 'current' as const, projectionEpoch: 1 },
+          notes: [
+            {
+              activityAt: '2026-07-23T00:00:00.000Z',
+              annotationCount: entries.length,
+              conflictCount: 0,
+              filePath: 'Note.md',
+              folder: '',
+              legacyInkCount: 0,
+              lastAnnotatedAt: '2026-07-23T00:00:00.000Z',
+              noteId: 'note-1',
+              problemCount: 0,
+              snapshotCount: entries.length,
+              textCount: 0,
+              title: 'Note',
+            },
+          ],
+        }),
+      ),
+      search: vi.fn(),
+      suggestFacet: vi.fn(),
+    };
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: { ...sidebarCommands(), bulkDelete },
+      inkRepository: { listSurfaceSummaries: () => Promise.resolve([]) } as never,
+      markVaultCatalogDirty,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      stylePresets: [],
+      vaultCatalog,
+    });
+    await view.onOpen();
+    clickScope(container, 'Entire Vault');
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-note-group="Note.md"]')).not.toBeNull(),
+    );
+    container.querySelector<HTMLButtonElement>('button[aria-label="Expand Note.md"]')?.click();
+    await vi.waitFor(() =>
+      expect(
+        container.querySelector('[data-inkstone-vault-snapshot-id="snapshot-new"]'),
+      ).not.toBeNull(),
+    );
+    const vaultHeaderActions = container.querySelector<HTMLElement>(
+      '[data-inkstone-sidebar-header-actions="entire-vault"]',
+    );
+    if (vaultHeaderActions === null) throw new Error('Missing Vault header actions.');
+    clickActionMenuItem(vaultHeaderActions, 'More actions', 'Select multiple…');
+    container
+      .querySelector<HTMLButtonElement>(
+        'button[role="checkbox"][aria-label="Select Snapshot snapshot-new"]',
+      )
+      ?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
+
+    await vi.waitFor(() => expect(bulkDelete).toHaveBeenCalledOnce());
+    expect(markVaultCatalogDirty).toHaveBeenCalledWith('Note.md');
+    await vi.waitFor(() =>
+      expect(
+        container.querySelector('[data-inkstone-vault-snapshot-id="snapshot-new"]'),
+      ).toBeNull(),
+    );
     await view.onClose();
   });
 

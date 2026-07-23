@@ -22,9 +22,14 @@ import { SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR } from './snapshot-dom-capture-prepa
 interface SnapshotManagerAppLike {
   readonly vault: {
     cachedRead(file: TFile): Promise<string>;
+    getFileByPath?(filePath: string): TFile | null;
   };
   readonly workspace: {
     getActiveViewOfType(viewType: typeof MarkdownView): MarkdownView | null;
+    getLeaf?(newLeaf?: boolean): {
+      readonly view: unknown;
+      openFile(file: TFile): Promise<void>;
+    };
   };
 }
 
@@ -257,7 +262,17 @@ export class ObsidianSnapshotAnnotationManager {
 
   async jumpToSource(filePath: string, snapshotId: string): Promise<boolean> {
     this.assertAvailable();
-    const view = this.input.app.workspace.getActiveViewOfType(MarkdownView);
+    let view = this.input.app.workspace.getActiveViewOfType(MarkdownView);
+    if (view === null || view.file?.path !== filePath) {
+      const file = this.input.app.vault.getFileByPath?.(filePath);
+      const leaf = this.input.app.workspace.getLeaf?.(false);
+      if (file === null || file === undefined || leaf === undefined) return false;
+      await leaf.openFile(file);
+      view =
+        leaf.view instanceof MarkdownView
+          ? leaf.view
+          : this.input.app.workspace.getActiveViewOfType(MarkdownView);
+    }
     if (view === null || view.file?.path !== filePath) return false;
     return this.jumpToSourceInView(view, filePath, snapshotId);
   }
@@ -279,7 +294,13 @@ export class ObsidianSnapshotAnnotationManager {
     const anchor = link.anchors.find(({ focus }) => focus) ?? link.anchors[0];
     if (anchor === undefined) return false;
     const root = view.contentEl.querySelector<HTMLElement>('.markdown-preview-sizer');
-    if (root === null) return false;
+    if (root === null) {
+      const from = view.editor.offsetToPos(anchor.start);
+      const to = view.editor.offsetToPos(anchor.end);
+      view.editor.setSelection(from, to);
+      view.editor.scrollIntoView({ from, to }, true);
+      return true;
+    }
     for (const element of root.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6, p, li')) {
       const renderedText = element.textContent?.trim() ?? '';
       if (renderedText.length === 0) continue;
@@ -441,7 +462,9 @@ export class ObsidianSnapshotAnnotationManager {
             .catch((error: unknown) => this.input.onIssue?.(error));
         }
         const filePath = session.snapshot().record.filePath;
-        await this.input.onRecordsChanged?.(filePath);
+        void Promise.resolve()
+          .then(() => this.input.onRecordsChanged?.(filePath))
+          .catch((error: unknown) => this.input.onIssue?.(error));
         await this.refreshSourceTrackingForActiveFile().catch((error: unknown) =>
           this.input.onIssue?.(error),
         );

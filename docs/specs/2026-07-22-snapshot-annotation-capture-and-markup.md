@@ -325,9 +325,10 @@ and problem grouping. Snapshot cards add:
 
 - a two-column masonry layout inside each heading group, with a one-column narrow fallback;
 - a lazily loaded, Retina-capable flattened thumbnail that fills the card with `cover` cropping;
-- a compact, read-only stroke-count/link-state badge over the lower-left image corner;
+- a compact stroke-count/link-state button over the lower-left image corner that jumps to source;
 - a single upper-right overflow menu for edit, export, relink, delete, or Restore;
-- card-click preview, with source jump retained in the overflow menu; and
+- card-click preview, with source jump available from the stroke-count button and overflow menu; in
+  selection mode card-click toggles selection instead; and
 - an active style synchronized to the visible source neighborhood.
 
 Every sidebar shell, group, and card must shrink to the owning Obsidian leaf without establishing a
@@ -353,8 +354,23 @@ bytes or stroke arrays. It:
 - invalidates and rebuilds its disposable index after path-explicit create/edit/delete/Restore or
   relink mutations.
 
-Snapshot cards are excluded from text/Ink bulk mutation commands until those commands gain an
-explicit mixed-type contract. Their individual actions remain fully available.
+Snapshot cards participate in the same page-local selection mode as text and Legacy Ink. Selection
+mode replaces the overflow action with a checkbox and changes card activation from Preview/source
+jump to selection toggle. The mixed-type bulk contract is explicit:
+
+- Copy includes Snapshot file, heading, and stroke-count summary text.
+- Export writes one flattened Snapshot PNG per selected Snapshot.
+- Delete writes revision-checked Snapshot tombstones and participates in the shared five-second
+  Restore receipt.
+- After a Current file bulk Delete completes, every successful row disappears from the current
+  projection immediately, failed rows remain selected, and Restore remains available through the
+  shared receipt rather than by retaining successful tombstone cards in the list.
+- Per-item dropdown Delete uses the same successful-deletion presentation for text, Legacy Ink, and
+  Snapshot: remove the item immediately after canonical success and expose Restore through the
+  shared five-second receipt; a failed write leaves the item in place.
+- Tags and styles remain disabled whenever the selection contains Snapshot or Legacy Ink because
+  those mutations are text-only.
+- Select all includes only the explicitly loaded Current file rows or Entire Vault page rows.
 
 Preview opens with an explicit read-only status. Activating that status enters Edit for the same
 canonical Snapshot; it does not create a second record or silently mutate the preview session.
@@ -1000,6 +1016,15 @@ gate remains open for backend performance scoring and the later web/iPad work li
   horizontal clipping, required two-column masonry cards with sharp `cover` thumbnails, required an
   explicit read-only Preview that can enter Edit, and made the stroke-count badge informational
   rather than interactive.
+- User Snapshot selection correction in the current Codex session on 2026-07-23: made the
+  stroke-count badge execute source jump and required Snapshot cards to participate in selection
+  mode and page-local bulk Copy/Export/Delete/Restore.
+- User Current file deletion correction in the current Codex session on 2026-07-23: required
+  successful bulk-deleted rows to disappear immediately while retaining the shared five-second
+  Restore receipt and failed selections.
+- User dropdown-deletion alignment in the current Codex session on 2026-07-23: required text, Legacy
+  Ink, and Snapshot dropdown deletion to use the same immediate removal and shared Restore receipt
+  as successful bulk deletion.
 - User cutover instruction in the current Codex session on 2026-07-22: remove the old doodle code
   and entry points now. The implementation treats this as authorization to retire creation/editing,
   not authorization to delete or silently migrate existing sidecar bytes.
@@ -1080,9 +1105,10 @@ gate remains open for backend performance scoring and the later web/iPad work li
   existing source elements can drive non-visual Current file activation.
 - Current file and Entire Vault reuse one shrink-safe Snapshot preview card. Current file lays cards
   out in a two-column masonry with sharp `cover` thumbnails and a narrow one-column fallback. Stroke
-  count is read-only; source jump lives in the action menu. Entire Vault persists only compact
-  summary metadata in its disposable index and excludes Snapshot cards from unsupported text/Ink
-  bulk mutations. Preview declares its read-only state and can reopen the same Snapshot in Edit.
+  count jumps to source outside selection mode. Entire Vault persists only compact summary metadata
+  in its disposable index; Snapshot participates in page-local Copy/Export/Delete/Restore while
+  text-only Tags/Style stay disabled. Preview declares its read-only state and can reopen the same
+  Snapshot in Edit.
 
 ### Verification evidence
 

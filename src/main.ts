@@ -55,17 +55,14 @@ import {
   writeInkStandaloneReport,
   writeInkSvgExport,
 } from './application/ink-export-file-writer';
-import { VaultIndexBuilder } from './application/vault-index-builder';
-import {
-  CanonicalInkSurfaceProjectionCoordinator,
-  applyCanonicalRecordChanged,
-  applyCanonicalRecordRemoved,
-} from './application/vault-index-events';
+import { VaultCatalogReconciler } from './application/vault-catalog-reconciler';
+import { VaultCatalogSession } from './application/vault-catalog-session';
+import { VaultCatalogMarkdownProjector } from './application/vault-catalog-markdown-projector';
 import type { InkSurfaceRecord } from './domain/ink-surface';
 import { StylePresetCatalog } from './domain/style-preset';
 import { annotationTargetText, type TextAnnotationRecord } from './domain/text-annotation';
-import { VaultAnnotationIndex, type AnnotationIndexEntry } from './domain/vault-annotation-index';
-import { createSnapshotAnnotationSummaryFromIndexEntry } from './domain/snapshot-annotation-summary';
+import type { AnnotationIndexEntry } from './domain/vault-annotation-index';
+import { hashText } from './domain/text-anchor';
 import { AnnotationInspector } from './ui/annotation-inspector';
 import { AnnotationExportDialog } from './ui/annotation-export-dialog';
 import { Diagnostics } from './runtime/diagnostics';
@@ -78,7 +75,7 @@ import { InkSurfaceRepository } from './storage/ink-surface-repository';
 import { InkDocumentSnapshotRepository } from './storage/ink-document-snapshot-repository';
 import { IndexedDbSnapshotAnnotationDraftStore } from './storage/indexeddb-snapshot-annotation-draft-store';
 import { LocalInkToolPreferenceStore } from './storage/local-ink-tool-preference';
-import { VaultIndexCache } from './storage/vault-index-cache';
+import { IndexedDbVaultCatalog } from './storage/indexeddb-vault-catalog';
 import { SnapshotAnnotationRepository } from './storage/snapshot-annotation-repository';
 import { SnapshotAnnotationEditor } from './ui/snapshot-annotation-editor';
 import { writeSnapshotAnnotationPngExport } from './application/snapshot-annotation-export';
@@ -109,17 +106,13 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
       onDerivedIssue: (error) => console.warn('[Inkstone Annotations]', error),
     });
     const currentMarkdownFile = new CurrentMarkdownFileContext(this.app.workspace);
-    const vaultIndex = new VaultAnnotationIndex();
+    let markVaultCatalogDirty: (filePath: string) => void = () => undefined;
     const styleName = (styleId: string): string | undefined =>
       this.pluginSettings.stylePresets.find((preset) => preset.id === styleId)?.name;
     const repository = new SidecarRepository(sidecarStore, {
       onEventIssue: (error) => console.warn('[Inkstone Annotations]', error),
-      onRecordChanged: (record) => {
-        applyCanonicalRecordChanged(vaultIndex, record, styleName);
-      },
-      onRecordRemoved: (record) => {
-        applyCanonicalRecordRemoved(vaultIndex, record);
-      },
+      onRecordChanged: (record) => markVaultCatalogDirty(record.filePath),
+      onRecordRemoved: (record) => markVaultCatalogDirty(record.filePath),
     });
     let refreshInkSurfaceProjection: (record: InkSurfaceRecord) => void = () => undefined;
     const inkRepository = new InkSurfaceRepository(sidecarStore, {
@@ -228,18 +221,96 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     if (snapshotDraftStore !== undefined) {
       this.runtime.registerDisposer(() => snapshotDraftStore.close());
     }
-    const inkSurfaceProjections = new CanonicalInkSurfaceProjectionCoordinator({
-      applySummaries: (filePath, summaries) =>
-        this.sidebarView?.applyInkSurfaceSummaries(filePath, summaries),
-      index: vaultIndex,
-      listSurfaceSummaries: (filePath) => canonicalInkSummaries.listSurfaceSummaries(filePath),
+    const vaultFingerprint = await hashText(
+      resolveVaultLocalIdentity(this.app.vault, this.pluginSettings.deviceId),
+    );
+    const vaultCatalog =
+      globalThis.indexedDB === undefined || globalThis.IDBKeyRange === undefined
+        ? null
+        : new IndexedDbVaultCatalog({
+            IDBKeyRange: globalThis.IDBKeyRange,
+            databaseName: `inkstone-vault-catalog-v1-${vaultFingerprint.slice(0, 24)}`,
+            indexedDB: globalThis.indexedDB,
+            vaultFingerprint,
+            yieldControl: () => new Promise((resolve) => setTimeout(resolve, 0)),
+          });
+    const vaultCatalogReconciler = new VaultCatalogReconciler({
+      onIssue: (error) => console.warn('[Inkstone Annotations]', error),
+      source: {
+        isSourceAvailable: (filePath) => this.app.vault.getFileByPath(filePath) !== null,
+        listAnnotations: (filePath) => repository.listAnnotations(filePath),
+        listNotes: () => repository.listNotes(),
+        readNoteMeta: (filePath) => repository.readNoteMeta(filePath),
+        listSnapshotRecords: (filePath) => snapshotAnnotationRepository.listRecords(filePath),
+        listSurfaceSummaries: (filePath) => canonicalInkSummaries.listSurfaceSummaries(filePath),
+        readMarkdown: async (filePath) => {
+          const file = this.app.vault.getFileByPath(filePath);
+          if (file === null) throw new Error(`Snapshot source note is missing: ${filePath}`);
+          return this.app.vault.cachedRead(file);
+        },
+      },
+      styleName,
+      yieldControl: () => new Promise((resolve) => setTimeout(resolve, 0)),
     });
+    const vaultCatalogMarkdownProjector =
+      vaultCatalog === null
+        ? null
+        : new VaultCatalogMarkdownProjector(vaultCatalog, {
+            yieldControl: () => new Promise((resolve) => setTimeout(resolve, 0)),
+          });
+    const vaultCatalogSession = new VaultCatalogSession({
+      onIssue: (error) => console.warn('[Inkstone Annotations]', error),
+      openCatalog: async (signal) => {
+        if (vaultCatalog === null) throw new Error('Vault Catalog IndexedDB is unavailable.');
+        await vaultCatalogReconciler.ensureInitialized(vaultCatalog, signal);
+        return vaultCatalog;
+      },
+      projectPaths: async (_store, paths, signal) => {
+        if (vaultCatalog === null) throw new Error('Vault Catalog IndexedDB is unavailable.');
+        const markdownPaths = paths
+          .filter((path) => path.startsWith('markdown:'))
+          .map((path) => path.slice('markdown:'.length));
+        const canonicalPaths = paths.filter((path) => !path.startsWith('markdown:'));
+        if (canonicalPaths.length > 0) {
+          await vaultCatalogReconciler.reconcileFiles(vaultCatalog, canonicalPaths, signal);
+        }
+        if (markdownPaths.length > 0 && vaultCatalogMarkdownProjector !== null) {
+          await vaultCatalog.setFreshness('reconciling');
+          try {
+            for (const filePath of markdownPaths) {
+              const [meta, file] = await Promise.all([
+                repository.readNoteMeta(filePath),
+                Promise.resolve(this.app.vault.getFileByPath(filePath)),
+              ]);
+              if (meta === null || file === null) continue;
+              const source = await this.app.vault.cachedRead(file);
+              await vaultCatalogMarkdownProjector.apply({
+                noteId: meta.noteId,
+                ...(signal === undefined ? {} : { signal }),
+                source,
+              });
+            }
+            await vaultCatalog.setFreshness('current');
+          } catch (error) {
+            await vaultCatalog.setFreshness('stale');
+            throw error;
+          }
+        }
+      },
+      reconcile: (_store, signal) => {
+        if (vaultCatalog === null) throw new Error('Vault Catalog IndexedDB is unavailable.');
+        return vaultCatalogReconciler.reconcile(vaultCatalog, signal);
+      },
+    });
+    markVaultCatalogDirty = (filePath) => vaultCatalogSession.markDirtyPath(filePath);
     refreshInkSurfaceProjection = (record) => {
-      void inkSurfaceProjections
-        .refresh(record)
+      markVaultCatalogDirty(record.filePath);
+      void canonicalInkSummaries
+        .listSurfaceSummaries(record.filePath)
+        .then((summaries) => this.sidebarView?.applyInkSurfaceSummaries(record.filePath, summaries))
         .catch((error) => console.warn('[Inkstone Annotations]', error));
     };
-    this.runtime.registerDisposer(() => inkSurfaceProjections.dispose());
+    this.runtime.registerDisposer(() => vaultCatalogSession.close());
     const annotationService = new AnnotationService({
       deviceId: this.pluginSettings.deviceId,
       repository,
@@ -362,29 +433,6 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         title: `Export ${input.title}`,
       });
     };
-    const vaultIndexCache = new VaultIndexCache(sidecarStore);
-    const vaultIndexBuilder = new VaultIndexBuilder({
-      cache: vaultIndexCache,
-      index: vaultIndex,
-      onCacheIssue: (error) => console.warn('[Inkstone Annotations]', error),
-      source: {
-        isSourceAvailable: (filePath) => this.app.vault.getFileByPath(filePath) !== null,
-        listAnnotations: (filePath) => repository.listAnnotations(filePath),
-        listNotes: () => repository.listNotes(),
-        listSnapshotSummaries: async (filePath) => {
-          const entries = await snapshotAnnotationRepository.listIndexEntries(filePath);
-          if (entries.length === 0) return [];
-          const file = this.app.vault.getFileByPath(filePath);
-          if (file === null) return [];
-          const source = await this.app.vault.cachedRead(file);
-          return entries.map((entry) =>
-            createSnapshotAnnotationSummaryFromIndexEntry(entry, source),
-          );
-        },
-        listSurfaceSummaries: (filePath) => canonicalInkSummaries.listSurfaceSummaries(filePath),
-      },
-      styleName,
-    });
     let livePreview: LivePreviewAnnotationCoordinator | null = null;
     const annotationProjections = new AnnotationProjectionCoordinator({
       consumers: [
@@ -613,8 +661,11 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             await refreshAnnotationSurfaces(filePath);
           },
           bulkDelete: async (selection) => {
-            const textSelection = selection.filter((item) => item.type !== 'ink');
+            const textSelection = selection.filter(
+              (item) => item.type !== 'ink' && item.type !== 'snapshot',
+            );
             const inkSelection = selection.filter((item) => item.type === 'ink');
+            const snapshotSelection = selection.filter((item) => item.type === 'snapshot');
             const failed: AnnotationSidebarBulkSelection[] = [];
             const succeeded: AnnotationSidebarDeletedItem[] = [];
 
@@ -658,6 +709,26 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
                   id: item.id,
                   noteId: deleted.noteId,
                   type: 'ink',
+                });
+              } catch (error) {
+                console.warn('[Inkstone Annotations]', error);
+                failed.push(item);
+              }
+            }
+            for (const item of snapshotSelection) {
+              try {
+                const deleted = await snapshotAnnotationRepository.tombstone(
+                  item.filePath,
+                  item.id,
+                  item.expectedRevision,
+                  new Date().toISOString(),
+                );
+                succeeded.push({
+                  deletedRevision: deleted.revision,
+                  filePath: deleted.filePath,
+                  id: item.id,
+                  noteId: deleted.noteId,
+                  type: 'snapshot',
                 });
               } catch (error) {
                 console.warn('[Inkstone Annotations]', error);
@@ -783,7 +854,10 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             const failed: AnnotationSidebarDeletedItem[] = [];
             const restoredFilePaths = new Set<string>();
             const inkSelection = selection.filter((item) => item.type === 'ink');
-            for (const item of selection.filter((candidate) => candidate.type !== 'ink')) {
+            const snapshotSelection = selection.filter((item) => item.type === 'snapshot');
+            for (const item of selection.filter(
+              (candidate) => candidate.type !== 'ink' && candidate.type !== 'snapshot',
+            )) {
               try {
                 await annotationService.undoDeletion(item.filePath, item.id, item.deletedRevision);
                 restoredFilePaths.add(item.filePath);
@@ -796,6 +870,20 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             for (const item of inkSelection) {
               try {
                 await restoreCanonicalInk(item.filePath, item.id, item.deletedRevision);
+                restoredFilePaths.add(item.filePath);
+              } catch (error) {
+                console.warn('[Inkstone Annotations]', error);
+                failed.push(item);
+              }
+            }
+            for (const item of snapshotSelection) {
+              try {
+                await snapshotAnnotationRepository.restore(
+                  item.filePath,
+                  item.id,
+                  item.deletedRevision,
+                  new Date().toISOString(),
+                );
                 restoredFilePaths.add(item.filePath);
               } catch (error) {
                 console.warn('[Inkstone Annotations]', error);
@@ -820,23 +908,21 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         inkRepository: canonicalInkSidebarRepository,
         service: annotationService,
         snapshots: {
-          delete: (summary) => {
-            void snapshotAnnotationRepository
-              .tombstone(summary.filePath, summary.id, summary.revision, new Date().toISOString())
-              .then(
-                () => view.refreshAfterCanonicalMutation(summary.filePath),
-                (error) => console.warn('[Inkstone Annotations]', error),
-              );
+          delete: async (summary) => {
+            await snapshotAnnotationRepository.tombstone(
+              summary.filePath,
+              summary.id,
+              summary.revision,
+              new Date().toISOString(),
+            );
           },
           edit: (summary) => {
             void snapshotAnnotationManager
               ?.reopen(summary.filePath, summary.id)
               .catch((error) => console.warn('[Inkstone Annotations]', error));
           },
-          exportPng: (summary) => {
-            void snapshotAnnotationManager
-              ?.exportSnapshot(summary.filePath, summary.id)
-              .catch((error) => console.warn('[Inkstone Annotations]', error));
+          exportPng: async (summary) => {
+            await snapshotAnnotationManager?.exportSnapshot(summary.filePath, summary.id);
           },
           jump: (summary) => {
             void snapshotAnnotationManager
@@ -900,8 +986,10 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             Promise.resolve(null),
         },
         stylePresets: this.pluginSettings.stylePresets,
-        vaultIndex,
-        vaultIndexBuilder,
+        closeVaultCatalog: () => vaultCatalogSession.close(),
+        markVaultCatalogDirty: (filePath) => vaultCatalogSession.markDirtyPath(filePath),
+        requestVaultCatalogReconcile: () => vaultCatalogSession.requestReconcile(),
+        vaultCatalog: vaultCatalogSession,
       });
       this.sidebarView = view;
       return view;
@@ -1206,22 +1294,23 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on('active-leaf-change', (leaf) => {
         currentMarkdownFile.observeLeaf(leaf);
+        const filePath = currentMarkdownFile.currentFilePath();
+        if (filePath !== null) {
+          void repository
+            .readNoteMeta(filePath)
+            .then((meta) => {
+              if (meta !== null) {
+                vaultCatalogSession.recordNoteOpened(meta.noteId, new Date().toISOString());
+              }
+            })
+            .catch((error) => console.warn('[Inkstone Annotations]', error));
+        }
         void this.sidebarView?.followActiveFile();
       }),
     );
-    let sidecarRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-    const scheduleExternalSidecarRefresh = (): void => {
-      if (sidecarRefreshTimer !== null) clearTimeout(sidecarRefreshTimer);
-      sidecarRefreshTimer = setTimeout(() => {
-        sidecarRefreshTimer = null;
-        void this.sidebarView
-          ?.refreshAfterCanonicalSidecarChange()
-          .catch((error) => console.warn('[Inkstone Annotations]', error));
-      }, 180);
-    };
     const handleCanonicalSidecarEvent = (file: { readonly path: string }): void => {
       const canonical =
-        /^\.obsidian-annotations\/v1\/notes\/[^/]+\/(?:(?:annotations|surfaces)\/[^/]+\.json|ink-summaries\.json|ink\.json)$/u.test(
+        /^\.obsidian-annotations\/v1\/notes\/[^/]+\/(?:(?:annotations|surfaces)\/[^/]+\.json|snapshot-annotations\/[^/]+\/(?:record|summary)\.json|ink-summaries\.json|ink\.json)$/u.test(
           file.path,
         );
       if (!canonical) return;
@@ -1233,6 +1322,17 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         })
         .then((unchangedLocalWrite) => {
           if (unchangedLocalWrite) return;
+          void repository
+            .resolveFilePathForSidecar(file.path)
+            .then((filePath) => {
+              if (filePath === null) {
+                vaultCatalogSession.requestReconcile();
+                return;
+              }
+              markVaultCatalogDirty(filePath);
+              void this.sidebarView?.refreshAfterCanonicalMutation(filePath);
+            })
+            .catch((error) => console.warn('[Inkstone Annotations]', error));
           if (file.path.endsWith('/ink.json')) {
             void inkSnapshotRepository
               .resolveFilePath(file.path)
@@ -1260,13 +1360,8 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
               )
               .catch((error) => console.warn('[Inkstone Annotations]', error));
           }
-          scheduleExternalSidecarRefresh();
         });
     };
-    this.runtime.registerDisposer(() => {
-      if (sidecarRefreshTimer !== null) clearTimeout(sidecarRefreshTimer);
-      sidecarRefreshTimer = null;
-    });
     this.registerEvent(this.app.vault.on('create', handleCanonicalSidecarEvent));
     this.registerEvent(this.app.vault.on('modify', handleCanonicalSidecarEvent));
     this.registerEvent(this.app.vault.on('delete', handleCanonicalSidecarEvent));
@@ -1277,25 +1372,15 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         if (!(file instanceof TFile) || file.extension !== 'md') {
           return;
         }
-        void vaultIndex
-          .batch(async () => {
-            const meta = await sidecarLifecycle.reconcileObservedRename(oldPath, file.path);
-            if (meta !== null) {
-              vaultIndex.renameNote({ newPath: file.path, noteId: meta.noteId, oldPath });
-            }
-            return meta;
-          })
+        void sidecarLifecycle
+          .reconcileObservedRename(oldPath, file.path)
           .then(async (meta) => {
             await snapshotAnnotationRepository.reconcileObservedRename(
               oldPath,
               file.path,
               new Date().toISOString(),
             );
-            if (meta !== null) {
-              await vaultIndexCache
-                .clear()
-                .catch((error) => console.warn('[Inkstone Annotations]', error));
-            }
+            if (meta !== null) markVaultCatalogDirty(file.path);
             void this.app.vault
               .cachedRead(file)
               .then((source) => annotationService.reconcileNotePath(file.path, source))
@@ -1307,6 +1392,9 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
+        if (file instanceof TFile && file.extension === 'md') {
+          vaultCatalogSession.markDirtyPath(`markdown:${file.path}`);
+        }
         const activeMarkdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (
           !(file instanceof TFile) ||
@@ -1326,15 +1414,11 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         if (!(file instanceof TFile) || file.extension !== 'md') {
           return;
         }
-        vaultIndex.removeFile(file.path);
-        void vaultIndexCache
-          .clear()
-          .catch((error) => console.warn('[Inkstone Annotations]', error));
         void sidecarLifecycle
           .markSourceMissing(file.path)
           .then((meta) => {
             if (meta === null) return;
-            vaultIndex.removeNote(meta.noteId);
+            markVaultCatalogDirty(file.path);
           })
           .catch((error) => console.warn('[Inkstone Annotations]', error));
       }),
@@ -1420,4 +1504,15 @@ class ReadingSectionChild extends MarkdownRenderChild {
   override onunload(): void {
     this.cleanup();
   }
+}
+
+function resolveVaultLocalIdentity(
+  vault: { readonly adapter: unknown; getName(): string },
+  deviceId: string,
+): string {
+  const adapter = vault.adapter as { getBasePath?: () => string };
+  const basePath = adapter.getBasePath?.();
+  return basePath === undefined || basePath.length === 0
+    ? `mobile:${deviceId}:${vault.getName()}`
+    : `desktop:${basePath}`;
 }

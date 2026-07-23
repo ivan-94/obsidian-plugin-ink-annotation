@@ -8,6 +8,7 @@ import {
   type AnnotationIndexEntry,
 } from '../domain/vault-annotation-index';
 import type { SnapshotAnnotationSummary } from '../domain/snapshot-annotation-summary';
+import type { CatalogEntry, VaultCatalogQueryPort } from '../application/vault-catalog';
 import { createVaultSidebarStore } from './stores/annotation-sidebar-store';
 import { VaultAnnotationSidebar } from './vault-annotation-sidebar';
 
@@ -64,6 +65,184 @@ describe('Entire Vault annotation sidebar', () => {
     expect(state.searchQuery.value).toBe('');
     expect(container.textContent).not.toContain('No matching results');
     expect(container.querySelector('[data-annotation-id="one"]')).not.toBeNull();
+  });
+
+  it('shows recent note summaries first and loads child rows only when a group expands', async () => {
+    const container = document.createElement('div');
+    const entriesForNote = vi.fn().mockResolvedValue({
+      entries: [catalogEntry()],
+      hasMore: false,
+      meta: { freshness: 'current', projectionEpoch: 1 },
+      state: 'ready',
+    });
+    const catalog: VaultCatalogQueryPort = {
+      entriesForNote,
+      recentNotes: vi.fn().mockResolvedValue({
+        meta: { freshness: 'current', projectionEpoch: 1 },
+        notes: [
+          {
+            activityAt: '2026-07-23T00:00:00.000Z',
+            annotationCount: 1,
+            conflictCount: 0,
+            filePath: 'Notes/Recent.md',
+            folder: 'Notes',
+            legacyInkCount: 0,
+            lastAnnotatedAt: '2026-07-23T00:00:00.000Z',
+            noteId: 'note-recent',
+            problemCount: 0,
+            snapshotCount: 0,
+            textCount: 1,
+            title: 'Recent',
+          },
+        ],
+      }),
+      search: vi.fn(),
+      suggestFacet: vi.fn(),
+    };
+    const sidebar = new VaultAnnotationSidebar({ catalog, container, document });
+
+    sidebar.showReady();
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-note-group="Notes/Recent.md"]')).not.toBeNull(),
+    );
+    expect(container.querySelector('[data-annotation-id="recent-entry"]')).toBeNull();
+
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Expand Notes/Recent.md"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-annotation-id="recent-entry"]')).not.toBeNull(),
+    );
+    expect(entriesForNote).toHaveBeenCalledWith({ limit: 50, noteId: 'note-recent' });
+    sidebar.dispose();
+  });
+
+  it('reloads an expanded note page when the bounded Catalog refreshes', async () => {
+    const container = document.createElement('div');
+    let entries: readonly CatalogEntry[] = [catalogEntry()];
+    const entriesForNote = vi.fn(() =>
+      Promise.resolve({
+        entries,
+        hasMore: false,
+        meta: { freshness: 'current' as const, projectionEpoch: 1 },
+        state: 'ready' as const,
+      }),
+    );
+    const catalog: VaultCatalogQueryPort = {
+      entriesForNote,
+      recentNotes: vi.fn().mockResolvedValue({
+        meta: { freshness: 'current', projectionEpoch: 1 },
+        notes: [
+          {
+            activityAt: '2026-07-23T00:00:00.000Z',
+            annotationCount: 1,
+            conflictCount: 0,
+            filePath: 'Notes/Recent.md',
+            folder: 'Notes',
+            legacyInkCount: 0,
+            lastAnnotatedAt: '2026-07-23T00:00:00.000Z',
+            noteId: 'note-recent',
+            problemCount: 0,
+            snapshotCount: 0,
+            textCount: 1,
+            title: 'Recent',
+          },
+        ],
+      }),
+      search: vi.fn(),
+      suggestFacet: vi.fn(),
+    };
+    const sidebar = new VaultAnnotationSidebar({ catalog, container, document });
+
+    sidebar.showReady();
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-note-group="Notes/Recent.md"]')).not.toBeNull(),
+    );
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Expand Notes/Recent.md"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-annotation-id="recent-entry"]')).not.toBeNull(),
+    );
+
+    entries = [];
+    await sidebar.refreshCatalog();
+
+    expect(container.querySelector('[data-annotation-id="recent-entry"]')).toBeNull();
+    expect(entriesForNote).toHaveBeenCalledTimes(2);
+    sidebar.dispose();
+  });
+
+  it('refreshes the bounded Catalog after a successful bulk deletion', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    let entries: readonly CatalogEntry[] = [catalogEntry()];
+    const onBulkDelete = vi.fn(() => {
+      entries = [];
+      return Promise.resolve({ failed: [] });
+    });
+    const entriesForNote = vi.fn(() =>
+      Promise.resolve({
+        entries,
+        hasMore: false,
+        meta: { freshness: 'current' as const, projectionEpoch: 1 },
+        state: 'ready' as const,
+      }),
+    );
+    const catalog: VaultCatalogQueryPort = {
+      entriesForNote,
+      recentNotes: vi.fn().mockResolvedValue({
+        meta: { freshness: 'current', projectionEpoch: 1 },
+        notes: [
+          {
+            activityAt: '2026-07-23T00:00:00.000Z',
+            annotationCount: 1,
+            conflictCount: 0,
+            filePath: 'Notes/Recent.md',
+            folder: 'Notes',
+            legacyInkCount: 0,
+            lastAnnotatedAt: '2026-07-23T00:00:00.000Z',
+            noteId: 'note-recent',
+            problemCount: 0,
+            snapshotCount: 0,
+            textCount: 1,
+            title: 'Recent',
+          },
+        ],
+      }),
+      search: vi.fn(),
+      suggestFacet: vi.fn(),
+    };
+    const sidebar = new VaultAnnotationSidebar({
+      catalog,
+      container,
+      document,
+      onBulkDelete,
+    });
+
+    sidebar.showReady();
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-note-group="Notes/Recent.md"]')).not.toBeNull(),
+    );
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Expand Notes/Recent.md"]')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-annotation-id="recent-entry"]')).not.toBeNull(),
+    );
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
+    container
+      .querySelector<HTMLInputElement>('input[aria-label="Select annotation recent-entry"]')
+      ?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
+
+    await vi.waitFor(() => expect(onBulkDelete).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-annotation-id="recent-entry"]')).toBeNull(),
+    );
+    expect(entriesForNote).toHaveBeenCalledTimes(2);
+    sidebar.dispose();
   });
 
   it('coalesces rapid search input and runs only the final one-character query', () => {
@@ -274,6 +453,63 @@ describe('Entire Vault annotation sidebar', () => {
     expect(edit).toHaveBeenCalledOnce();
     expect(exported).toHaveBeenCalledOnce();
     expect(deleted).toHaveBeenCalledOnce();
+  });
+
+  it('selects a Vault Snapshot card in bulk mode without opening its normal actions', async () => {
+    const container = document.createElement('div');
+    const summary = snapshotSummary();
+    const index = new VaultAnnotationIndex();
+    index.rebuild([snapshotSummaryToIndexEntry(summary, 'note-snapshot')]);
+    const deleted = vi.fn(() => Promise.resolve({ failed: [] }));
+    const preview = vi.fn();
+    const sidebar = new VaultAnnotationSidebar({
+      container,
+      document,
+      index,
+      onBulkDelete: deleted,
+      onPreviewSnapshot: preview,
+    });
+    sidebar.showReady();
+
+    clickActionMenuItem(container, 'More actions', 'Select multiple…');
+    const checkbox = container.querySelector<HTMLButtonElement>(
+      'button[role="checkbox"][aria-label="Select Snapshot snapshot-vault"]',
+    );
+    expect(checkbox).not.toBeNull();
+    expect(container.querySelector('[data-inkstone-snapshot-actions]')).toBeNull();
+
+    container.querySelector<HTMLButtonElement>('.inkstone-snapshot-card__thumbnail')?.click();
+
+    expect(preview).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(
+        container
+          .querySelector('[data-inkstone-vault-snapshot-id="snapshot-vault"]')
+          ?.getAttribute('aria-selected'),
+      ).toBe('true');
+      expect(container.querySelector('.inkstone-bulk-action-dock')?.textContent).toContain(
+        '1 selected',
+      );
+    });
+    expect(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Tag selected"]')?.disabled,
+    ).toBe(true);
+    expect(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Style selected"]')?.disabled,
+    ).toBe(true);
+    container.querySelector<HTMLButtonElement>('button[aria-label="Delete selected"]')?.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
+    await vi.waitFor(() =>
+      expect(deleted).toHaveBeenCalledWith([
+        expect.objectContaining({
+          expectedRevision: 2,
+          filePath: 'Notes/Snapshot.md',
+          id: 'snapshot-vault',
+          noteId: 'note-snapshot',
+          type: 'snapshot',
+        }),
+      ]),
+    );
   });
 
   it('applies and removes a visible type filter chip', () => {
@@ -922,14 +1158,12 @@ describe('Entire Vault annotation sidebar', () => {
     container.querySelector<HTMLButtonElement>('button[aria-label="Confirm bulk delete"]')?.click();
 
     await vi.waitFor(() =>
-      expect(container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(
-        true,
+      expect(container.querySelector('[role="status"]')?.textContent).toContain(
+        '1 selected annotations could not be updated.',
       ),
     );
+    expect(container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
     expect(container.textContent).toContain('1 selected');
-    expect(container.querySelector('[role="status"]')?.textContent).toContain(
-      '1 selected annotations could not be updated.',
-    );
   });
 
   it('keeps a failed bulk action open with retryable feedback', async () => {
@@ -1061,6 +1295,25 @@ function entry(id: string, quote: string): AnnotationIndexEntry {
     tags: [],
     type: 'highlight',
     updatedAt: '2026-07-14T08:00:00.000Z',
+  };
+}
+
+function catalogEntry(): CatalogEntry {
+  return {
+    annotationId: 'recent-entry',
+    conflict: 0,
+    filePath: 'Notes/Recent.md',
+    folder: 'Notes',
+    noteId: 'note-recent',
+    position: 0,
+    quote: 'Recent row',
+    revision: 1,
+    searchTextNormalized: 'recent row',
+    status: 'active',
+    tags: [],
+    tagsNormalized: [],
+    type: 'highlight',
+    updatedAt: '2026-07-23T00:00:00.000Z',
   };
 }
 

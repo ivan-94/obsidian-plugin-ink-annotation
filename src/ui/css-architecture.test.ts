@@ -209,6 +209,25 @@ describe('production CSS architecture', () => {
     );
   });
 
+  it('keeps Snapshot cards and their overlay controls flat', () => {
+    expect(styles).toMatch(/\.inkstone-snapshot-card\s*\{[^}]*box-shadow:\s*none/u);
+    expect(styles).toMatch(/\.inkstone-snapshot-card\.is-active\s*\{[^}]*box-shadow:\s*none/u);
+    expect(styles).toMatch(/\.inkstone-snapshot-card__summary\s*\{[^}]*box-shadow:\s*none/u);
+    expect(styles).toMatch(/\.inkstone-snapshot-card__actions\s*\{[^}]*box-shadow:\s*none/u);
+  });
+
+  it('anchors the Snapshot selection control in the overflow slot with explicit states', () => {
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-card__selection\s*\{[^}]*position:\s*absolute[^}]*top:\s*8px[^}]*right:\s*8px[^}]*width:\s*32px[^}]*height:\s*32px/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-card__selection\.is-selected\s*\{[^}]*background:\s*var\(--interactive-accent\)[^}]*border-color:\s*var\(--interactive-accent\)/u,
+    );
+    expect(styles).toMatch(
+      /\.inkstone-snapshot-card__selection:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--interactive-accent\)/u,
+    );
+  });
+
   it('keeps Vault toolbar-to-results spacing compact without an empty chip row', () => {
     expect(styles).toMatch(/\.inkstone-sidebar--vault\s*\{[^}]*gap:\s*6px/u);
   });

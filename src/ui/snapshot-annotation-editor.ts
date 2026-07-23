@@ -57,16 +57,13 @@ export class SnapshotAnnotationEditor {
 
     const header = this.document.createElement('header');
     header.className = 'inkstone-snapshot-editor__header';
-    let mobileClose: HTMLButtonElement | null = null;
-    if (this.document.body.classList.contains('is-mobile')) {
-      mobileClose = this.document.createElement('button');
-      mobileClose.className = 'inkstone-snapshot-editor__close';
-      mobileClose.dataset.inkstoneSnapshotClose = '';
-      mobileClose.setAttribute('aria-label', 'Close Snapshot editor');
-      mobileClose.type = 'button';
-      setIcon(mobileClose, 'x');
-      header.append(mobileClose);
-    }
+    const closeButton = this.document.createElement('button');
+    closeButton.className = 'inkstone-snapshot-editor__close';
+    closeButton.dataset.inkstoneSnapshotClose = '';
+    closeButton.setAttribute('aria-label', 'Close Snapshot editor');
+    closeButton.type = 'button';
+    setIcon(closeButton, 'x');
+    header.append(closeButton);
     const title = this.document.createElement('div');
     title.className = 'inkstone-snapshot-editor__title';
     title.textContent = snapshot.record.filePath;
@@ -269,7 +266,7 @@ export class SnapshotAnnotationEditor {
       if (input.session.hasUnsavedChanges()) showBackDialog();
       else close();
     };
-    mobileClose?.addEventListener('click', onBack);
+    closeButton.addEventListener('click', onBack);
 
     const onPointerDown = (event: PointerEvent): void => {
       if (event.pointerType === 'touch') {

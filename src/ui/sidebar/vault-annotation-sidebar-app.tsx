@@ -3,7 +3,7 @@ import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 import type {
   AnnotationIndexEntry,
   VaultAnnotationFilters,
-  VaultAnnotationIndex,
+  VaultAnnotationQueryPort,
 } from '../../domain/vault-annotation-index';
 import { snapshotIndexEntryToSummary } from '../../domain/vault-annotation-index';
 import type { SnapshotAnnotationSummary } from '../../domain/snapshot-annotation-summary';
@@ -47,9 +47,11 @@ type VaultVirtualItem =
   | { readonly entry: AnnotationIndexEntry; readonly kind: 'row' };
 
 export interface VaultAnnotationSidebarAppProps {
+  readonly boundedCatalog?: boolean;
   readonly document: Document;
+  readonly groupTotals?: ReadonlyMap<string, number>;
   readonly headerContainer?: HTMLElement;
-  readonly index: VaultAnnotationIndex;
+  readonly index: VaultAnnotationQueryPort;
   readonly onBulkAddTags: (
     selection: readonly BulkSelectionSnapshot[],
     tags: readonly string[],
@@ -76,6 +78,7 @@ export interface VaultAnnotationSidebarAppProps {
   readonly onRequestFrame: () => void;
   readonly onResetSearchAndFilters: () => void;
   readonly onSearch: (value: string) => void;
+  readonly onToggleGroup?: (filePath: string, expanded: boolean) => void;
   readonly showScope: boolean;
   readonly state: VaultSidebarStore;
   readonly styleOptions: readonly SelectOption[];
@@ -137,9 +140,7 @@ function VaultReadyApp(props: VaultAnnotationSidebarAppProps) {
   );
   const selectedEntries = props.index
     .snapshot()
-    .filter(
-      (entry) => entry.type !== 'snapshot' && state.selectedKeys.value.has(vaultEntryKey(entry)),
-    );
+    .filter((entry) => state.selectedKeys.value.has(vaultEntryKey(entry)));
 
   return (
     <>
@@ -166,7 +167,7 @@ function VaultReadyApp(props: VaultAnnotationSidebarAppProps) {
                 <VaultGroupHeader
                   entries={item.entries}
                   filePath={item.filePath}
-                  total={item.total}
+                  total={props.groupTotals?.get(item.filePath) ?? item.total}
                   {...props}
                 />
               ) : (
@@ -225,11 +226,11 @@ function VaultHeader({
         onRenderNow();
       }}
       onSelectAll={() => {
-        state.selectedKeys.value = new Set(entries.map(vaultEntryKey));
+        state.selectedKeys.value = new Set(entries.slice(0, 50).map(vaultEntryKey));
         onRenderNow();
       }}
       selectedCount={state.selectedKeys.value.size}
-      totalCount={entries.length}
+      totalCount={Math.min(entries.length, 50)}
     />
   ) : (
     <>
@@ -338,7 +339,11 @@ function VaultToolbar(
             aria-label="Search annotations"
             disabled={state.bulkSelectionMode.value}
             onInput={(event) => onSearch(event.currentTarget.value)}
-            placeholder={`Search ${index.snapshot().length.toLocaleString()} ${index.snapshot().length === 1 ? 'annotation' : 'annotations'}…`}
+            placeholder={
+              props.boundedCatalog
+                ? 'Search annotations…'
+                : `Search ${index.snapshot().length.toLocaleString()} ${index.snapshot().length === 1 ? 'annotation' : 'annotations'}…`
+            }
             type="search"
             value={state.searchInput.value}
           />
@@ -409,7 +414,7 @@ function VaultFilterMenu({
   state,
 }: VaultAnnotationSidebarAppProps & {
   readonly dismissible: ReturnType<typeof useDismissibleMenu>;
-  readonly facets: ReturnType<VaultAnnotationIndex['facets']>;
+  readonly facets: ReturnType<VaultAnnotationQueryPort['facets']>;
 }) {
   const filters = state.filters.value;
   const update = (key: string, value: string): void => {
@@ -550,6 +555,7 @@ function VaultGroupHeader({
   entries,
   filePath,
   onRenderNow,
+  onToggleGroup,
   state,
   total,
 }: VaultAnnotationSidebarAppProps & {
@@ -558,14 +564,15 @@ function VaultGroupHeader({
   readonly total: number;
 }) {
   const expanded = !state.collapsedGroups.value.has(filePath);
-  const keys = entries.filter((entry) => entry.type !== 'snapshot').map(vaultEntryKey);
+  const keys = entries.map(vaultEntryKey);
   const selectedCount = keys.filter((key) => state.selectedKeys.value.has(key)).length;
-  const allSelected = total > 0 && selectedCount === total;
+  const allSelected = keys.length > 0 && selectedCount === keys.length;
   const toggleExpanded = (): void => {
     const collapsed = new Set(state.collapsedGroups.value);
     if (collapsed.has(filePath)) collapsed.delete(filePath);
     else collapsed.add(filePath);
     state.collapsedGroups.value = collapsed;
+    onToggleGroup?.(filePath, !expanded);
     onRenderNow();
   };
   return (
@@ -648,6 +655,15 @@ function VaultAnnotationRow(
   if (props.entry.type === 'snapshot') {
     const summary = snapshotIndexEntryToSummary(props.entry);
     const height = vaultSnapshotCardHeight(props.entry) - VAULT_SNAPSHOT_CARD_GAP;
+    const key = vaultEntryKey(props.entry);
+    const selected = props.state.selectedKeys.value.has(key);
+    const toggleSelection = (): void => {
+      const keys = new Set(props.state.selectedKeys.value);
+      if (keys.has(key)) keys.delete(key);
+      else keys.add(key);
+      props.state.selectedKeys.value = keys;
+      props.onRenderNow();
+    };
     return (
       <SnapshotAnnotationCard
         className="inkstone-vault-snapshot-card"
@@ -663,6 +679,15 @@ function VaultAnnotationRow(
         onRelink={props.onRelinkSnapshot}
         onRestore={props.onRestoreSnapshot}
         onSelectSource={props.onSelectSnapshotSource}
+        {...(props.state.bulkSelectionMode.value
+          ? {
+              selection: {
+                label: `Select Snapshot ${summary.id}`,
+                onToggle: toggleSelection,
+                selected,
+              },
+            }
+          : {})}
         style={{ height: `${height}px` }}
         summary={summary}
       />
@@ -744,7 +769,7 @@ function BulkActionBar({
 }: VaultAnnotationSidebarAppProps & {
   readonly entries: readonly AnnotationIndexEntry[];
 }) {
-  const hasInk = entries.some((entry) => entry.type === 'ink');
+  const hasInk = entries.some((entry) => entry.type === 'ink' || entry.type === 'snapshot');
   const snapshot = entries.map(toBulkSnapshot);
   if (!state.bulkSelectionMode.value) return null;
   const copy = (): void => {
@@ -893,7 +918,7 @@ function openDialog(
 }
 
 function retainFailed(
-  index: VaultAnnotationIndex,
+  index: VaultAnnotationQueryPort,
   state: VaultSidebarStore,
   failed: readonly BulkSelectionSnapshot[],
 ): void {
@@ -921,7 +946,7 @@ function updateFilter(
 
 function filterChips(
   filters: VaultAnnotationFilters,
-  facets: ReturnType<VaultAnnotationIndex['facets']>,
+  facets: ReturnType<VaultAnnotationQueryPort['facets']>,
 ): readonly {
   readonly key: string;
   readonly label: string;
@@ -1005,7 +1030,7 @@ function sortGroups(
 }
 
 function flattenResult(
-  result: ReturnType<VaultAnnotationIndex['query']>,
+  result: ReturnType<VaultAnnotationQueryPort['query']>,
 ): readonly AnnotationIndexEntry[] {
   return result.groups.flatMap((group) => group.rows);
 }
