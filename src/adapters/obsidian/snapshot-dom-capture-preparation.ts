@@ -35,11 +35,11 @@ export function removeSnapshotCaptureExcludedNodes(root: HTMLElement): void {
 }
 
 /**
- * Freezes the exact styles that Reading View resolved while the source still owns its Obsidian
- * ancestor context. Web capture clones are later moved under an isolated root where selectors such
- * as `.markdown-rendered code` no longer match.
+ * Inlines the exact styles for the first-party foreignObject serializer, which owns its clone.
+ * Do not use this before html-to-image: that renderer already performs its own complete
+ * computed-style traversal.
  */
-export async function freezeSnapshotCaptureComputedStyles(
+export async function inlineSnapshotCaptureComputedStyles(
   sourceRoot: HTMLElement,
   cloneRoot: HTMLElement,
   signal: AbortSignal,

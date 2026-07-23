@@ -8,7 +8,7 @@ import {
   type SnapshotCaptureRequest,
 } from './snapshot-capture-backend';
 import {
-  freezeSnapshotCaptureComputedStyles,
+  inlineSnapshotCaptureComputedStyles,
   pairSnapshotCaptureElements,
   removeSnapshotCaptureExcludedNodes,
   replaceDirectlyUnsupportedCaptureNodes,
@@ -84,7 +84,7 @@ export class ForeignObjectSnapshotCaptureBackend implements SnapshotCaptureBacke
     }
     const clone = subject.cloneNode(true) as HTMLElement;
     removeSnapshotCaptureExcludedNodes(clone);
-    await freezeSnapshotCaptureComputedStyles(subject, clone, request.signal);
+    await inlineSnapshotCaptureComputedStyles(subject, clone, request.signal);
     await inlineLocalImages(subject, clone, request.signal, this.resolveImageDataUrl);
     replaceDirectlyUnsupportedCaptureNodes(subject, clone);
     const bounds = request.subjectCssRect ?? subject.getBoundingClientRect();

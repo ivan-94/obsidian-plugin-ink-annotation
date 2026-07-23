@@ -10,7 +10,6 @@ import {
   type SnapshotCaptureRequest,
 } from './snapshot-capture-backend';
 import {
-  freezeSnapshotCaptureComputedStyles,
   pairSnapshotCaptureElements,
   removeSnapshotCaptureExcludedNodes,
   replaceDirectlyUnsupportedCaptureNodes,
@@ -76,7 +75,7 @@ export class HtmlToImageSnapshotCaptureBackend implements SnapshotCaptureBackend
     if (request.signal.aborted) throw aborted();
     const { clone, isolation } = isolateViewport(this.document, subject, request.viewportCssRect);
     try {
-      await prepareHtmlToImageClone(subject, clone, request.signal);
+      prepareHtmlToImageClone(subject, clone);
       positionIsolatedClone(
         clone,
         request.subjectCssRect ?? subject.getBoundingClientRect(),
@@ -190,13 +189,8 @@ function positionIsolatedClone(
   clone.style.width = `${sourceBounds.width}px`;
 }
 
-async function prepareHtmlToImageClone(
-  sourceRoot: HTMLElement,
-  cloneRoot: HTMLElement,
-  signal: AbortSignal,
-): Promise<void> {
+function prepareHtmlToImageClone(sourceRoot: HTMLElement, cloneRoot: HTMLElement): void {
   removeSnapshotCaptureExcludedNodes(cloneRoot);
-  await freezeSnapshotCaptureComputedStyles(sourceRoot, cloneRoot, signal);
   for (const { clone, source } of pairSnapshotCaptureElements<HTMLImageElement>(
     sourceRoot,
     cloneRoot,

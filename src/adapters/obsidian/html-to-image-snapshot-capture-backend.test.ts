@@ -61,7 +61,7 @@ describe('html-to-image Snapshot capture backend', () => {
     expect(document.querySelector('[data-inkstone-snapshot-isolation]')).toBeNull();
   });
 
-  it('freezes Reading View styles before the clone leaves its Obsidian ancestor context', async () => {
+  it('preserves Reading View styles inside the isolated renderer context', async () => {
     const style = document.createElement('style');
     style.textContent = `
       .markdown-preview-view { background-color: rgb(250, 250, 250); }
@@ -124,37 +124,42 @@ describe('html-to-image Snapshot capture backend', () => {
       expect(node.classList).toContain('markdown-rendered');
       const clone = node.querySelector<HTMLElement>('.markdown-preview-sizer');
       expect(clone?.style.transform).toBe('translate(40px, -1020px)');
-      expect(
-        clone?.querySelector<HTMLElement>('.capture-fixture-list-item')?.style.listStyleType,
-      ).toBe('none');
+      const listItem = clone?.querySelector<HTMLElement>('.capture-fixture-list-item');
+      expect(resolvedStyle(listItem)?.listStyleType).toBe('none');
       const link = clone?.querySelector<HTMLElement>('.capture-fixture-link');
-      expect(link?.style.backgroundRepeat).toBe('no-repeat');
-      expect(link?.style.backgroundPosition).toBe('right center');
-      expect(link?.style.paddingRight).toBe('12px');
+      const linkStyle = resolvedStyle(link);
+      expect(linkStyle?.backgroundRepeat).toBe('no-repeat');
+      expect(linkStyle?.backgroundPosition).toBe('right center');
+      expect(linkStyle?.paddingRight).toBe('12px');
       const inlineCode = clone?.querySelector<HTMLElement>('.capture-fixture-inline-code');
-      expect(inlineCode?.style.backgroundColor).toBe('rgb(244, 244, 244)');
-      expect(inlineCode?.style.borderRadius).toBe('4px');
-      expect(inlineCode?.style.padding).toBe('2px 4px');
+      const inlineCodeStyle = resolvedStyle(inlineCode);
+      expect(inlineCodeStyle?.backgroundColor).toBe('rgb(244, 244, 244)');
+      expect(inlineCodeStyle?.borderRadius).toBe('4px');
+      expect(inlineCodeStyle?.padding).toBe('2px 4px');
       const codeBlock = clone?.querySelector<HTMLElement>('.capture-fixture-code-block');
-      expect(codeBlock?.style.backgroundColor).toBe('rgb(248, 248, 248)');
-      expect(codeBlock?.style.borderRadius).toBe('6px');
-      expect(codeBlock?.style.padding).toBe('12px 16px');
-      expect(codeBlock?.style.position).toBe('relative');
+      const codeBlockStyle = resolvedStyle(codeBlock);
+      expect(codeBlockStyle?.backgroundColor).toBe('rgb(248, 248, 248)');
+      expect(codeBlockStyle?.borderRadius).toBe('6px');
+      expect(codeBlockStyle?.padding).toBe('12px 16px');
+      expect(codeBlockStyle?.position).toBe('relative');
       const copyButton = codeBlock?.querySelector<HTMLElement>('.copy-code-button');
-      expect(copyButton?.style.height).toBe('auto');
-      expect(copyButton?.style.padding).toBe('6px 8px');
-      expect(copyButton?.style.position).toBe('absolute');
-      expect(copyButton?.style.right).toBe('0px');
-      expect(copyButton?.style.top).toBe('0px');
-      expect(copyButton?.style.width).toBe('auto');
+      const copyButtonStyle = resolvedStyle(copyButton);
+      expect(copyButtonStyle?.height).toBe('auto');
+      expect(copyButtonStyle?.padding).toBe('6px 8px');
+      expect(copyButtonStyle?.position).toBe('absolute');
+      expect(copyButtonStyle?.right).toBe('0px');
+      expect(copyButtonStyle?.top).toBe('0px');
+      expect(copyButtonStyle?.width).toBe('auto');
       const quote = clone?.querySelector<HTMLElement>('.capture-fixture-quote');
-      expect(quote?.style.borderLeft).toBe('2px solid rgb(128, 96, 255)');
-      expect(quote?.style.paddingLeft).toBe('16px');
+      const quoteStyle = resolvedStyle(quote);
+      expect(quoteStyle?.borderLeft).toBe('2px solid rgb(128, 96, 255)');
+      expect(quoteStyle?.paddingLeft).toBe('16px');
       const tableCell = clone?.querySelector<HTMLElement>('.capture-fixture-table-cell');
-      expect(tableCell?.style.borderTopColor).toBe('rgb(220, 220, 220)');
-      expect(tableCell?.style.borderTopStyle).toBe('solid');
-      expect(tableCell?.style.borderTopWidth).toBe('1px');
-      expect(tableCell?.style.padding).toBe('4px 8px');
+      const tableCellStyle = resolvedStyle(tableCell);
+      expect(tableCellStyle?.borderTopColor).toBe('rgb(220, 220, 220)');
+      expect(tableCellStyle?.borderTopStyle).toBe('solid');
+      expect(tableCellStyle?.borderTopWidth).toBe('1px');
+      expect(tableCellStyle?.padding).toBe('4px 8px');
       return Promise.resolve(
         new Blob([pngHeader(744, 1009).buffer as ArrayBuffer], { type: 'image/png' }),
       );
@@ -176,6 +181,57 @@ describe('html-to-image Snapshot capture backend', () => {
       preview.remove();
       style.remove();
       document.body.classList.remove('is-mobile');
+    }
+  });
+
+  it('does not duplicate html-to-image style traversal before rendering a long note', async () => {
+    const style = document.createElement('style');
+    style.textContent = `
+      .markdown-preview-view { background-color: rgb(250, 250, 250); }
+      .markdown-rendered code {
+        background-color: rgb(244, 244, 244);
+        border-radius: 4px;
+        padding: 2px 4px;
+      }
+    `;
+    const preview = document.createElement('div');
+    preview.className = 'markdown-preview-view markdown-rendered';
+    const root = document.createElement('div');
+    root.className = 'markdown-preview-sizer';
+    for (let index = 0; index < 200; index += 1) {
+      const paragraph = document.createElement('p');
+      paragraph.innerHTML = `Row ${index} <code>code</code> <a>link</a><span>tail</span>`;
+      root.append(paragraph);
+    }
+    preview.append(root);
+    document.head.append(style);
+    document.body.append(preview);
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(20, -4000, 700, 8000));
+    const computedStyle = vi.spyOn(window, 'getComputedStyle');
+    let readsBeforeRenderer = Number.POSITIVE_INFINITY;
+    const renderToBlob = vi.fn(() => {
+      readsBeforeRenderer = computedStyle.mock.calls.length;
+      return Promise.resolve(
+        new Blob([pngHeader(744, 1009).buffer as ArrayBuffer], { type: 'image/png' }),
+      );
+    });
+    const backend = new HtmlToImageSnapshotCaptureBackend({ document, renderToBlob });
+
+    try {
+      await backend.capture({
+        captureGeneration: 9,
+        desiredPixelRatio: 1,
+        signal: new AbortController().signal,
+        subject: leaseSnapshotCaptureSubject(root),
+        subjectCssRect: { height: 8000, left: 20, top: -4000, width: 700 },
+        viewportCssRect: { height: 1009, left: 0, top: 120, width: 744 },
+      });
+
+      expect(readsBeforeRenderer).toBeLessThanOrEqual(4);
+    } finally {
+      computedStyle.mockRestore();
+      preview.remove();
+      style.remove();
     }
   });
 
@@ -278,6 +334,10 @@ function rect(left: number, top: number, width: number, height: number): DOMRect
     x: left,
     y: top,
   };
+}
+
+function resolvedStyle(element: HTMLElement | null | undefined): CSSStyleDeclaration | undefined {
+  return element === null || element === undefined ? undefined : getComputedStyle(element);
 }
 
 function pngHeader(width: number, height: number): Uint8Array {
