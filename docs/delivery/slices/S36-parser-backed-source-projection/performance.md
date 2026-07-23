@@ -24,8 +24,8 @@ These are deterministic local regression gates, not physical-iPad latency eviden
 
 | Artifact     | Baseline `9569874` |       S36 build |                    Delta |
 | ------------ | -----------------: | --------------: | -----------------------: |
-| `main.js`    |    1,257,706 bytes | 1,522,008 bytes | +264,302 bytes (+21.01%) |
-| `styles.css` |       74,403 bytes |    74,486 bytes |                +83 bytes |
+| `main.js`    |    1,257,706 bytes | 1,524,831 bytes | +267,125 bytes (+21.24%) |
+| `styles.css` |       74,403 bytes |    74,568 bytes |               +165 bytes |
 
 The JavaScript increase is the reviewed cost of the CommonMark/GFM/frontmatter/math parser stack and
 named-entity decoding. The mobile bundle scan passes and finds no Node.js/Electron runtime leak.

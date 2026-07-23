@@ -5,7 +5,11 @@ import type { StylePreset } from '../../domain/style-preset';
 import { annotationTargetText, type TextAnnotationRecord } from '../../domain/text-annotation';
 import { IconButton } from '../primitives/icon-button';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
-import { observeAnchoredElement, viewportBounds } from '../runtime/anchored-layer-position';
+import {
+  observeAnchoredElement,
+  observeViewportBottomSheet,
+  viewportBounds,
+} from '../runtime/anchored-layer-position';
 import { registerDismissibleLayer } from '../runtime/dismissible-layer';
 import type { InspectorDraft, InspectorState } from '../stores/annotation-inspector-store';
 import type { AnnotationInspectorInitialFocus } from '../annotation-inspector';
@@ -51,7 +55,13 @@ export function AnnotationInspectorApp(props: AnnotationInspectorAppProps) {
   useLayoutEffect(() => {
     const element = inspector.current;
     if (element === null) return;
-    if (state.kind === 'deleted' || viewportBounds(props.document).width <= 600) return;
+    if (state.kind === 'deleted') return;
+    if (viewportBounds(props.document).width <= 600) {
+      return observeViewportBottomSheet({
+        document: props.document,
+        element,
+      });
+    }
     return observeAnchoredElement({
       anchorRect: props.anchorRect,
       document: props.document,

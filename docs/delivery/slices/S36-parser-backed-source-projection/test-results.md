@@ -5,7 +5,7 @@
 - PASS: `npm run check`.
 - PASS: formatting, lint, TypeScript, coverage, performance, production build, mobile-bundle policy,
   and retired-document-Ink policy.
-- PASS: 122 test files and 877 tests in the coverage run.
+- PASS: 122 test files and 878 tests in the coverage run.
 - PASS: the durable HAT `prepare.sh prepare` workflow completed twice consecutively.
 - NOTE: the first full run hit one transient 10-second timeout in the pre-existing raster
   highlighter test. Its immediate focused rerun passed 2/2 in 1.74 seconds, and the second unchanged
@@ -19,6 +19,8 @@
 - PASS: MathJax element-endpoint rejection.
 - PASS: postprocessor-root replacement and view-level highlight restoration.
 - PASS: Reading View integration suite, 24 tests.
+- PASS: mobile Note Inspector moves and reclamps when the iPad visual viewport shrinks from the
+  software keyboard.
 
 ## Desktop HAT Evidence
 

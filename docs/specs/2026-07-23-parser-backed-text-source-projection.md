@@ -809,7 +809,9 @@ This implementation is release-qualified only when all of the following are true
   paragraph/list and heading/paragraph cross-block selection, postprocessor-root replacement after
   reload, and MathJax fail-closed Snapshot fallback.
 - Open release gate: physical-iPad P0 latency, native selection-handle, scrolling, and accessibility
-  evidence. It is not inferred from desktop, simulator, or automated evidence.
+  evidence. The first device run exposed a Note Inspector software-keyboard overlap; the mobile
+  visual-viewport correction is implemented and awaits device retest. Release qualification is not
+  inferred from desktop, simulator, or automated evidence.
 - Deferred surface: whole rendered-math selection remains disabled until an explicit MathJax DOM
   adapter proves a stable atomic boundary.
 

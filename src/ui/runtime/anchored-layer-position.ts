@@ -191,6 +191,63 @@ export function observeViewportBottomActionBar(input: {
   };
 }
 
+export function observeViewportBottomSheet(input: {
+  readonly document: Document;
+  readonly element: HTMLElement;
+  readonly margin?: number;
+}): () => void {
+  const margin = input.margin ?? 0;
+  const update = (): void => {
+    const viewport = viewportBounds(input.document);
+    const viewportBottom = viewport.top + viewport.height;
+    const mobileNavbar = input.document.querySelector<HTMLElement>('.mobile-navbar');
+    const navbarBounds = mobileNavbar?.getBoundingClientRect();
+    const availableBottom =
+      navbarBounds !== undefined &&
+      navbarBounds.top > viewport.top &&
+      navbarBounds.top < viewportBottom &&
+      navbarBounds.bottom >= viewportBottom - margin
+        ? navbarBounds.top
+        : viewportBottom;
+    const maximumHeight = Math.max(0, availableBottom - viewport.top - margin * 2);
+    const maximumWidth = Math.max(0, viewport.width - margin * 2);
+    input.element.style.setProperty('--inkstone-anchored-max-height', `${maximumHeight}px`);
+    input.element.style.setProperty('--inkstone-anchored-max-width', `${maximumWidth}px`);
+    const bounds = input.element.getBoundingClientRect();
+    const layerWidth = Math.min(maximumWidth, bounds.width || input.element.offsetWidth);
+    const layerHeight = Math.min(maximumHeight, bounds.height || input.element.offsetHeight);
+    const left = viewport.left + Math.max(margin, (viewport.width - layerWidth) / 2);
+    const top = Math.max(viewport.top + margin, availableBottom - margin - layerHeight);
+    input.element.style.bottom = 'auto';
+    input.element.style.left = `${Math.round(left)}px`;
+    input.element.style.right = 'auto';
+    input.element.style.top = `${Math.round(top)}px`;
+    input.element.dataset.inkstonePlacement = 'bottom-sheet';
+  };
+  const ownerWindow = input.document.defaultView;
+  const visualViewport = ownerWindow?.visualViewport;
+  const ResizeObserverConstructor = ownerWindow?.ResizeObserver;
+  const resizeObserver =
+    ResizeObserverConstructor === undefined
+      ? null
+      : new ResizeObserverConstructor(() => {
+          update();
+        });
+
+  update();
+  resizeObserver?.observe(input.element);
+  ownerWindow?.addEventListener('resize', update);
+  visualViewport?.addEventListener('resize', update);
+  visualViewport?.addEventListener('scroll', update);
+
+  return () => {
+    resizeObserver?.disconnect();
+    ownerWindow?.removeEventListener('resize', update);
+    visualViewport?.removeEventListener('resize', update);
+    visualViewport?.removeEventListener('scroll', update);
+  };
+}
+
 export function viewportBounds(document: Document): ViewportBounds {
   const visualViewport = document.defaultView?.visualViewport;
   if (visualViewport !== undefined && visualViewport !== null) {

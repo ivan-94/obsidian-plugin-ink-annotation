@@ -10,8 +10,10 @@ Desktop Obsidian 1.12.7 acceptance passed for the reported tight-list regression
 cross-kind selection, reload restoration, and MathJax fail-closed Snapshot fallback. Automated
 correctness, performance, mobile-bundle, and bounded-cache gates pass.
 
-The remaining release qualification is physical-iPad P0. Whole rendered-math selection is also
-intentionally disabled until a stable atomic MathJax DOM adapter is proven.
+Physical-iPad P0 is in progress. Its first run exposed a software-keyboard overlap in the shared
+Note Inspector; a visual-viewport bottom-sheet correction is implemented and awaiting device retest.
+Whole rendered-math selection is also intentionally disabled until a stable atomic MathJax DOM
+adapter is proven.
 
 ## Delivered
 
@@ -36,3 +38,4 @@ intentionally disabled until a stable atomic MathJax DOM adapter is proven.
 - [Source Manifest](source-manifest.md)
 - [Desktop restored-highlight screenshot](desktop-restored-highlights.jpeg)
 - [Desktop MathJax fallback screenshot](desktop-math-fallback.jpeg)
+- [iPad keyboard-overlap evidence before correction](ipad-keyboard-overlap-before.png)

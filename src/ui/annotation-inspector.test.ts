@@ -6,7 +6,14 @@ import type { TextAnnotationRecord } from '../domain/text-annotation';
 import { AnnotationInspector } from './annotation-inspector';
 
 describe('annotation inspector', () => {
-  afterEach(() => document.body.replaceChildren());
+  afterEach(() => {
+    document.body.replaceChildren();
+    vi.restoreAllMocks();
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: undefined,
+    });
+  });
 
   it('groups editor controls and footer actions into a compact layout', () => {
     const inspector = new AnnotationInspector({
@@ -135,6 +142,58 @@ describe('annotation inspector', () => {
       configurable: true,
       value: undefined,
     });
+  });
+
+  it('moves the mobile note inspector above the software keyboard as the visual viewport shrinks', () => {
+    let viewportHeight = 800;
+    let viewportTop = 0;
+    const visualViewport = new EventTarget();
+    Object.defineProperties(visualViewport, {
+      height: { configurable: true, get: () => viewportHeight },
+      offsetLeft: { configurable: true, value: 0 },
+      offsetTop: { configurable: true, get: () => viewportTop },
+      width: { configurable: true, value: 500 },
+    });
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    });
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this.classList.contains('inkstone-annotation-inspector')
+        ? new DOMRect(0, 0, 500, 420)
+        : new DOMRect();
+    });
+    const inspector = new AnnotationInspector({
+      document,
+      onDelete: (item) => Promise.resolve(item),
+      onNavigate: () => undefined,
+      onSave: (item) => Promise.resolve(item),
+      onUndo: (item) => Promise.resolve(item),
+      presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
+      writeClipboard: () => Promise.resolve(),
+    });
+
+    inspector.show({
+      anchorRect: new DOMRect(200, 680, 40, 30),
+      initialFocus: 'note',
+      records: [record('ipad-keyboard', 'Keyboard target')],
+    });
+
+    const element = document.querySelector<HTMLElement>('[data-inkstone-annotation-inspector]');
+    expect(element?.style.top).toBe('380px');
+
+    viewportHeight = 360;
+    viewportTop = 24;
+    visualViewport.dispatchEvent(new Event('resize'));
+
+    expect(element?.style.getPropertyValue('--inkstone-anchored-max-height')).toBe('360px');
+    expect(element?.style.top).toBe('24px');
+    expect(element?.style.bottom).toBe('auto');
+    expect(element?.dataset.inkstonePlacement).toBe('bottom-sheet');
+
+    inspector.close(false);
   });
 
   it('keeps Copy JSON directly available without an overflow menu', () => {
