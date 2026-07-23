@@ -139,9 +139,13 @@ export class SnapshotAnnotationEditor {
       return state.scale;
     };
     const fitCamera = (): number => {
-      const bounds = viewport.getBoundingClientRect();
+      const bounds = snapshotFitViewportBounds(
+        this.document,
+        root,
+        viewport.getBoundingClientRect(),
+      );
       if (bounds.width > 0 && bounds.height > 0) {
-        camera.fit({ height: bounds.height, width: bounds.width });
+        camera.fit(bounds);
       }
       const state = camera.snapshot();
       frame.style.transformOrigin = '0 0';
@@ -362,6 +366,26 @@ function touchGesture(points: readonly { readonly x: number; readonly y: number 
     centerY: (first.y + second.y) / 2,
     distance: Math.hypot(second.x - first.x, second.y - first.y),
   };
+}
+
+function snapshotFitViewportBounds(
+  document: Document,
+  root: HTMLElement,
+  viewport: Pick<DOMRect, 'bottom' | 'height' | 'left' | 'right' | 'top' | 'width'>,
+): { readonly height: number; readonly width: number } {
+  const full = { height: viewport.height, width: viewport.width };
+  if (!document.body.classList.contains('is-mobile')) return full;
+  const controls = root.querySelector<HTMLElement>('.inkstone-ink-controls');
+  // An explicitly dragged toolbar is user-positioned overlay chrome and must not redefine Fit.
+  if (controls === null || controls.style.top.length > 0) return full;
+  const toolbar = controls.getBoundingClientRect();
+  const horizontallyOverlaps = toolbar.right > viewport.left && toolbar.left < viewport.right;
+  const verticallyOverlaps = toolbar.bottom > viewport.top && toolbar.top < viewport.bottom;
+  if (!horizontallyOverlaps || !verticallyOverlaps || toolbar.width <= 0 || toolbar.height <= 0) {
+    return full;
+  }
+  const height = Math.min(viewport.height, toolbar.top - viewport.top - 8);
+  return height > 0 ? { height, width: viewport.width } : full;
 }
 
 function textButton(document: Document, label: string): HTMLButtonElement {

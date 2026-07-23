@@ -8,13 +8,13 @@ import {
   type SnapshotCaptureRequest,
 } from './snapshot-capture-backend';
 import {
+  freezeSnapshotCaptureComputedStyles,
   pairSnapshotCaptureElements,
   removeSnapshotCaptureExcludedNodes,
   replaceDirectlyUnsupportedCaptureNodes,
   replaceGeneratedCaptureNodesForRetry,
   replaceSnapshotCaptureNodeWithPlaceholder,
   snapshotImageIsRemote,
-  SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR,
 } from './snapshot-dom-capture-preparation';
 
 interface ForeignObjectRasterInput {
@@ -84,10 +84,10 @@ export class ForeignObjectSnapshotCaptureBackend implements SnapshotCaptureBacke
     }
     const clone = subject.cloneNode(true) as HTMLElement;
     removeSnapshotCaptureExcludedNodes(clone);
-    await inlineComputedStyles(subject, clone, request.signal);
+    await freezeSnapshotCaptureComputedStyles(subject, clone, request.signal);
     await inlineLocalImages(subject, clone, request.signal, this.resolveImageDataUrl);
     replaceDirectlyUnsupportedCaptureNodes(subject, clone);
-    const bounds = subject.getBoundingClientRect();
+    const bounds = request.subjectCssRect ?? subject.getBoundingClientRect();
     clone.removeAttribute('id');
     clone.style.margin = '0';
     clone.style.position = 'absolute';
@@ -133,43 +133,6 @@ export class ForeignObjectSnapshotCaptureBackend implements SnapshotCaptureBacke
   }
 }
 
-async function inlineComputedStyles(
-  sourceRoot: HTMLElement,
-  cloneRoot: HTMLElement,
-  signal: AbortSignal,
-): Promise<void> {
-  const sourceElements = [sourceRoot, ...sourceRoot.querySelectorAll<HTMLElement>('*')].filter(
-    (element) => !isExcludedNode(element),
-  );
-  const cloneElements = [cloneRoot, ...cloneRoot.querySelectorAll<HTMLElement>('*')];
-  if (sourceElements.length !== cloneElements.length) {
-    throw new SnapshotCaptureError(
-      'capture-failed',
-      'Snapshot style isolation could not preserve the supported DOM structure.',
-    );
-  }
-  const view = sourceRoot.ownerDocument.defaultView;
-  if (view === null)
-    throw new SnapshotCaptureError('backend-unavailable', 'DOM styles unavailable.');
-  for (let index = 0; index < sourceElements.length; index += 1) {
-    if (signal.aborted) throw aborted();
-    const source = sourceElements[index] as HTMLElement;
-    const target = cloneElements[index] as HTMLElement;
-    const computed = view.getComputedStyle(source);
-    for (let propertyIndex = 0; propertyIndex < computed.length; propertyIndex += 1) {
-      const property = computed.item(propertyIndex);
-      if (property.length > 0) {
-        target.style.setProperty(
-          property,
-          computed.getPropertyValue(property),
-          computed.getPropertyPriority(property),
-        );
-      }
-    }
-    if (index > 0 && index % 128 === 0) await nextTask();
-  }
-}
-
 async function inlineLocalImages(
   sourceRoot: HTMLElement,
   cloneRoot: HTMLElement,
@@ -200,13 +163,6 @@ async function inlineLocalImages(
       replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'local-image');
     }
   }
-}
-
-function isExcludedNode(element: HTMLElement): boolean {
-  return (
-    element.matches(SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR) ||
-    element.closest(SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR) !== null
-  );
 }
 
 function serializeForeignObjectClone(clone: HTMLElement, width: number, height: number): string {
@@ -291,10 +247,6 @@ function loadSvgDataUrlImage(
     image.decoding = 'async';
     image.src = dataUrl;
   });
-}
-
-function nextTask(): Promise<void> {
-  return new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 }
 
 function isElement(value: unknown): value is HTMLElement {

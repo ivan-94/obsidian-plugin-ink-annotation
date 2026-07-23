@@ -61,6 +61,124 @@ describe('html-to-image Snapshot capture backend', () => {
     expect(document.querySelector('[data-inkstone-snapshot-isolation]')).toBeNull();
   });
 
+  it('freezes Reading View styles before the clone leaves its Obsidian ancestor context', async () => {
+    const style = document.createElement('style');
+    style.textContent = `
+      .markdown-preview-view { background-color: rgb(250, 250, 250); }
+      .markdown-rendered .capture-fixture-list-item { list-style-type: none; }
+      .markdown-rendered .capture-fixture-link {
+        background-image: linear-gradient(rgb(1, 2, 3), rgb(1, 2, 3));
+        background-position: right center;
+        background-repeat: no-repeat;
+        padding-right: 12px;
+      }
+      .markdown-rendered .capture-fixture-inline-code {
+        background-color: rgb(244, 244, 244);
+        border-radius: 4px;
+        padding: 2px 4px;
+      }
+      .markdown-rendered .capture-fixture-code-block {
+        background-color: rgb(248, 248, 248);
+        border-radius: 6px;
+        padding: 12px 16px;
+        position: relative;
+      }
+      .is-mobile .markdown-rendered .capture-fixture-code-block > .copy-code-button {
+        height: auto;
+        padding: 6px 8px;
+        position: absolute;
+        right: 0;
+        top: 0;
+        width: auto;
+      }
+      .markdown-rendered .capture-fixture-quote {
+        border-left: 2px solid rgb(128, 96, 255);
+        padding-left: 16px;
+      }
+      .markdown-rendered .capture-fixture-table-cell {
+        border: 1px solid rgb(220, 220, 220);
+        padding: 4px 8px;
+      }
+    `;
+    document.body.classList.add('is-mobile');
+    const preview = document.createElement('div');
+    preview.className = 'markdown-preview-view markdown-rendered';
+    const root = document.createElement('div');
+    root.className = 'markdown-preview-sizer';
+    root.innerHTML = `
+      <ul><li class="capture-fixture-list-item">List item</li></ul>
+      <a class="capture-fixture-link">External link</a>
+      <code class="capture-fixture-inline-code">inline code</code>
+      <pre class="capture-fixture-code-block"><button class="copy-code-button">Copy</button><code>code block</code></pre>
+      <blockquote class="capture-fixture-quote">Quote</blockquote>
+      <mark class="capture-fixture-mark">marked text</mark>
+      <table><tbody><tr><td class="capture-fixture-table-cell">Cell</td></tr></tbody></table>
+    `;
+    preview.append(root);
+    document.head.append(style);
+    document.body.append(preview);
+    vi.spyOn(root, 'getBoundingClientRect').mockReturnValue(rect(80, -900, 600, 2400));
+    const renderToBlob = vi.fn((node: HTMLElement) => {
+      expect(node.style.background).toBe('rgb(250, 250, 250)');
+      expect(node.classList).toContain('markdown-preview-view');
+      expect(node.classList).toContain('markdown-rendered');
+      const clone = node.querySelector<HTMLElement>('.markdown-preview-sizer');
+      expect(clone?.style.transform).toBe('translate(40px, -1020px)');
+      expect(
+        clone?.querySelector<HTMLElement>('.capture-fixture-list-item')?.style.listStyleType,
+      ).toBe('none');
+      const link = clone?.querySelector<HTMLElement>('.capture-fixture-link');
+      expect(link?.style.backgroundRepeat).toBe('no-repeat');
+      expect(link?.style.backgroundPosition).toBe('right center');
+      expect(link?.style.paddingRight).toBe('12px');
+      const inlineCode = clone?.querySelector<HTMLElement>('.capture-fixture-inline-code');
+      expect(inlineCode?.style.backgroundColor).toBe('rgb(244, 244, 244)');
+      expect(inlineCode?.style.borderRadius).toBe('4px');
+      expect(inlineCode?.style.padding).toBe('2px 4px');
+      const codeBlock = clone?.querySelector<HTMLElement>('.capture-fixture-code-block');
+      expect(codeBlock?.style.backgroundColor).toBe('rgb(248, 248, 248)');
+      expect(codeBlock?.style.borderRadius).toBe('6px');
+      expect(codeBlock?.style.padding).toBe('12px 16px');
+      expect(codeBlock?.style.position).toBe('relative');
+      const copyButton = codeBlock?.querySelector<HTMLElement>('.copy-code-button');
+      expect(copyButton?.style.height).toBe('auto');
+      expect(copyButton?.style.padding).toBe('6px 8px');
+      expect(copyButton?.style.position).toBe('absolute');
+      expect(copyButton?.style.right).toBe('0px');
+      expect(copyButton?.style.top).toBe('0px');
+      expect(copyButton?.style.width).toBe('auto');
+      const quote = clone?.querySelector<HTMLElement>('.capture-fixture-quote');
+      expect(quote?.style.borderLeft).toBe('2px solid rgb(128, 96, 255)');
+      expect(quote?.style.paddingLeft).toBe('16px');
+      const tableCell = clone?.querySelector<HTMLElement>('.capture-fixture-table-cell');
+      expect(tableCell?.style.borderTopColor).toBe('rgb(220, 220, 220)');
+      expect(tableCell?.style.borderTopStyle).toBe('solid');
+      expect(tableCell?.style.borderTopWidth).toBe('1px');
+      expect(tableCell?.style.padding).toBe('4px 8px');
+      return Promise.resolve(
+        new Blob([pngHeader(744, 1009).buffer as ArrayBuffer], { type: 'image/png' }),
+      );
+    });
+    const backend = new HtmlToImageSnapshotCaptureBackend({ document, renderToBlob });
+
+    try {
+      await expect(
+        backend.capture({
+          captureGeneration: 8,
+          desiredPixelRatio: 1,
+          signal: new AbortController().signal,
+          subject: leaseSnapshotCaptureSubject(root),
+          subjectCssRect: { height: 2400, left: 80, top: -900, width: 600 },
+          viewportCssRect: { height: 1009, left: 40, top: 120, width: 744 },
+        }),
+      ).resolves.toMatchObject({ pixelHeight: 1009, pixelWidth: 744 });
+    } finally {
+      preview.remove();
+      style.remove();
+      document.body.classList.remove('is-mobile');
+    }
+  });
+
   it('preserves generated SVG and replaces individually unsupported nodes with placeholders', async () => {
     const root = document.createElement('div');
     const annotation = document.createElement('span');

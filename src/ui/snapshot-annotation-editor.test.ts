@@ -319,6 +319,41 @@ describe('Snapshot Annotation editor lifecycle', () => {
     }
   });
 
+  it('fits the captured image above the default mobile toolbar instead of beneath it', async () => {
+    document.body.replaceChildren();
+    document.body.classList.add('is-mobile');
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext());
+    const editor = new SnapshotAnnotationEditor({
+      createObjectUrl: () => 'data:image/png;base64,fixture',
+      document,
+      revokeObjectUrl: () => undefined,
+    });
+
+    try {
+      editor.open({
+        onClose: vi.fn(),
+        onDone: () => Promise.resolve(),
+        pngBytes: pngHeader(600, 400),
+        session: await emptySession(),
+      });
+      const viewport = document.querySelector<HTMLElement>('.inkstone-snapshot-editor__viewport');
+      const controls = document.querySelector<HTMLElement>('.inkstone-ink-controls');
+      const frame = document.querySelector<HTMLElement>('.inkstone-snapshot-editor__frame');
+      if (viewport === null || controls === null || frame === null) {
+        throw new Error('Fixture Snapshot editor surface was not mounted.');
+      }
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect(0, 100, 300, 200));
+      vi.spyOn(controls, 'getBoundingClientRect').mockReturnValue(rect(8, 250, 284, 46));
+
+      document.querySelector<HTMLButtonElement>('[data-inkstone-ink-zoom-fit]')?.click();
+
+      expect(frame.style.transform).toBe('translate(43.5px, 0px) scale(0.71)');
+    } finally {
+      editor.dispose();
+      document.body.classList.remove('is-mobile');
+    }
+  });
+
   it('restores the last tool, color, and width from the device-local preference', async () => {
     document.body.replaceChildren();
     const preferenceStore = new LocalInkToolPreferenceStore(

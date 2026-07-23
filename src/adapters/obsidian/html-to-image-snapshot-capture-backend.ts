@@ -10,6 +10,7 @@ import {
   type SnapshotCaptureRequest,
 } from './snapshot-capture-backend';
 import {
+  freezeSnapshotCaptureComputedStyles,
   pairSnapshotCaptureElements,
   removeSnapshotCaptureExcludedNodes,
   replaceDirectlyUnsupportedCaptureNodes,
@@ -74,8 +75,13 @@ export class HtmlToImageSnapshotCaptureBackend implements SnapshotCaptureBackend
     await waitForFontsBounded(this.document, request.signal);
     if (request.signal.aborted) throw aborted();
     const { clone, isolation } = isolateViewport(this.document, subject, request.viewportCssRect);
-    prepareHtmlToImageClone(subject, clone);
     try {
+      await prepareHtmlToImageClone(subject, clone, request.signal);
+      positionIsolatedClone(
+        clone,
+        request.subjectCssRect ?? subject.getBoundingClientRect(),
+        request.viewportCssRect,
+      );
       // html-to-image applies pixelRatio to these CSS-pixel bounds itself.
       const options = {
         filter: includeCaptureNode,
@@ -130,12 +136,12 @@ function isolateViewport(
   source: HTMLElement,
   viewport: SnapshotCaptureRequest['viewportCssRect'],
 ): { readonly clone: HTMLElement; readonly isolation: HTMLElement } {
-  const sourceBounds = source.getBoundingClientRect();
   const isolation = document.createElement('div');
   isolation.dataset.inkstoneSnapshotIsolation = '';
+  preserveCaptureAncestorContext(source, isolation);
   // html-to-image serializes this position into its SVG; offscreen coordinates blank WKWebView.
   Object.assign(isolation.style, {
-    background: getComputedStyle(source).backgroundColor,
+    background: resolveCaptureBackgroundColor(source),
     height: `${viewport.height}px`,
     left: '0',
     overflow: 'hidden',
@@ -146,19 +152,51 @@ function isolateViewport(
     zIndex: '-2147483648',
   });
   const clone = source.cloneNode(true) as HTMLElement;
+  isolation.append(clone);
+  document.body.append(isolation);
+  return { clone, isolation };
+}
+
+function preserveCaptureAncestorContext(source: HTMLElement, isolation: HTMLElement): void {
+  let ancestor = source.parentElement;
+  while (ancestor !== null && ancestor !== source.ownerDocument.body) {
+    for (const className of ancestor.classList) isolation.classList.add(className);
+    ancestor = ancestor.parentElement;
+  }
+}
+
+function resolveCaptureBackgroundColor(source: HTMLElement): string {
+  const view = source.ownerDocument.defaultView;
+  if (view === null) return 'transparent';
+  let element: HTMLElement | null = source;
+  while (element !== null) {
+    const color = view.getComputedStyle(element).backgroundColor;
+    if (color !== 'transparent' && !/^rgba\(0,\s*0,\s*0,\s*0\)$/u.test(color)) return color;
+    element = element.parentElement;
+  }
+  return 'transparent';
+}
+
+function positionIsolatedClone(
+  clone: HTMLElement,
+  sourceBounds: Pick<DOMRect, 'left' | 'top' | 'width'>,
+  viewport: SnapshotCaptureRequest['viewportCssRect'],
+): void {
   clone.removeAttribute('id');
   clone.style.margin = '0';
   clone.style.position = 'absolute';
   clone.style.transform = `translate(${sourceBounds.left - viewport.left}px, ${sourceBounds.top - viewport.top}px)`;
   clone.style.transformOrigin = '0 0';
   clone.style.width = `${sourceBounds.width}px`;
-  isolation.append(clone);
-  document.body.append(isolation);
-  return { clone, isolation };
 }
 
-function prepareHtmlToImageClone(sourceRoot: HTMLElement, cloneRoot: HTMLElement): void {
+async function prepareHtmlToImageClone(
+  sourceRoot: HTMLElement,
+  cloneRoot: HTMLElement,
+  signal: AbortSignal,
+): Promise<void> {
   removeSnapshotCaptureExcludedNodes(cloneRoot);
+  await freezeSnapshotCaptureComputedStyles(sourceRoot, cloneRoot, signal);
   for (const { clone, source } of pairSnapshotCaptureElements<HTMLImageElement>(
     sourceRoot,
     cloneRoot,

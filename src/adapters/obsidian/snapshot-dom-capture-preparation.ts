@@ -1,3 +1,5 @@
+import { SnapshotCaptureError } from './snapshot-capture-backend';
+
 export const SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR = [
   '.inkstone-reading-toolbar',
   '[data-inkstone-quick-toolbar-host]',
@@ -30,6 +32,52 @@ export interface CaptureElementPair<T extends Element> {
 
 export function removeSnapshotCaptureExcludedNodes(root: HTMLElement): void {
   for (const element of root.querySelectorAll(SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR)) element.remove();
+}
+
+/**
+ * Freezes the exact styles that Reading View resolved while the source still owns its Obsidian
+ * ancestor context. Web capture clones are later moved under an isolated root where selectors such
+ * as `.markdown-rendered code` no longer match.
+ */
+export async function freezeSnapshotCaptureComputedStyles(
+  sourceRoot: HTMLElement,
+  cloneRoot: HTMLElement,
+  signal: AbortSignal,
+): Promise<void> {
+  const sourceElements = [sourceRoot, ...sourceRoot.querySelectorAll<HTMLElement>('*')].filter(
+    (element) =>
+      !element.matches(SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR) &&
+      element.closest(SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR) === null,
+  );
+  const cloneElements = [cloneRoot, ...cloneRoot.querySelectorAll<HTMLElement>('*')];
+  if (sourceElements.length !== cloneElements.length) {
+    throw new SnapshotCaptureError(
+      'capture-failed',
+      'Snapshot style isolation could not preserve the supported DOM structure.',
+    );
+  }
+  const view = sourceRoot.ownerDocument.defaultView;
+  if (view === null) {
+    throw new SnapshotCaptureError('backend-unavailable', 'DOM styles unavailable.');
+  }
+  for (let index = 0; index < sourceElements.length; index += 1) {
+    if (signal.aborted) {
+      throw new SnapshotCaptureError('aborted', 'Snapshot capture was cancelled.');
+    }
+    const source = sourceElements[index] as HTMLElement;
+    const target = cloneElements[index] as HTMLElement;
+    const computed = view.getComputedStyle(source);
+    for (let propertyIndex = 0; propertyIndex < computed.length; propertyIndex += 1) {
+      const property = computed.item(propertyIndex);
+      if (property.length === 0) continue;
+      target.style.setProperty(
+        property,
+        computed.getPropertyValue(property),
+        computed.getPropertyPriority(property),
+      );
+    }
+    if (index > 0 && index % 128 === 0) await nextTask();
+  }
 }
 
 export function pairSnapshotCaptureElements<T extends Element>(
@@ -136,4 +184,8 @@ function resolvedDimension(
   if (Number.isFinite(measured) && measured > 0) return Math.max(1, Math.round(measured));
   const declared = Number.parseFloat(element.getAttribute(attribute) ?? '');
   return Number.isFinite(declared) && declared > 0 ? Math.max(1, Math.round(declared)) : fallback;
+}
+
+function nextTask(): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 }

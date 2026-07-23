@@ -151,6 +151,10 @@ export class ObsidianSnapshotAnnotationManager {
         preview.getBoundingClientRect(),
         this.input.document,
       );
+      const subjectCssRect = snapshotCaptureSubjectRect(
+        readingRoot.getBoundingClientRect(),
+        viewportCssRect,
+      );
       const sourceBinding = await buildSnapshotCaptureSourceBinding({
         filePath: file.path,
         projectionCache: this.sourceProjectionCache,
@@ -167,6 +171,7 @@ export class ObsidianSnapshotAnnotationManager {
         scrollLeft: preview.scrollLeft,
         scrollTop: preview.scrollTop,
         source,
+        subjectCssRect,
         view,
         viewportCssRect,
       };
@@ -178,6 +183,7 @@ export class ObsidianSnapshotAnnotationManager {
           Math.min(2, Math.max(1, this.input.document.defaultView?.devicePixelRatio ?? 1)),
         signal: controller.signal,
         subject: this.input.createCaptureSubject(readingRoot, selectedBackendId),
+        subjectCssRect,
         viewportCssRect,
       });
       await this.input.validatePngCoverage?.(capture.pngBytes, controller.signal);
@@ -521,6 +527,12 @@ export class ObsidianSnapshotAnnotationManager {
     readonly scrollLeft: number;
     readonly scrollTop: number;
     readonly source: string;
+    readonly subjectCssRect: {
+      readonly height: number;
+      readonly left: number;
+      readonly top: number;
+      readonly width: number;
+    };
     readonly view: MarkdownView;
     readonly viewportCssRect: {
       readonly height: number;
@@ -540,6 +552,13 @@ export class ObsidianSnapshotAnnotationManager {
       input.preview.scrollTop !== input.scrollTop ||
       (input.readingRoot.textContent ?? '') !== input.renderedText ||
       !sameCaptureRect(
+        snapshotCaptureSubjectRect(
+          input.readingRoot.getBoundingClientRect(),
+          input.viewportCssRect,
+        ),
+        input.subjectCssRect,
+      ) ||
+      !sameCaptureRect(
         integerCaptureRect(input.preview.getBoundingClientRect(), this.input.document),
         input.viewportCssRect,
       )
@@ -548,6 +567,38 @@ export class ObsidianSnapshotAnnotationManager {
     }
     return (await this.input.app.vault.cachedRead(active.file)).localeCompare(input.source) === 0;
   }
+}
+
+function snapshotCaptureSubjectRect(
+  rect: Pick<DOMRect, 'height' | 'left' | 'top' | 'width'>,
+  fallback: {
+    readonly height: number;
+    readonly left: number;
+    readonly top: number;
+    readonly width: number;
+  },
+): {
+  readonly height: number;
+  readonly left: number;
+  readonly top: number;
+  readonly width: number;
+} {
+  if (
+    Number.isFinite(rect.left) &&
+    Number.isFinite(rect.top) &&
+    Number.isFinite(rect.width) &&
+    Number.isFinite(rect.height) &&
+    rect.width > 0 &&
+    rect.height > 0
+  ) {
+    return Object.freeze({
+      height: rect.height,
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+    });
+  }
+  return fallback;
 }
 
 function sameCaptureRect(

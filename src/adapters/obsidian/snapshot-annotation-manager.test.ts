@@ -357,6 +357,7 @@ describe('Snapshot Annotation desktop core flow', () => {
     commandPalette.className = 'prompt';
     document.body.append(contentEl, commandPalette);
     vi.spyOn(preview, 'getBoundingClientRect').mockReturnValue(rect(20, 30, 300, 200));
+    vi.spyOn(sizer, 'getBoundingClientRect').mockReturnValue(rect(40, -500, 260, 1200));
     vi.spyOn(heading, 'getBoundingClientRect').mockReturnValue(rect(40, 50, 180, 30));
     vi.spyOn(paragraph, 'getBoundingClientRect').mockReturnValue(rect(40, 110, 220, 50));
     vi.spyOn(repeatedParagraph, 'getBoundingClientRect').mockReturnValue(rect(40, 165, 220, 30));
@@ -374,6 +375,12 @@ describe('Snapshot Annotation desktop core flow', () => {
         expect(commandPalette.style.display).toBe('none');
         expect(headingCollapse.style.display).toBe('none');
         expect(generated.style.display).not.toBe('none');
+        expect(request.subjectCssRect).toEqual({
+          height: 1200,
+          left: 40,
+          top: -500,
+          width: 260,
+        });
         return Promise.resolve({
           backendId: 'fake-capture',
           backendVersion: '1',

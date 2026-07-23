@@ -28,6 +28,8 @@ export interface SnapshotCaptureRequest {
   readonly desiredPixelRatio: number;
   readonly signal: AbortSignal;
   readonly subject: SnapshotCaptureSubjectHandle;
+  /** Frozen viewport-space bounds of the leased Reading DOM root for Web clone positioning. */
+  readonly subjectCssRect?: SnapshotCaptureCssRect;
   readonly viewportCssRect: SnapshotCaptureCssRect;
 }
 
@@ -148,6 +150,19 @@ function assertCaptureRequest(request: SnapshotCaptureRequest): void {
     height <= 0
   ) {
     throw invalidResult('Snapshot capture rectangle must be finite and non-empty.');
+  }
+  if (request.subjectCssRect !== undefined) {
+    const subject = request.subjectCssRect;
+    if (
+      !Number.isFinite(subject.left) ||
+      !Number.isFinite(subject.top) ||
+      !Number.isFinite(subject.width) ||
+      !Number.isFinite(subject.height) ||
+      subject.width <= 0 ||
+      subject.height <= 0
+    ) {
+      throw invalidResult('Snapshot capture subject rectangle must be finite and non-empty.');
+    }
   }
 }
 
