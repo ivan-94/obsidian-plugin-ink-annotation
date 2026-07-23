@@ -314,5 +314,30 @@ describe('quick highlight toolbar', () => {
       'Generated content cannot be mapped to stable Markdown source.',
     );
     expect(document.querySelector('.inkstone-quick-toolbar button')).toBeNull();
+    toolbar.close(false);
+  });
+
+  it('offers an explicit Snapshot action without converting the failed text annotation', async () => {
+    const annotateSnapshot = vi.fn(() => Promise.resolve());
+    const toolbar = new QuickHighlightToolbar({
+      document,
+      onAction: () => Promise.resolve(),
+      onDismiss: () => undefined,
+    });
+
+    toolbar.showUnavailable({
+      action: {
+        label: 'Annotate a snapshot instead',
+        onActivate: annotateSnapshot,
+      },
+      anchorRect: new DOMRect(100, 120, 80, 20),
+      message: 'This content cannot be traced to this Markdown file.',
+    });
+    document
+      .querySelector<HTMLButtonElement>('button[aria-label="Annotate a snapshot instead"]')
+      ?.click();
+
+    await vi.waitFor(() => expect(annotateSnapshot).toHaveBeenCalledOnce());
+    expect(document.querySelector('button[aria-label="Annotate a snapshot instead"]')).toBeNull();
   });
 });

@@ -3,7 +3,11 @@ import { MarkdownView, type TFile } from 'obsidian';
 import { SnapshotAnnotationSession } from '../../application/snapshot-annotation-session';
 import { snapshotDraftKey } from '../../application/snapshot-annotation-session';
 import type { SnapshotAnnotationDraftStore } from '../../application/snapshot-annotation-draft-store';
-import { locateRenderedBlockSourceRange } from '../../domain/rendered-source-map';
+import {
+  OBSIDIAN_SOURCE_DIALECT_VERSION,
+  sourceProjectionRevision,
+  SourceProjectionCache,
+} from '../../domain/source-projection';
 import {
   createSnapshotSourceBinding,
   projectSnapshotSourceLink,
@@ -18,6 +22,7 @@ import type {
   SnapshotCaptureSubjectHandle,
 } from './snapshot-capture-backend';
 import { SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR } from './snapshot-dom-capture-preparation';
+import { bindReadingBlocks, type ReadingBlockBinding } from './reading-source-projection';
 
 interface SnapshotManagerAppLike {
   readonly vault: {
@@ -70,6 +75,7 @@ export interface ObsidianSnapshotAnnotationManagerInput {
   readonly onIssue?: (error: unknown) => void;
   readonly onRecordsChanged?: (filePath: string) => void | Promise<void>;
   readonly repository: SnapshotAnnotationRepository;
+  readonly sourceProjectionCache?: SourceProjectionCache;
   readonly textRepository: SnapshotNoteRepositoryLike;
   readonly validatePngCoverage?: (pngBytes: Uint8Array, signal: AbortSignal) => Promise<void>;
 }
@@ -85,11 +91,15 @@ export class ObsidianSnapshotAnnotationManager {
   private sourceObserver: IntersectionObserver | null = null;
   private readonly thumbnailCache = new Map<string, string>();
   private readonly now: () => string;
+  private readonly sourceProjectionCache: SourceProjectionCache;
 
   constructor(private readonly input: ObsidianSnapshotAnnotationManagerInput) {
     this.backendId = input.backendId;
     this.createId = input.createId ?? (() => globalThis.crypto.randomUUID());
     this.now = input.now ?? (() => new Date().toISOString());
+    this.sourceProjectionCache =
+      input.sourceProjectionCache ??
+      new SourceProjectionCache({ maxEntries: 8, maxEstimatedBytes: 16 * 1024 * 1024 });
   }
 
   selectBackend(backendId: string): void {
@@ -142,8 +152,11 @@ export class ObsidianSnapshotAnnotationManager {
         this.input.document,
       );
       const sourceBinding = await buildSnapshotCaptureSourceBinding({
+        filePath: file.path,
+        projectionCache: this.sourceProjectionCache,
         readingRoot,
         source,
+        sourceRevision: sourceProjectionRevision(source),
         viewportCssRect,
       });
       const frozenOwner = {
@@ -301,26 +314,19 @@ export class ObsidianSnapshotAnnotationManager {
       view.editor.scrollIntoView({ from, to }, true);
       return true;
     }
-    for (const element of root.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6, p, li')) {
-      const renderedText = element.textContent?.trim() ?? '';
-      if (renderedText.length === 0) continue;
-      try {
-        const range = locateRenderedBlockSourceRange({
-          renderedText,
-          sectionSource: source,
-          sectionSourceStart: 0,
-        });
-        if (range.start > anchor.start || range.end < anchor.end) continue;
-        element.scrollIntoView({ block: 'center' });
-        element.classList.add('inkstone-snapshot-source-pulse');
-        globalThis.setTimeout(
-          () => element.classList.remove('inkstone-snapshot-source-pulse'),
-          900,
-        );
-        return true;
-      } catch {
-        // Keep looking for the uniquely mapped source block.
-      }
+    const bindingResult = snapshotReadingBindings(
+      root,
+      source,
+      this.sourceProjectionCache,
+      filePath,
+    );
+    for (const [element, binding] of bindingResult.bindings) {
+      const block = binding.projectedBlock;
+      if (block.sourceStart > anchor.start || block.sourceEnd < anchor.end) continue;
+      element.scrollIntoView({ block: 'center' });
+      element.classList.add('inkstone-snapshot-source-pulse');
+      globalThis.setTimeout(() => element.classList.remove('inkstone-snapshot-source-pulse'), 900);
+      return true;
     }
     return false;
   }
@@ -381,13 +387,19 @@ export class ObsidianSnapshotAnnotationManager {
       this.input.repository.listIndexEntries(file.path),
       this.input.app.vault.cachedRead(file),
     ]);
+    const sourceBindings = snapshotReadingBindings(
+      root,
+      source,
+      this.sourceProjectionCache,
+      file.path,
+    ).bindings;
     const byElement = new Map<HTMLElement, string[]>();
     for (const entry of entries.filter(({ deletedAt }) => deletedAt === undefined)) {
       const link = projectSnapshotSourceLink(source, entry.source);
       if (link.state === 'unanchored') continue;
       const anchor = link.anchors.find(({ focus }) => focus) ?? link.anchors[0];
       if (anchor === undefined) continue;
-      const element = findRenderedElementForAnchor(root, source, anchor);
+      const element = findRenderedElementForAnchor(sourceBindings, anchor);
       if (element === null) continue;
       const ids = byElement.get(element) ?? [];
       ids.push(entry.id);
@@ -632,8 +644,11 @@ interface SnapshotCaptureSourceBlock {
 }
 
 async function buildSnapshotCaptureSourceBinding(input: {
+  readonly filePath: string;
+  readonly projectionCache: SourceProjectionCache;
   readonly readingRoot: HTMLElement;
   readonly source: string;
+  readonly sourceRevision: string;
   readonly viewportCssRect: {
     readonly height: number;
     readonly left: number;
@@ -642,10 +657,15 @@ async function buildSnapshotCaptureSourceBinding(input: {
   };
 }): Promise<SnapshotSourceBinding> {
   const blocks: SnapshotCaptureSourceBlock[] = [];
-  for (const element of input.readingRoot.querySelectorAll<HTMLElement>(
-    'h1, h2, h3, h4, h5, h6, p, li',
-  )) {
-    const renderedText = element.textContent?.trim() ?? '';
+  const bindingResult = snapshotReadingBindings(
+    input.readingRoot,
+    input.source,
+    input.projectionCache,
+    input.filePath,
+    input.sourceRevision,
+  );
+  for (const [element, binding] of bindingResult.bindings) {
+    const renderedText = binding.visibleText.trim();
     const bounds = element.getBoundingClientRect();
     if (
       renderedText.length === 0 ||
@@ -656,30 +676,26 @@ async function buildSnapshotCaptureSourceBinding(input: {
     ) {
       continue;
     }
-    try {
-      const range = locateRenderedBlockSourceRange({
-        renderedText,
-        sectionSource: input.source,
-        sectionSourceStart: 0,
-      });
-      if (blocks.some(({ anchor }) => anchor.start === range.start && anchor.end === range.end)) {
-        continue;
-      }
-      blocks.push({
-        anchor: {
-          displayText: renderedText,
-          end: range.end,
-          scope: { headingPath: headingPathBefore(input.readingRoot, element) },
-          start: range.start,
-        },
-        bottom: Math.min(input.viewportCssRect.height, bounds.bottom - input.viewportCssRect.top),
-        left: Math.max(0, bounds.left - input.viewportCssRect.left),
-        right: Math.min(input.viewportCssRect.width, bounds.right - input.viewportCssRect.left),
-        top: Math.max(0, bounds.top - input.viewportCssRect.top),
-      });
-    } catch {
-      // Unsupported or ambiguous rendered blocks are omitted from the stable source map.
+    const range = binding.projectedBlock;
+    if (
+      blocks.some(
+        ({ anchor }) => anchor.start === range.sourceStart && anchor.end === range.sourceEnd,
+      )
+    ) {
+      continue;
     }
+    blocks.push({
+      anchor: {
+        displayText: renderedText,
+        end: range.sourceEnd,
+        scope: { headingPath: headingPathBefore(input.readingRoot, element) },
+        start: range.sourceStart,
+      },
+      bottom: Math.min(input.viewportCssRect.height, bounds.bottom - input.viewportCssRect.top),
+      left: Math.max(0, bounds.left - input.viewportCssRect.left),
+      right: Math.min(input.viewportCssRect.width, bounds.right - input.viewportCssRect.left),
+      top: Math.max(0, bounds.top - input.viewportCssRect.top),
+    });
   }
   blocks.sort((left, right) => left.anchor.start - right.anchor.start);
   const nonOverlapping = blocks.filter(
@@ -744,25 +760,33 @@ function headingPathBefore(
 }
 
 function findRenderedElementForAnchor(
-  root: HTMLElement,
-  source: string,
+  bindings: ReadonlyMap<HTMLElement, ReadingBlockBinding>,
   anchor: { readonly end: number; readonly start: number },
 ): HTMLElement | null {
-  for (const element of root.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6, p, li')) {
-    const renderedText = element.textContent?.trim() ?? '';
-    if (renderedText.length === 0) continue;
-    try {
-      const range = locateRenderedBlockSourceRange({
-        renderedText,
-        sectionSource: source,
-        sectionSourceStart: 0,
-      });
-      if (range.start <= anchor.start && range.end >= anchor.end) return element;
-    } catch {
-      // Unsupported or ambiguous blocks cannot host a trusted Snapshot marker.
-    }
+  for (const [element, binding] of bindings) {
+    const block = binding.projectedBlock;
+    if (block.sourceStart <= anchor.start && block.sourceEnd >= anchor.end) return element;
   }
   return null;
+}
+
+function snapshotReadingBindings(
+  root: HTMLElement,
+  source: string,
+  projectionCache: SourceProjectionCache,
+  filePath: string,
+  sourceRevision = sourceProjectionRevision(source),
+) {
+  return bindReadingBlocks({
+    projection: projectionCache.getOrBuild({
+      dialectVersion: OBSIDIAN_SOURCE_DIALECT_VERSION,
+      filePath,
+      source,
+      sourceRevision,
+    }),
+    root,
+    sectionRange: () => null,
+  });
 }
 
 function nextPaint(document: Document): Promise<void> {

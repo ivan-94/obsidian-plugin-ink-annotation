@@ -4,10 +4,12 @@ import type {
   ResolveHighlightsResult,
 } from '../../application/annotation-service';
 import {
-  locateRenderedBlockSourceRange,
-  mapRenderedRangeToSource,
-  mapSourceRangeToRendered,
-} from '../../domain/rendered-source-map';
+  mapProjectedSourceRangeToDisplay,
+  OBSIDIAN_SOURCE_DIALECT_VERSION,
+  sourceProjectionRevision,
+  type SourceProjection,
+  SourceProjectionCache,
+} from '../../domain/source-projection';
 import {
   annotationIdsAtElement,
   cleanupHighlights,
@@ -24,6 +26,14 @@ import {
 } from '../../domain/style-preset';
 import type { TextAnnotationRecord } from '../../domain/text-annotation';
 import type { NoteDraftRenderTarget } from './reading-annotation-controller';
+import {
+  bindReadingBlocks,
+  isOwnedReadingTextNode,
+  mapReadingSelectionToSource,
+  type ReadingBlockBinding,
+  type ReadingBlockBindingResult,
+  ReadingSourceProjectionError,
+} from './reading-source-projection';
 
 export interface ReadingSectionInfo {
   readonly lineEnd: number;
@@ -45,6 +55,8 @@ interface ReadingViewDelegate {
 }
 
 export class ReadingViewIntegration {
+  private static readonly MAX_SOURCE_ARTIFACTS = 8;
+
   private readonly controller: ReadingAnnotationController;
   private readonly document: Document;
   private readonly onIssue: (error: unknown) => void;
@@ -63,12 +75,34 @@ export class ReadingViewIntegration {
   private readonly sourceArtifacts = new Map<
     string,
     {
-      readonly blockRanges: Map<string, { readonly end: number; readonly start: number }>;
       readonly lineOffsets: readonly number[];
+      readonly projection: SourceProjection;
       readonly source: string;
     }
   >();
+  private readonly sourceArtifactInflight = new Map<
+    string,
+    {
+      readonly promise: Promise<{
+        readonly lineOffsets: readonly number[];
+        readonly projection: SourceProjection;
+        readonly source: string;
+      }>;
+      readonly source: string;
+    }
+  >();
+  private readonly sourceProjectionCache: SourceProjectionCache;
+  private readonly domBindingCache = new WeakMap<
+    HTMLElement,
+    {
+      readonly renderEpoch: number;
+      readonly result: ReadingBlockBindingResult;
+      readonly sourceRevision: string;
+    }
+  >();
+  private readonly renderEpochs = new WeakMap<HTMLElement, number>();
   private readonly viewDelegates = new Map<HTMLElement, ReadingViewDelegate>();
+  private readonly viewRestoreTimeouts = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
   private readonly sectionCleanups = new Set<() => void>();
   private readonly sectionCleanupByRoot = new Map<HTMLElement, () => void>();
   private readonly sectionRestoreEpochs = new WeakMap<HTMLElement, number>();
@@ -90,9 +124,11 @@ export class ReadingViewIntegration {
       target: NoteDraftRenderTarget,
     ) => Promise<void> | void;
     readonly onRecordsChanged?: (filePath: string) => void;
+    readonly onSnapshotFallback?: () => Promise<void> | void;
     readonly presets?: readonly StylePreset[];
     readonly recordDuration?: (name: DiagnosticMetricName, durationMs: number) => void;
     readonly service: AnnotationService;
+    readonly sourceProjectionCache?: SourceProjectionCache;
   }) {
     this.document = input.document;
     this.now = input.now ?? (() => performance.now());
@@ -101,6 +137,12 @@ export class ReadingViewIntegration {
     this.recordDuration = input.recordDuration ?? (() => undefined);
     this.presets = new StylePresetCatalog(input.presets ?? DEFAULT_STYLE_PRESETS).list();
     this.service = input.service;
+    this.sourceProjectionCache =
+      input.sourceProjectionCache ??
+      new SourceProjectionCache({
+        maxEntries: ReadingViewIntegration.MAX_SOURCE_ARTIFACTS,
+        maxEstimatedBytes: 16 * 1024 * 1024,
+      });
     const MutationObserverConstructor = this.document.defaultView?.MutationObserver;
     this.sectionObserver =
       MutationObserverConstructor === undefined
@@ -132,6 +174,9 @@ export class ReadingViewIntegration {
         await this.refreshFile(record.filePath);
         return true;
       },
+      ...(input.onSnapshotFallback === undefined
+        ? {}
+        : { onSnapshotFallback: input.onSnapshotFallback }),
       service: input.service,
       presets: this.presets,
       toolbarLayout: input.isMobile === true ? 'mobile-action-bar' : 'anchored',
@@ -157,6 +202,7 @@ export class ReadingViewIntegration {
     const delegateRoot = readingViewDelegateRoot(input.root);
     this.ensureViewDelegate(delegateRoot, { ...input, root: delegateRoot }, input.root);
     this.sections.set(input.root, input);
+    this.scheduleViewRestore(delegateRoot);
 
     const cleanup = (): void => {
       if (!this.sectionCleanups.delete(cleanup)) {
@@ -166,6 +212,7 @@ export class ReadingViewIntegration {
       this.autoPrunableSections.delete(input.root);
       this.sections.delete(input.root);
       this.releaseViewDelegate(delegateRoot, input.root);
+      if (delegateRoot.isConnected) this.scheduleViewRestore(delegateRoot);
       this.controller.disposeSection(input.root);
       this.invalidateSectionRestore(input.root);
       cleanupHighlights(input.root);
@@ -184,12 +231,16 @@ export class ReadingViewIntegration {
     for (const cleanup of [...this.sectionCleanups]) {
       cleanup();
     }
+    for (const timeout of this.viewRestoreTimeouts.values()) clearTimeout(timeout);
+    this.viewRestoreTimeouts.clear();
     for (const root of this.pendingSections.keys()) this.invalidateSectionRestore(root);
     this.pendingSections.clear();
     for (const delegate of this.viewDelegates.values()) delegate.dispose();
     this.viewDelegates.clear();
     this.resolvedCache.clear();
     this.sourceArtifacts.clear();
+    this.sourceArtifactInflight.clear();
+    this.sourceProjectionCache.clear();
     for (const timeout of this.pulseTimeouts) {
       clearTimeout(timeout);
     }
@@ -258,6 +309,21 @@ export class ReadingViewIntegration {
   private removeViewDelegate(root: HTMLElement): void {
     this.viewDelegates.get(root)?.dispose();
     this.viewDelegates.delete(root);
+    const timeout = this.viewRestoreTimeouts.get(root);
+    if (timeout !== undefined) clearTimeout(timeout);
+    this.viewRestoreTimeouts.delete(root);
+  }
+
+  private scheduleViewRestore(root: HTMLElement): void {
+    const pending = this.viewRestoreTimeouts.get(root);
+    if (pending !== undefined) clearTimeout(pending);
+    const timeout = setTimeout(() => {
+      this.viewRestoreTimeouts.delete(root);
+      const delegate = this.viewDelegates.get(root);
+      if (delegate === undefined || !root.isConnected) return;
+      void this.restoreSection({ ...delegate.context, root }).catch(this.onIssue);
+    }, 0);
+    this.viewRestoreTimeouts.set(root, timeout);
   }
 
   private inspectAnnotationEvent(event: Event): void {
@@ -314,25 +380,18 @@ export class ReadingViewIntegration {
     if (context === null) return null;
     const captured = captureReadingSelection(context.readingRoot, range);
     if (!captured.supported) return null;
-    const mapped = captured.fragments.map((fragment) =>
-      mapRenderedRangeToSource({
-        renderedEnd: fragment.renderedEnd,
-        renderedStart: fragment.renderedStart,
-        renderedText: fragment.block.textContent ?? '',
-        sectionSource: context.sectionSource,
-        sectionSourceStart: context.sectionSourceStart,
-      }),
-    );
-    const first = mapped[0];
-    const last = mapped.at(-1);
-    if (first === undefined || last === undefined) return null;
+    const mapped = mapReadingSelectionToSource({
+      bindings: context.sourceBindings,
+      fragments: captured.fragments,
+      source: context.source,
+    });
     return this.service.prepareSelection({
       filePath: context.filePath,
       selection: {
         displayText: captured.exact,
-        end: last.end,
+        end: mapped.end,
         scope: context.scope,
-        start: first.start,
+        start: mapped.start,
       },
       source: context.source,
     });
@@ -360,9 +419,13 @@ export class ReadingViewIntegration {
 
   private async restoreSection(input: ReadingSectionMountInput): Promise<void> {
     const restoreEpoch = this.beginSectionRestore(input.root);
+    this.invalidateDomBindings(input.root);
+    const delegateRoot = readingViewDelegateRoot(input.root);
+    if (delegateRoot !== input.root) this.invalidateDomBindings(delegateRoot);
     cleanupHighlights(input.root);
     const source = await input.getFullSource();
     if (!this.isCurrentSectionRestore(input.root, restoreEpoch)) return;
+    // Parse while the section mounts so selection handlers only perform DOM binding and lookup.
     const artifacts = this.artifactsFor(input.filePath, source);
     const loaded = await this.loadResolved(input.filePath, source);
     if (!this.isCurrentSectionRestore(input.root, restoreEpoch)) return;
@@ -370,50 +433,40 @@ export class ReadingViewIntegration {
       this.onIssue(issue);
     }
     if (loaded.resolved.length === 0) return;
+    const bindingResult = this.bindingsFor({
+      projection: artifacts.projection,
+      root: input.root,
+      sectionRange: (block) => {
+        const info = input.getSectionInfo(block);
+        if (info === null) return null;
+        try {
+          const start = sourceOffsetForSectionWithOffsets(source, info, artifacts.lineOffsets);
+          return { end: start + info.text.length, start };
+        } catch {
+          return null;
+        }
+      },
+    });
 
-    for (const block of supportedBlocks(input.root)) {
-      const info = input.getSectionInfo(block);
-      if (info === null) {
-        continue;
-      }
-      const sectionSourceStart = sourceOffsetForSectionWithOffsets(
-        source,
-        info,
-        artifacts.lineOffsets,
-      );
-      let blockSourceRange: { readonly end: number; readonly start: number };
-      try {
-        const renderedText = block.textContent ?? '';
-        const artifactKey = `${sectionSourceStart}:${renderedText}`;
-        blockSourceRange =
-          artifacts.blockRanges.get(artifactKey) ??
-          locateRenderedBlockSourceRange({
-            renderedText,
-            sectionSource: info.text,
-            sectionSourceStart,
-          });
-        artifacts.blockRanges.set(artifactKey, blockSourceRange);
-      } catch {
-        continue;
-      }
+    for (const [block, binding] of bindingResult.bindings) {
+      const blockSourceRange = binding.projectedBlock;
       const intervals = [];
       const noteAnchors: Array<{ readonly annotationId: string; readonly offset: number }> = [];
       for (const resolved of loaded.resolved) {
         if (resolved.record.status !== 'active') {
           continue;
         }
-        if (resolved.end <= blockSourceRange.start || resolved.start >= blockSourceRange.end) {
+        if (
+          resolved.end <= blockSourceRange.sourceStart ||
+          resolved.start >= blockSourceRange.sourceEnd
+        ) {
           continue;
         }
         try {
-          const fragmentStart = Math.max(resolved.start, blockSourceRange.start);
-          const fragmentEnd = Math.min(resolved.end, blockSourceRange.end);
-          const fragmentExact = source.slice(fragmentStart, fragmentEnd);
-          const mapped = mapSourceRangeToRendered({
-            exact: fragmentExact,
-            renderedText: block.textContent ?? '',
-            sectionSource: info.text,
-            sectionSourceStart,
+          const fragmentStart = Math.max(resolved.start, blockSourceRange.sourceStart);
+          const fragmentEnd = Math.min(resolved.end, blockSourceRange.sourceEnd);
+          const mapped = mapProjectedSourceRangeToDisplay({
+            block: binding.projectedBlock,
             sourceEnd: fragmentEnd,
             sourceStart: fragmentStart,
           });
@@ -436,7 +489,9 @@ export class ReadingViewIntegration {
         }
       }
       if (intervals.length > 0) {
-        const fragments = renderHighlightPlan(block, intervals);
+        const fragments = renderHighlightPlan(block, intervals, (node) =>
+          isOwnedReadingTextNode(block, node),
+        );
         for (const fragment of fragments) {
           const preset = this.presets.find(
             (candidate) => candidate.id === fragment.dataset.inkstoneStyleId,
@@ -448,7 +503,7 @@ export class ReadingViewIntegration {
         }
       }
       for (const point of noteAnchors) {
-        renderNoteAnchorIndicator(block, point);
+        renderNoteAnchorIndicator(block, point, (node) => isOwnedReadingTextNode(block, node));
       }
     }
   }
@@ -461,6 +516,7 @@ export class ReadingViewIntegration {
 
   private invalidateSectionRestore(root: HTMLElement): void {
     this.sectionRestoreEpochs.set(root, (this.sectionRestoreEpochs.get(root) ?? 0) + 1);
+    this.invalidateDomBindings(root);
   }
 
   private isCurrentSectionRestore(root: HTMLElement, epoch: number): boolean {
@@ -488,23 +544,102 @@ export class ReadingViewIntegration {
         await this.restoreSection(section);
       }
     }
+    for (const [root, delegate] of this.viewDelegates) {
+      if (delegate.context.filePath === filePath && root.isConnected) {
+        await this.restoreSection({ ...delegate.context, root });
+      }
+    }
   }
 
   private artifactsFor(
     filePath: string,
     source: string,
   ): {
-    readonly blockRanges: Map<string, { readonly end: number; readonly start: number }>;
     readonly lineOffsets: readonly number[];
+    readonly projection: SourceProjection;
     readonly source: string;
   } {
     const cached = this.sourceArtifacts.get(filePath);
     if (cached !== undefined && cached.source === source) {
+      this.sourceArtifacts.delete(filePath);
+      this.sourceArtifacts.set(filePath, cached);
       return cached;
     }
-    const artifacts = { blockRanges: new Map(), lineOffsets: buildLineOffsets(source), source };
+    const sourceRevision = sourceProjectionRevision(source);
+    const artifacts = {
+      lineOffsets: buildLineOffsets(source),
+      projection: this.sourceProjectionCache.getOrBuild({
+        dialectVersion: OBSIDIAN_SOURCE_DIALECT_VERSION,
+        filePath,
+        source,
+        sourceRevision,
+      }),
+      source,
+    };
+    this.sourceArtifacts.delete(filePath);
     this.sourceArtifacts.set(filePath, artifacts);
+    while (this.sourceArtifacts.size > ReadingViewIntegration.MAX_SOURCE_ARTIFACTS) {
+      const oldest = this.sourceArtifacts.keys().next().value;
+      if (oldest === undefined) break;
+      this.sourceArtifacts.delete(oldest);
+    }
     return artifacts;
+  }
+
+  private artifactsForInteraction(
+    filePath: string,
+    source: string,
+  ): Promise<{
+    readonly lineOffsets: readonly number[];
+    readonly projection: SourceProjection;
+    readonly source: string;
+  }> {
+    const cached = this.sourceArtifacts.get(filePath);
+    if (cached !== undefined && cached.source === source) {
+      return Promise.resolve(this.artifactsFor(filePath, source));
+    }
+    const inflight = this.sourceArtifactInflight.get(filePath);
+    if (inflight !== undefined && inflight.source === source) return inflight.promise;
+
+    const promise = new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0))
+      .then(() => this.artifactsFor(filePath, source))
+      .finally(() => {
+        if (this.sourceArtifactInflight.get(filePath)?.promise === promise) {
+          this.sourceArtifactInflight.delete(filePath);
+        }
+      });
+    this.sourceArtifactInflight.set(filePath, { promise, source });
+    return promise;
+  }
+
+  private bindingsFor(input: {
+    readonly projection: SourceProjection;
+    readonly root: HTMLElement;
+    readonly sectionRange: (
+      element: HTMLElement,
+    ) => { readonly end: number; readonly start: number } | null;
+  }): ReadingBlockBindingResult {
+    const renderEpoch = this.renderEpochs.get(input.root) ?? 0;
+    const cached = this.domBindingCache.get(input.root);
+    if (
+      cached !== undefined &&
+      cached.renderEpoch === renderEpoch &&
+      cached.sourceRevision === input.projection.key.sourceRevision
+    ) {
+      return cached.result;
+    }
+    const result = bindReadingBlocks(input);
+    this.domBindingCache.set(input.root, {
+      renderEpoch,
+      result,
+      sourceRevision: input.projection.key.sourceRevision,
+    });
+    return result;
+  }
+
+  private invalidateDomBindings(root: HTMLElement): void {
+    this.renderEpochs.set(root, (this.renderEpochs.get(root) ?? 0) + 1);
+    this.domBindingCache.delete(root);
   }
 
   private async showToolbarForSelection(input: ReadingSectionMountInput): Promise<void> {
@@ -518,14 +653,21 @@ export class ReadingViewIntegration {
     if (block === null) {
       return;
     }
-    const context = await this.contextForRange(range);
+    const blockRect = block.getBoundingClientRect();
+    const anchorRect =
+      typeof range.getBoundingClientRect === 'function' ? range.getBoundingClientRect() : blockRect;
+    let context;
+    try {
+      context = await this.contextForRange(range);
+    } catch (error) {
+      this.controller.showProjectionFailure(anchorRect, error);
+      this.onIssue(error);
+      return;
+    }
     if (context === null || context.filePath !== input.filePath) {
       this.onIssue(new Error('Obsidian did not provide Markdown section information.'));
       return;
     }
-    const blockRect = block.getBoundingClientRect();
-    const anchorRect =
-      typeof range.getBoundingClientRect === 'function' ? range.getBoundingClientRect() : blockRect;
 
     const shown = await this.controller.showForRange({
       anchorRect,
@@ -536,13 +678,13 @@ export class ReadingViewIntegration {
       scope: context.scope,
       sectionSource: context.sectionSource,
       sectionSourceStart: context.sectionSourceStart,
+      sourceBindings: context.sourceBindings,
+      sourceProjection: context.sourceProjection,
     });
     if (shown.supported) {
       this.recordDuration('quick-toolbar-open', this.now() - startedAt);
-    } else if (shown.reason === 'source-mapping-failed') {
-      this.onIssue(
-        shown.error ?? new Error('Rendered selection could not be mapped to Markdown source.'),
-      );
+    } else if (shown.error !== undefined) {
+      this.onIssue(shown.error);
     }
   }
 
@@ -553,6 +695,8 @@ export class ReadingViewIntegration {
     readonly sectionSource: string;
     readonly sectionSourceStart: number;
     readonly source: string;
+    readonly sourceBindings: ReadonlyMap<HTMLElement, ReadingBlockBinding>;
+    readonly sourceProjection: SourceProjection;
   } | null> {
     const startBlock = findSupportedBlock(range.startContainer);
     const endBlock = findSupportedBlock(range.endContainer);
@@ -570,12 +714,43 @@ export class ReadingViewIntegration {
     const endInfo = endSection.getSectionInfo(endBlock);
     if (startInfo === null || endInfo === null) return null;
     const source = await startSection.getFullSource();
-    const artifacts = this.artifactsFor(startSection.filePath, source);
     const sameSourceSection =
       startInfo.text === endInfo.text && startInfo.lineStart === endInfo.lineStart;
+    const startReadingRoot = readingViewDelegateRoot(startSection.root);
+    const endReadingRoot = readingViewDelegateRoot(endSection.root);
+    const readingRoot =
+      startReadingRoot === endReadingRoot ? startReadingRoot : commonAncestorElement(range);
+    const renderEpoch = this.renderEpochs.get(readingRoot) ?? 0;
+    const artifacts = await this.artifactsForInteraction(startSection.filePath, source);
+    if (
+      (await startSection.getFullSource()) !== source ||
+      (this.renderEpochs.get(readingRoot) ?? 0) !== renderEpoch ||
+      !readingRoot.contains(range.startContainer) ||
+      !readingRoot.contains(range.endContainer)
+    ) {
+      throw new ReadingSourceProjectionError(
+        'stale-context',
+        'The note or Reading View changed while Source Projection was prepared.',
+      );
+    }
+    const bindingResult = this.bindingsFor({
+      projection: artifacts.projection,
+      root: readingRoot,
+      sectionRange: (element) => {
+        const section = this.contextContaining(element);
+        const info = section?.getSectionInfo(element);
+        if (info === undefined || info === null) return null;
+        try {
+          const start = sourceOffsetForSectionWithOffsets(source, info, artifacts.lineOffsets);
+          return { end: start + info.text.length, start };
+        } catch {
+          return null;
+        }
+      },
+    });
     return {
       filePath: startSection.filePath,
-      readingRoot: commonAncestorElement(range),
+      readingRoot,
       scope: {
         sectionEndLine: Math.max(startInfo.lineEnd, endInfo.lineEnd),
         sectionStartLine: Math.min(startInfo.lineStart, endInfo.lineStart),
@@ -585,6 +760,8 @@ export class ReadingViewIntegration {
         ? sourceOffsetForSectionWithOffsets(source, startInfo, artifacts.lineOffsets)
         : 0,
       source,
+      sourceBindings: bindingResult.bindings,
+      sourceProjection: artifacts.projection,
     };
   }
 
@@ -667,11 +844,6 @@ function buildLineOffsets(source: string): readonly number[] {
     }
   }
   return offsets;
-}
-
-function supportedBlocks(root: HTMLElement): readonly HTMLElement[] {
-  const descendants = [...root.querySelectorAll<HTMLElement>(SUPPORTED_BLOCK_SELECTOR)];
-  return root.matches(SUPPORTED_BLOCK_SELECTOR) ? [root, ...descendants] : descendants;
 }
 
 function findSupportedBlock(node: Node): HTMLElement | null {

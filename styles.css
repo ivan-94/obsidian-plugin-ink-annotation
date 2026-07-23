@@ -300,6 +300,11 @@
   line-height: 1.35;
 }
 
+.inkstone-quick-toolbar__fallback {
+  margin-right: 8px;
+  white-space: nowrap;
+}
+
 /* features / Reading View and Live Preview annotations */
 .inkstone-text-highlight {
   padding: 0;

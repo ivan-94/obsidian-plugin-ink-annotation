@@ -63,6 +63,7 @@ import { StylePresetCatalog } from './domain/style-preset';
 import { annotationTargetText, type TextAnnotationRecord } from './domain/text-annotation';
 import type { AnnotationIndexEntry } from './domain/vault-annotation-index';
 import { hashText } from './domain/text-anchor';
+import { SourceProjectionCache } from './domain/source-projection';
 import { AnnotationInspector } from './ui/annotation-inspector';
 import { AnnotationExportDialog } from './ui/annotation-export-dialog';
 import { Diagnostics } from './runtime/diagnostics';
@@ -100,6 +101,11 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     this.runtime.start();
     const readingSourceCache = new VersionedSourceCache(8);
     this.runtime.registerDisposer(() => readingSourceCache.clear());
+    const sourceProjectionCache = new SourceProjectionCache({
+      maxEntries: 8,
+      maxEstimatedBytes: 16 * 1024 * 1024,
+    });
+    this.runtime.registerDisposer(() => sourceProjectionCache.clear());
 
     const sidecarStore = new ObsidianVaultTextFileStore(this.app.vault.adapter);
     const snapshotAnnotationRepository = new SnapshotAnnotationRepository(sidecarStore, {
@@ -1011,8 +1017,15 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         });
       },
       onRecordsChanged: () => void this.sidebarView?.refresh(),
+      onSnapshotFallback: async () => {
+        if (snapshotAnnotationManager === null) {
+          throw new Error('Snapshot annotation is unavailable.');
+        }
+        await snapshotAnnotationManager.captureActiveReadingView();
+      },
       recordDuration: (name, durationMs) => this.diagnostics.recordDuration(name, durationMs),
       service: annotationService,
+      sourceProjectionCache,
       presets: this.pluginSettings.stylePresets,
     });
     this.readingView = readingView;
@@ -1073,6 +1086,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
           .catch((error: unknown) => console.warn('[Inkstone Annotations]', error));
       },
       repository: snapshotAnnotationRepository,
+      sourceProjectionCache,
       textRepository: repository,
       validatePngCoverage: (pngBytes, signal) =>
         new BrowserSnapshotPngCoverageValidator({

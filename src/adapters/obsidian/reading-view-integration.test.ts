@@ -130,6 +130,121 @@ describe('Reading View integration', () => {
     integration.dispose();
   });
 
+  it('renders source-backed text after an embed without counting generated embed text', async () => {
+    const source = 'before ![[Embedded note]] after';
+    const exact = 'after';
+    const start = source.indexOf(exact);
+    const service = new AnnotationService({
+      createId: (() => {
+        const ids = ['note-embed', 'annotation-after-embed'];
+        return () => ids.shift() ?? 'unexpected-id';
+      })(),
+      repository: new SidecarRepository(new MemoryTextFileStore()),
+    });
+    await service.createHighlight({
+      filePath: 'Embed restore.md',
+      selection: {
+        displayText: exact,
+        end: start + exact.length,
+        scope: { sectionEndLine: 0, sectionStartLine: 0 },
+        start,
+      },
+      source,
+      styleId: 'highlight-sun',
+    });
+    const root = document.createElement('section');
+    root.innerHTML =
+      '<p>before <span class="internal-embed">generated preview text</span> after</p>';
+    const integration = new ReadingViewIntegration({ document, service });
+
+    await integration.mountSection({
+      filePath: 'Embed restore.md',
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: source }),
+      root,
+    });
+
+    expect(root.querySelector('.inkstone-text-highlight')?.textContent).toBe(exact);
+    expect(root.querySelector('.internal-embed .inkstone-text-highlight')).toBeNull();
+    integration.dispose();
+  });
+
+  it('fails stale-context when the source revision changes during cold projection preparation', async () => {
+    let source = 'Initial source.';
+    const onIssue = vi.fn();
+    const service = new AnnotationService({
+      repository: new SidecarRepository(new MemoryTextFileStore()),
+    });
+    const root = document.createElement('p');
+    root.textContent = source;
+    document.body.append(root);
+    const integration = new ReadingViewIntegration({ document, onIssue, service });
+    await integration.mountSection({
+      filePath: 'Stale.md',
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: source }),
+      root,
+    });
+
+    source = 'Changed source.';
+    root.textContent = source;
+    const text = root.firstChild;
+    if (!(text instanceof Text)) throw new Error('Stale fixture is missing text.');
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    document.getSelection()?.addRange(range);
+    root.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    source = 'Changed again.';
+
+    await vi.waitFor(() =>
+      expect(document.querySelector('.inkstone-quick-toolbar__reason')?.textContent).toContain(
+        'changed',
+      ),
+    );
+    expect(onIssue.mock.calls[0]?.[0]).toMatchObject({ code: 'stale-context' });
+    expect(document.querySelector('button[aria-label="Highlight: Sun"]')).toBeNull();
+    integration.dispose();
+    document.getSelection()?.removeAllRanges();
+  });
+
+  it('restores a highlight in the second item of a tight list', async () => {
+    const source = '- first\n- second\n- third';
+    const store = new MemoryTextFileStore();
+    const service = new AnnotationService({
+      createId: (() => {
+        const ids = ['note-list', 'annotation-list'];
+        return () => ids.shift() ?? 'unexpected-id';
+      })(),
+      repository: new SidecarRepository(store),
+    });
+    const start = source.indexOf('second');
+    await service.createHighlight({
+      filePath: 'Tight list.md',
+      selection: {
+        end: start + 'second'.length,
+        scope: { sectionEndLine: 2, sectionStartLine: 0 },
+        start,
+      },
+      source,
+      styleId: 'highlight-sun',
+    });
+    const root = document.createElement('section');
+    root.innerHTML = '<ul><li>first</li><li>second</li><li>third</li></ul>';
+    const integration = new ReadingViewIntegration({ document, service });
+
+    await integration.mountSection({
+      filePath: 'Tight list.md',
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo: () => ({ lineEnd: 2, lineStart: 0, text: source }),
+      root,
+    });
+
+    expect(
+      root.querySelectorAll('li')[1]?.querySelector('.inkstone-text-highlight')?.textContent,
+    ).toBe('second');
+    integration.dispose();
+  });
+
   it('releases rendered sections that Obsidian virtualizes out of the DOM', async () => {
     vi.useFakeTimers();
     try {
@@ -192,6 +307,63 @@ describe('Reading View integration', () => {
     );
     integration.dispose();
     document.getSelection()?.removeAllRanges();
+    readingView.remove();
+  });
+
+  it('restores highlights after Obsidian replaces and unloads one postprocessor root', async () => {
+    const source = 'First paragraph.\n\nSecond paragraph.';
+    const store = new MemoryTextFileStore();
+    const service = new AnnotationService({
+      repository: new SidecarRepository(store),
+    });
+    await service.createHighlight({
+      filePath: 'Replaced sections.md',
+      selection: {
+        end: 'First paragraph.'.length,
+        scope: { sectionEndLine: 0, sectionStartLine: 0 },
+        start: 0,
+      },
+      source,
+      styleId: 'highlight-sun',
+    });
+    const integration = new ReadingViewIntegration({ document, service });
+    const readingView = document.createElement('div');
+    readingView.className = 'markdown-reading-view';
+    const firstRoot = document.createElement('section');
+    const secondRoot = document.createElement('section');
+    firstRoot.innerHTML = '<p>First paragraph.</p>';
+    secondRoot.innerHTML = '<p>Second paragraph.</p>';
+    readingView.append(firstRoot, secondRoot);
+    document.body.append(readingView);
+    const getSectionInfo = (element: HTMLElement): ReadingSectionInfo =>
+      element.textContent.includes('First paragraph.')
+        ? { lineEnd: 0, lineStart: 0, text: 'First paragraph.' }
+        : { lineEnd: 2, lineStart: 2, text: 'Second paragraph.' };
+    const cleanupFirst = await integration.mountSection({
+      filePath: 'Replaced sections.md',
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo,
+      root: firstRoot,
+    });
+    const cleanupSecond = await integration.mountSection({
+      filePath: 'Replaced sections.md',
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo,
+      root: secondRoot,
+    });
+    const replacement = document.createElement('section');
+    replacement.innerHTML = '<p>First paragraph.</p>';
+    firstRoot.replaceWith(replacement);
+    cleanupFirst();
+
+    await vi.waitFor(() =>
+      expect(replacement.querySelector('.inkstone-text-highlight')?.textContent).toBe(
+        'First paragraph.',
+      ),
+    );
+
+    cleanupSecond();
+    integration.dispose();
     readingView.remove();
   });
 

@@ -2,7 +2,11 @@ import {
   type AnnotationService,
   type PendingTextSelection,
 } from '../../application/annotation-service';
-import { mapRenderedRangeToSource } from '../../domain/rendered-source-map';
+import {
+  buildSourceProjection,
+  OBSIDIAN_SOURCE_DIALECT_VERSION,
+  type SourceProjection,
+} from '../../domain/source-projection';
 import { DEFAULT_STYLE_PRESETS, type StylePreset } from '../../domain/style-preset';
 import type { TextStructuralScope } from '../../domain/text-annotation';
 import type { TextAnnotationRecord } from '../../domain/text-annotation';
@@ -13,6 +17,14 @@ import {
 } from '../../ui/quick-highlight-toolbar';
 import { renderHighlight } from '../../ui/reading-highlight-renderer';
 import { captureReadingSelection } from './reading-selection';
+import {
+  bindReadingBlocks,
+  isOwnedReadingTextNode,
+  type ReadingBlockBinding,
+  ReadingSourceProjectionError,
+  type ReadingSourceProjectionFailureCode,
+  mapReadingSelectionToSource,
+} from './reading-source-projection';
 
 interface PendingRenderTarget {
   readonly anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>;
@@ -49,22 +61,15 @@ export interface ShowForRangeInput {
   readonly scope: TextStructuralScope;
   readonly sectionSource: string;
   readonly sectionSourceStart: number;
+  readonly sourceBindings?: ReadonlyMap<HTMLElement, ReadingBlockBinding>;
+  readonly sourceProjection?: SourceProjection;
 }
 
 export type ShowForRangeResult =
   | { readonly supported: true }
   | {
       readonly error?: Error;
-      readonly reason:
-        | 'code-content'
-        | 'cross-block'
-        | 'embedded-content'
-        | 'empty'
-        | 'generated-content'
-        | 'math-content'
-        | 'outside-reading-view'
-        | 'source-mapping-failed'
-        | 'unsupported-block';
+      readonly reason: ReadingSourceProjectionFailureCode;
       readonly supported: false;
     };
 
@@ -84,6 +89,7 @@ export class ReadingAnnotationController {
     record: TextAnnotationRecord,
     target: CommittedRenderTarget,
   ) => Promise<boolean>;
+  private readonly onSnapshotFallback: () => Promise<void>;
   private readonly service: AnnotationService;
   private presets: readonly StylePreset[];
   private recentStyleId: string;
@@ -106,6 +112,7 @@ export class ReadingAnnotationController {
       record: TextAnnotationRecord,
       target: CommittedRenderTarget,
     ) => Promise<boolean>;
+    readonly onSnapshotFallback?: () => Promise<void> | void;
     readonly service: AnnotationService;
     readonly presets?: readonly StylePreset[];
     readonly toolbarLayout?: QuickToolbarLayout;
@@ -116,6 +123,7 @@ export class ReadingAnnotationController {
     this.onNoteDraft = input.onNoteDraft ?? (() => Promise.resolve());
     this.onOpenDetails = input.onOpenDetails ?? (() => undefined);
     this.onRenderCommitted = input.onRenderCommitted ?? (() => Promise.resolve(false));
+    this.onSnapshotFallback = async () => input.onSnapshotFallback?.();
     this.service = input.service;
     this.presets = input.presets ?? DEFAULT_STYLE_PRESETS;
     const defaultStyleId = this.presets[0]?.id;
@@ -142,50 +150,53 @@ export class ReadingAnnotationController {
   async showForRange(input: ShowForRangeInput): Promise<ShowForRangeResult> {
     const captured = captureReadingSelection(input.readingRoot, input.range);
     if (!captured.supported) {
-      this.pending = null;
-      if (captured.reason === 'empty' || captured.reason === 'outside-reading-view') {
-        this.toolbar.close(false);
-      } else {
-        this.toolbar.showUnavailable({
-          anchorRect: input.anchorRect,
-          message: unsupportedReasonMessage(captured.reason),
-        });
-      }
-      return captured;
+      const reason = normalizeCaptureFailure(captured.reason);
+      return this.reject(input.anchorRect, reason);
     }
 
-    let mapped: ReturnType<typeof mapRenderedRangeToSource>;
+    let mapped: { readonly end: number; readonly exact: string; readonly start: number };
     try {
-      const mappedFragments = captured.fragments.map((fragment) =>
-        mapRenderedRangeToSource({
-          renderedEnd: fragment.renderedEnd,
-          renderedStart: fragment.renderedStart,
-          renderedText: fragment.block.textContent ?? '',
-          sectionSource: input.sectionSource,
-          sectionSourceStart: input.sectionSourceStart,
-        }),
+      const projection =
+        input.sourceProjection ??
+        buildSourceProjection({
+          dialectVersion: OBSIDIAN_SOURCE_DIALECT_VERSION,
+          filePath: input.filePath,
+          source: input.fullSource,
+          sourceRevision: `interaction:${input.fullSource.length}`,
+        });
+      const bindingResult =
+        input.sourceBindings === undefined
+          ? bindReadingBlocks({
+              projection,
+              root: input.readingRoot,
+              sectionRange: () => ({
+                end: input.sectionSourceStart + input.sectionSource.length,
+                start: input.sectionSourceStart,
+              }),
+            })
+          : { bindings: input.sourceBindings, failures: [] };
+      const selectedFailure = bindingResult.failures.find((failure) =>
+        captured.fragments.some((fragment) => fragment.block === failure.element),
       );
-      const first = mappedFragments[0];
-      const last = mappedFragments.at(-1);
-      if (first === undefined || last === undefined || last.end <= first.start) {
-        throw new Error('Cross-block selection has no stable source span.');
+      if (selectedFailure !== undefined) {
+        throw new ReadingSourceProjectionError(
+          selectedFailure.code,
+          `Reading View block could not bind to source (${selectedFailure.code}).`,
+        );
       }
-      mapped = {
-        end: last.end,
-        exact: input.fullSource.slice(first.start, last.end),
-        start: first.start,
-      };
-    } catch (error) {
-      this.pending = null;
-      this.toolbar.showUnavailable({
-        anchorRect: input.anchorRect,
-        message: unsupportedReasonMessage('source-mapping-failed'),
+      mapped = mapReadingSelectionToSource({
+        bindings: bindingResult.bindings,
+        fragments: captured.fragments,
+        source: input.fullSource,
       });
-      return {
-        error: error instanceof Error ? error : new Error(String(error)),
-        reason: 'source-mapping-failed',
-        supported: false,
-      };
+    } catch (error) {
+      const reason =
+        error instanceof ReadingSourceProjectionError ? error.code : ('internal-error' as const);
+      return this.reject(
+        input.anchorRect,
+        reason,
+        error instanceof Error ? error : new Error(String(error)),
+      );
     }
 
     const selection = await this.service.prepareSelection({
@@ -212,6 +223,19 @@ export class ReadingAnnotationController {
       recentStyleId: this.recentStyleId,
     });
     return { supported: true };
+  }
+
+  showProjectionFailure(
+    anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>,
+    error: unknown,
+  ): ShowForRangeResult {
+    const reason =
+      error instanceof ReadingSourceProjectionError ? error.code : ('internal-error' as const);
+    return this.reject(
+      anchorRect,
+      reason,
+      error instanceof Error ? error : new Error(String(error)),
+    );
   }
 
   dispose(): void {
@@ -277,13 +301,17 @@ export class ReadingAnnotationController {
     }
     if (!renderedByHost) {
       const fragments = pending.fragments.flatMap((fragment) =>
-        renderHighlight(fragment.block, {
-          annotationId: record.id,
-          end: fragment.renderedEnd,
-          kind: mark.kind,
-          start: fragment.renderedStart,
-          styleId: mark.styleId,
-        }),
+        renderHighlight(
+          fragment.block,
+          {
+            annotationId: record.id,
+            end: fragment.renderedEnd,
+            kind: mark.kind,
+            start: fragment.renderedStart,
+            styleId: mark.styleId,
+          },
+          (node) => isOwnedReadingTextNode(fragment.block, node),
+        ),
       );
       const color = this.presets.find((preset) => preset.id === mark.styleId)?.color;
       if (color !== undefined) {
@@ -296,6 +324,35 @@ export class ReadingAnnotationController {
     this.pending = null;
     this.collapseSelection();
     if (openDetails) await this.onOpenDetails(record, pending.block);
+  }
+
+  private reject(
+    anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>,
+    reason: ReadingSourceProjectionFailureCode,
+    error?: Error,
+  ): Extract<ShowForRangeResult, { supported: false }> {
+    this.pending = null;
+    if (reason === 'empty-selection' || reason === 'outside-reading-view') {
+      this.toolbar.close(false);
+    } else {
+      this.toolbar.showUnavailable({
+        ...(reason === 'generated-content' || reason === 'unsupported-syntax'
+          ? {
+              action: {
+                label: 'Annotate a snapshot instead',
+                onActivate: this.onSnapshotFallback,
+              },
+            }
+          : {}),
+        anchorRect,
+        message: unsupportedReasonMessage(reason),
+      });
+    }
+    return {
+      ...(error === undefined ? {} : { error }),
+      reason,
+      supported: false,
+    };
   }
 }
 
@@ -311,23 +368,45 @@ function focusReadingBlock(block: HTMLElement): void {
 function unsupportedReasonMessage(
   reason: Exclude<
     Extract<ShowForRangeResult, { supported: false }>['reason'],
-    'empty' | 'outside-reading-view'
+    'empty-selection' | 'outside-reading-view'
   >,
 ): string {
   switch (reason) {
-    case 'code-content':
-      return 'Code selections cannot be mapped to stable Markdown text.';
-    case 'embedded-content':
-      return 'Embedded note text belongs to another source file.';
     case 'generated-content':
-      return 'Generated content cannot be mapped to stable Markdown source.';
-    case 'math-content':
-      return 'Partial rendered math selections are not supported.';
+      return 'This visible content cannot be traced to the current Markdown source.';
+    case 'unsupported-syntax':
+      return 'This Markdown feature is not selectable yet.';
+    case 'non-monotonic-selection':
+      return 'This visible selection does not correspond to one continuous source range.';
+    case 'source-target-not-found':
+      return 'Inkstone could not connect this rendered block to the current source.';
+    case 'source-target-ambiguous':
+      return 'More than one Markdown source target remains possible.';
+    case 'stale-context':
+      return 'The note or Reading View changed while Inkstone mapped this selection.';
+    case 'internal-error':
+      return 'Inkstone could not prepare this annotation.';
+    case 'projection-warming':
+      return 'Inkstone is preparing this note for selection.';
+  }
+}
+
+function normalizeCaptureFailure(
+  reason: Extract<ReturnType<typeof captureReadingSelection>, { supported: false }>['reason'],
+): ReadingSourceProjectionFailureCode {
+  switch (reason) {
+    case 'empty':
+      return 'empty-selection';
+    case 'outside-reading-view':
+      return 'outside-reading-view';
+    case 'embedded-content':
+    case 'generated-content':
+      return 'generated-content';
     case 'cross-block':
-      return 'Selections across different block types are not supported.';
-    case 'source-mapping-failed':
-      return 'This selection is ambiguous in the Markdown source.';
+      return 'non-monotonic-selection';
+    case 'code-content':
+    case 'math-content':
     case 'unsupported-block':
-      return 'This Markdown block is not supported yet.';
+      return 'unsupported-syntax';
   }
 }

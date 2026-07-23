@@ -1,0 +1,11 @@
+# Risk Register
+
+| Risk                                                             | Status                                         | Treatment                                                                                                                       |
+| ---------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Physical-iPad selection and latency are unmeasured               | Open release gate                              | Run P0 on a connected physical iPad; do not infer from desktop or simulator evidence.                                           |
+| Whole rendered-math selection has no proven stable DOM boundary  | Deferred                                       | Keep disabled; partial MathJax selection fails closed and offers Snapshot Annotation.                                           |
+| Parser stack increases `main.js` by 264,302 bytes                | Accepted for implementation, monitor on device | Mobile scan passes; retain bounded cache and collect physical-iPad heap/latency evidence.                                       |
+| Themes/plugins may replace or postprocess DOM blocks             | Mitigated                                      | Semantic binding skips independently unsupported siblings; view-level restoration rebinds after postprocessor-root replacement. |
+| Third-party generated or reordered content resembles source text | Mitigated                                      | Generated selectors and non-monotonic mappings fail closed; no class-name guess becomes canonical.                              |
+| Static HTML browser repair may reorder text                      | Deferred                                       | Surrounding source text is selectable; endpoints inside HTML-rendered text remain unsupported.                                  |
+| Cross-block source quote contains Markdown separators            | Accepted by design                             | Canonical `quote.exact` remains source text while `displayText` preserves visible text.                                         |

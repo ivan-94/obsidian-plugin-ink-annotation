@@ -110,7 +110,7 @@ describe('Reading View selection capture', () => {
     }
   });
 
-  it('supports simple same-kind cross-block selections and fails closed for complex combinations', () => {
+  it('supports monotonic cross-kind selections and fails closed across generated content', () => {
     const root = document.createElement('section');
     root.innerHTML =
       '<p>First paragraph.</p><p>Second paragraph.</p><ul><li>List item.</li></ul><div class="dataview"><p>Generated value</p></div><p>After generated.</p>';
@@ -152,9 +152,10 @@ describe('Reading View selection capture', () => {
     const complexCrossBlock = document.createRange();
     complexCrossBlock.setStart(secondText, 0);
     complexCrossBlock.setEnd(listText, 4);
-    expect(captureReadingSelection(root, complexCrossBlock)).toEqual({
-      reason: 'cross-block',
-      supported: false,
+    expect(captureReadingSelection(root, complexCrossBlock)).toMatchObject({
+      block: paragraphs[1],
+      endBlock: root.querySelector('li'),
+      supported: true,
     });
 
     const acrossGenerated = document.createRange();
@@ -173,8 +174,92 @@ describe('Reading View selection capture', () => {
     });
   });
 
+  it('ignores Obsidian wrapper whitespace between source-backed blocks', () => {
+    const root = document.createElement('section');
+    root.innerHTML = [
+      '<div class="el-p"><p>Paragraph text.</p></div>',
+      '\n',
+      '<div class="el-ul"><ul>\n<li>List item.</li>\n</ul></div>',
+    ].join('');
+    const paragraph = root.querySelector('p');
+    const listItem = root.querySelector('li');
+    const paragraphText = paragraph?.firstChild;
+    const listText = listItem?.firstChild;
+    if (
+      !(paragraph instanceof HTMLElement) ||
+      !(listItem instanceof HTMLElement) ||
+      !(paragraphText instanceof Text) ||
+      !(listText instanceof Text)
+    ) {
+      throw new Error('Wrapper-whitespace fixture is malformed.');
+    }
+    const range = document.createRange();
+    range.setStart(paragraphText, 0);
+    range.setEnd(listText, listText.data.length);
+
+    expect(captureReadingSelection(root, range)).toMatchObject({
+      block: paragraph,
+      endBlock: listItem,
+      fragments: [
+        {
+          block: paragraph,
+          renderedEnd: paragraphText.data.length,
+          renderedStart: 0,
+        },
+        {
+          block: listItem,
+          renderedEnd: listText.data.length,
+          renderedStart: 0,
+        },
+      ],
+      supported: true,
+    });
+  });
+
+  it('captures inline and fenced code as source-backed blocks', () => {
+    const root = document.createElement('section');
+    root.innerHTML = '<p>before <code>inline code</code> after</p><pre><code>fenced()</code></pre>';
+    const inline = root.querySelector('p code')?.firstChild;
+    const fenced = root.querySelector('pre code')?.firstChild;
+    if (!(inline instanceof Text) || !(fenced instanceof Text)) {
+      throw new Error('Code fixture has no text nodes.');
+    }
+    const inlineRange = document.createRange();
+    inlineRange.selectNodeContents(inline);
+    const fencedRange = document.createRange();
+    fencedRange.selectNodeContents(fenced);
+
+    expect(captureReadingSelection(root, inlineRange)).toMatchObject({
+      exact: 'inline code',
+      supported: true,
+    });
+    expect(captureReadingSelection(root, fencedRange)).toMatchObject({
+      block: root.querySelector('pre'),
+      exact: 'fenced()',
+      supported: true,
+    });
+  });
+
+  it('rejects a MathJax element endpoint even when the rendered glyph has no text node', () => {
+    const root = document.createElement('section');
+    root.innerHTML =
+      '<p>before <span class="math math-inline"><mjx-container><mjx-math><mjx-msup></mjx-msup></mjx-math></mjx-container></span>.</p>';
+    const mathEndpoint = root.querySelector('mjx-msup');
+    const trailing = root.querySelector('p')?.lastChild;
+    if (!(mathEndpoint instanceof HTMLElement) || !(trailing instanceof Text)) {
+      throw new Error('MathJax endpoint fixture is malformed.');
+    }
+    const range = document.createRange();
+    range.setStart(mathEndpoint, 0);
+    range.setEnd(trailing, trailing.data.length);
+
+    expect(captureReadingSelection(root, range)).toEqual({
+      reason: 'math-content',
+      supported: false,
+    });
+  });
+
   it.each([
-    { html: '<p><code>inline code</code></p>', reason: 'code-content', selector: 'code' },
     { html: '<div class="math"><p>rendered math</p></div>', reason: 'math-content', selector: 'p' },
     {
       html: '<div class="internal-embed"><p>embedded note</p></div>',

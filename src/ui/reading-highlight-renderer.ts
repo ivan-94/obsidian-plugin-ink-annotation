@@ -16,12 +16,13 @@ const HIGHLIGHT_SELECTOR = 'span[data-inkstone-annotation-id]';
 export function renderHighlight(
   root: HTMLElement,
   range: HighlightRenderRange,
+  acceptTextNode?: (node: Text) => boolean,
 ): readonly HTMLSpanElement[] {
   if (range.start < 0 || range.end <= range.start) {
     throw new Error('Highlight render range must be a non-empty forward range.');
   }
 
-  const textNodes = collectTextNodes(root);
+  const textNodes = collectTextNodes(root, acceptTextNode);
   const totalLength = textNodes.at(-1)?.end ?? 0;
   if (range.end > totalLength) {
     throw new Error('Highlight render range exceeds the rendered section.');
@@ -73,8 +74,9 @@ export function cleanupHighlights(root: HTMLElement): void {
 export function renderNoteAnchorIndicator(
   root: HTMLElement,
   point: NoteAnchorRenderPoint,
+  acceptTextNode?: (node: Text) => boolean,
 ): HTMLSpanElement {
-  const textNodes = collectTextNodes(root);
+  const textNodes = collectTextNodes(root, acceptTextNode);
   const totalLength = textNodes.at(-1)?.end ?? 0;
   if (point.offset < 0 || point.offset > totalLength) {
     throw new Error('Note anchor point exceeds the rendered section.');
@@ -102,6 +104,7 @@ export function renderNoteAnchorIndicator(
 export function renderHighlightPlan(
   root: HTMLElement,
   intervals: readonly AnnotationRenderInterval[],
+  acceptTextNode?: (node: Text) => boolean,
 ): readonly HTMLSpanElement[] {
   cleanupHighlights(root);
   const fragments: HTMLSpanElement[] = [];
@@ -112,12 +115,16 @@ export function renderHighlightPlan(
     if (primaryId === undefined) {
       continue;
     }
-    const rendered = renderHighlight(root, {
-      annotationId: primaryId,
-      end: segment.end,
-      start: segment.start,
-      styleId: segment.backgroundStyleId ?? segment.underlineStyleIds[0] ?? 'annotation-default',
-    });
+    const rendered = renderHighlight(
+      root,
+      {
+        annotationId: primaryId,
+        end: segment.end,
+        start: segment.start,
+        styleId: segment.backgroundStyleId ?? segment.underlineStyleIds[0] ?? 'annotation-default',
+      },
+      acceptTextNode,
+    );
     for (const fragment of rendered) {
       fragment.dataset.inkstoneAnnotationIds = JSON.stringify(segment.annotationIds);
       if (segment.backgroundAnnotationId === undefined) {
@@ -153,7 +160,10 @@ export function annotationIdsAtElement(element: Element | null): readonly string
   }
 }
 
-function collectTextNodes(root: HTMLElement): readonly {
+function collectTextNodes(
+  root: HTMLElement,
+  acceptTextNode?: (node: Text) => boolean,
+): readonly {
   readonly end: number;
   readonly node: Text;
   readonly start: number;
@@ -165,7 +175,7 @@ function collectTextNodes(root: HTMLElement): readonly {
   let current = walker.nextNode();
 
   while (current !== null) {
-    if (isTextNode(current)) {
+    if (isTextNode(current) && (acceptTextNode === undefined || acceptTextNode(current))) {
       const start = offset;
       offset += current.data.length;
       entries.push({ end: offset, node: current, start });

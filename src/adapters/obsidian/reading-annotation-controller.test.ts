@@ -7,6 +7,38 @@ import { SidecarRepository, type TextFileStore } from '../../storage/sidecar-rep
 import { ReadingAnnotationController } from './reading-annotation-controller';
 
 describe('Reading annotation controller', () => {
+  it('opens annotation actions for the second item in a tight list', async () => {
+    const source = '- first\n- second\n- third';
+    const root = document.createElement('section');
+    root.innerHTML = '<ul><li>first</li><li>second</li><li>third</li></ul>';
+    document.body.append(root);
+    const text = root.querySelectorAll('li')[1]?.firstChild;
+    if (!(text instanceof Text)) throw new Error('Tight-list fixture is missing its second item.');
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    const controller = new ReadingAnnotationController({
+      collapseSelection: () => undefined,
+      document,
+      service: new AnnotationService({
+        repository: new SidecarRepository(new MemoryTextFileStore()),
+      }),
+    });
+
+    const shown = await controller.showForRange({
+      anchorRect: new DOMRect(40, 80, 120, 20),
+      filePath: 'Lists.md',
+      fullSource: source,
+      range,
+      readingRoot: root,
+      scope: { sectionEndLine: 2, sectionStartLine: 0 },
+      sectionSource: source,
+      sectionSourceStart: 0,
+    });
+    controller.dispose();
+
+    expect(shown).toEqual({ supported: true });
+  });
+
   it('maps a Range, commits one highlight, persists it and renders before collapsing selection', async () => {
     const store = new MemoryTextFileStore();
     const repository = new SidecarRepository(store);
@@ -326,6 +358,43 @@ describe('Reading annotation controller', () => {
     ).toEqual(['paragraph.', 'Second']);
     const [record] = (await repository.listAnnotations('Cross block.md')).records;
     expect(record?.target.quote.exact).toBe('paragraph.\n\nSecond');
+  });
+
+  it('returns generated-content and exposes the explicit Snapshot fallback', async () => {
+    const root = document.createElement('section');
+    root.innerHTML = '<div class="dataview"><p>Generated result</p></div>';
+    document.body.append(root);
+    const text = root.querySelector('p')?.firstChild;
+    if (!(text instanceof Text)) throw new Error('Generated fixture is missing text.');
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    const onSnapshotFallback = vi.fn(() => Promise.resolve());
+    const controller = new ReadingAnnotationController({
+      collapseSelection: () => undefined,
+      document,
+      onSnapshotFallback,
+      service: new AnnotationService({
+        repository: new SidecarRepository(new MemoryTextFileStore()),
+      }),
+    });
+
+    const shown = await controller.showForRange({
+      anchorRect: new DOMRect(40, 80, 120, 20),
+      filePath: 'Generated.md',
+      fullSource: '```dataview\nTABLE file.name\n```',
+      range,
+      readingRoot: root,
+      scope: { sectionEndLine: 2, sectionStartLine: 0 },
+      sectionSource: '```dataview\nTABLE file.name\n```',
+      sectionSourceStart: 0,
+    });
+
+    expect(shown).toMatchObject({ reason: 'generated-content', supported: false });
+    document
+      .querySelector<HTMLButtonElement>('button[aria-label="Annotate a snapshot instead"]')
+      ?.click();
+    await vi.waitFor(() => expect(onSnapshotFallback).toHaveBeenCalledOnce());
+    controller.dispose();
   });
 });
 

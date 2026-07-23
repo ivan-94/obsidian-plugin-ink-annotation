@@ -1,7 +1,7 @@
 # Parser-backed Text Source Projection and Powerful Reading Selection
 
 - Created: 2026-07-23
-- Status: architecture direction adopted for specification; implementation pending
+- Status: implementation delivered; release qualification pending physical-iPad P0
 - Scope: Reading View text selection, Markdown source projection, highlight restoration, and
   Snapshot source binding
 
@@ -489,29 +489,29 @@ Annotation.
 
 This matrix defines the target after the projection cutover, not the behavior of the legacy mapper.
 
-| Surface                                     | Text Annotation target                                               | Notes                                                                 |
-| ------------------------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| Paragraphs and headings                     | Supported                                                            | Partial and cross-node selection.                                     |
-| Bold, italic, highlight, strikethrough      | Supported                                                            | Outer syntax excluded; internal syntax may remain in canonical quote. |
-| Lists, task lists, and nested list items    | Supported                                                            | Each list item is a distinct projected block; checkbox is synthetic.  |
-| Blockquotes                                 | Supported                                                            | Quote markers are hidden source runs.                                 |
-| Callout body                                | Supported                                                            | Same source ownership as quoted body.                                 |
-| Explicit callout title                      | Supported                                                            | Title source is selectable.                                           |
-| Default/generated callout title and icon    | Not text-selectable                                                  | Synthetic presentation.                                               |
-| Markdown links                              | Visible label supported                                              | Destination hidden at outer edges.                                    |
-| Aliased and unaliased wikilinks             | Visible label supported                                              | Alias/target semantics provided by dialect module.                    |
-| Inline code                                 | Supported                                                            | Backticks hidden; code text source-backed.                            |
-| Fenced code and syntax-highlighted spans    | Supported                                                            | Fence/info string hidden; selected code text must remain monotonic.   |
-| GFM tables                                  | Supported by cell                                                    | DOM cell and projected cell must bind uniquely.                       |
-| Escapes and character entities              | Supported                                                            | Atomic runs where display/source lengths differ.                      |
-| Block IDs and Obsidian comments             | Visible surrounding text supported                                   | Hidden syntax is non-selectable.                                      |
-| Whole rendered math element                 | Supported as one atomic selection after dialect/DOM proof            | Source expression is canonical.                                       |
-| Partial rendered math                       | Unsupported initially                                                | Display glyphs are not reliably monotonic with TeX source.            |
-| Static raw HTML                             | Unsupported until a dedicated deterministic adapter exists           | Avoid treating browser repair as source truth.                        |
-| Embedded notes and cross-file transclusions | Snapshot fallback initially                                          | Requires explicit source-file and embed-instance semantics.           |
-| Mermaid, Dataview, iframe, query results    | Snapshot fallback                                                    | Generated content.                                                    |
-| Third-party renderer output                 | Unsupported unless a registered adapter proves stable source mapping | No class-name heuristic.                                              |
-| Visually reordered or discontiguous content | Unsupported under current target schema                              | Requires a future multi-range anchor.                                 |
+| Surface                                     | Text Annotation target                                               | Notes                                                                                 |
+| ------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Paragraphs and headings                     | Supported                                                            | Partial and cross-node selection.                                                     |
+| Bold, italic, highlight, strikethrough      | Supported                                                            | Outer syntax excluded; internal syntax may remain in canonical quote.                 |
+| Lists, task lists, and nested list items    | Supported                                                            | Each list item is a distinct projected block; checkbox is synthetic.                  |
+| Blockquotes                                 | Supported                                                            | Quote markers are hidden source runs.                                                 |
+| Callout body                                | Supported                                                            | Same source ownership as quoted body.                                                 |
+| Explicit callout title                      | Supported                                                            | Title source is selectable.                                                           |
+| Default/generated callout title and icon    | Not text-selectable                                                  | Synthetic presentation.                                                               |
+| Markdown links                              | Visible label supported                                              | Destination hidden at outer edges.                                                    |
+| Aliased and unaliased wikilinks             | Visible label supported                                              | Alias/target semantics provided by dialect module.                                    |
+| Inline code                                 | Supported                                                            | Backticks hidden; code text source-backed.                                            |
+| Fenced code and syntax-highlighted spans    | Supported                                                            | Fence/info string hidden; selected code text must remain monotonic.                   |
+| GFM tables                                  | Supported by cell                                                    | DOM cell and projected cell must bind uniquely.                                       |
+| Escapes and character entities              | Supported                                                            | Atomic runs where display/source lengths differ.                                      |
+| Block IDs and Obsidian comments             | Visible surrounding text supported                                   | Hidden syntax is non-selectable.                                                      |
+| Whole rendered math element                 | Not text-selectable until a proven DOM adapter exists                | Pure projection models it atomically; current MathJax DOM proof is incomplete.        |
+| Partial rendered math                       | Unsupported initially                                                | Display glyphs are not reliably monotonic with TeX source.                            |
+| Static raw HTML                             | Surrounding source text only                                         | HTML-rendered text endpoints remain unsupported until a deterministic adapter exists. |
+| Embedded notes and cross-file transclusions | Snapshot fallback initially                                          | Requires explicit source-file and embed-instance semantics.                           |
+| Mermaid, Dataview, iframe, query results    | Snapshot fallback                                                    | Generated content.                                                                    |
+| Third-party renderer output                 | Unsupported unless a registered adapter proves stable source mapping | No class-name heuristic.                                                              |
+| Visually reordered or discontiguous content | Unsupported under current target schema                              | Requires a future multi-range anchor.                                                 |
 
 ## Typed Failure Model
 
@@ -784,7 +784,7 @@ This is sequencing guidance, not a substitute for a separately reviewed executio
 
 ## Exit Gate
 
-This specification is implemented only when all of the following are true:
+This implementation is release-qualified only when all of the following are true:
 
 - The reported tight-list regression maps every source-backed list item in `UAT - Start Here.md`.
 - The supported syntax matrix has golden source fixtures and representative Obsidian DOM fixtures.
@@ -799,6 +799,20 @@ This specification is implemented only when all of the following are true:
 - `npm run check` passes.
 - Slice evidence and its Source Manifest are complete.
 
+### Current Gate Status — 2026-07-23
+
+- Delivered: parser-backed forward/reverse projection, bounded cache, Reading View binding,
+  creation/restoration, Snapshot capture/jump/refind migration, typed failure UX, legacy mapper
+  removal, automated fixtures, desktop performance evidence, desktop HAT, mobile bundle scan, and
+  Slice evidence.
+- Desktop HAT additionally proved real Obsidian 1.12.7 behavior for tight lists, inline code,
+  paragraph/list and heading/paragraph cross-block selection, postprocessor-root replacement after
+  reload, and MathJax fail-closed Snapshot fallback.
+- Open release gate: physical-iPad P0 latency, native selection-handle, scrolling, and accessibility
+  evidence. It is not inferred from desktop, simulator, or automated evidence.
+- Deferred surface: whole rendered-math selection remains disabled until an explicit MathJax DOM
+  adapter proves a stable atomic boundary.
+
 ## Risks and Open Decisions
 
 | Risk / decision                                    | Required treatment                                                                           |
@@ -807,8 +821,8 @@ This specification is implemented only when all of the following are true:
 | Obsidian DOM changes across versions/themes        | Semantic binder contract plus captured representative DOM fixtures and real HAT.             |
 | Parser bundle or memory cost is too high on iPad   | SP0 measurement gate; optimize projection representation or choose another compliant parser. |
 | Third-party plugins mutate source-backed DOM       | Require an explicit registered adapter; otherwise generated-content/Snapshot.                |
-| Static HTML browser repair changes text order      | Keep unsupported until a deterministic adapter is proven.                                    |
-| Partial math mapping is not monotonic              | Whole-element atomic support only; partial selection stays unsupported.                      |
+| Static HTML browser repair changes text order      | Keep HTML-rendered endpoints unsupported until a deterministic adapter is proven.            |
+| MathJax display/source mapping is not monotonic    | Keep partial selection unsupported and defer whole-element selection until DOM proof exists. |
 | Cross-block source interval contains hidden syntax | Preserve canonical source quote and separate visible `displayText`.                          |
 | Discontiguous selections require schema change     | Defer to a future ordered multi-range target proposal.                                       |
 | Physical-iPad behavior remains unmeasured          | iPad P0 HAT is a cutover gate, not inferred from desktop or simulator evidence.              |
@@ -854,6 +868,10 @@ This specification is implemented only when all of the following are true:
 
 - `docs/specs/2026-07-23-parser-backed-text-source-projection.md`.
 - `docs/specs/README.md` index update.
+- `docs/delivery/slices/S36-parser-backed-source-projection/`.
+- `src/domain/source-projection.ts`.
+- `src/adapters/obsidian/reading-source-projection.ts`.
+- `test-fixtures/vault/Source Projection HAT.md` in the local acceptance Vault.
 
 ### Key Decisions
 
@@ -889,14 +907,21 @@ This specification is implemented only when all of the following are true:
   coverage gap rather than an already-failing checked-in test.
 - Specification formatting, local links, fenced-block balance, and repository diff checks are
   recorded after file creation.
+- S36 replaces that legacy suite with parser/dialect, DOM binding, selection, restoration, Snapshot,
+  cache, and performance coverage. Final commands and counts are recorded in
+  `docs/delivery/slices/S36-parser-backed-source-projection/test-results.md`.
+- Desktop Obsidian 1.12.7 acceptance screenshots and sidecar offsets are recorded in
+  `docs/delivery/slices/S36-parser-backed-source-projection/hat-guide.md`.
 
 ### Open Questions / Risks
 
-- SP0 must confirm the exact parser package set; the architecture contract is firm, but package
-  selection remains reversible until bundle, mobile, and UTF-16 gates pass.
-- Representative Obsidian DOM fixtures must cover supported desktop and iPad versions without
-  treating private class names as stable API.
+- The selected mdast/micromark package set passed UTF-16, cache, performance, production-bundle, and
+  mobile-scan gates; physical-iPad memory and latency remain unmeasured.
+- Representative DOM fixtures and real Obsidian 1.12.7 desktop HAT pass without treating private
+  class names as stable API; physical-iPad DOM and native-handle behavior remain to be recorded.
 - Physical-iPad selection latency and selection-retention behavior remain unmeasured.
+- Whole rendered-math selection remains intentionally disabled; partial MathJax selection is
+  verified as `unsupported-syntax` with an explicit Snapshot fallback.
 - A future multi-range anchor schema is required for discontiguous or renderer-reordered selection.
 - The screenshot source is in an ephemeral temporary directory; its visible error message and the
   associated live-note evidence are summarized in this durable artifact.

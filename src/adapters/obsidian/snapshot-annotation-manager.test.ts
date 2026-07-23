@@ -341,6 +341,8 @@ describe('Snapshot Annotation desktop core flow', () => {
     heading.textContent = 'Test';
     const paragraph = document.createElement('p');
     paragraph.textContent = 'Visible paragraph';
+    const repeatedParagraph = document.createElement('p');
+    repeatedParagraph.textContent = 'Visible paragraph';
     const headingCollapse = document.createElement('span');
     headingCollapse.className = 'collapse-indicator';
     headingCollapse.append(document.createElementNS('http://www.w3.org/2000/svg', 'svg'));
@@ -348,7 +350,7 @@ describe('Snapshot Annotation desktop core flow', () => {
     generated.className = 'mermaid';
     generated.append(document.createElementNS('http://www.w3.org/2000/svg', 'svg'));
     const iframe = document.createElement('iframe');
-    sizer.append(heading, headingCollapse, paragraph, generated, iframe);
+    sizer.append(heading, headingCollapse, paragraph, repeatedParagraph, generated, iframe);
     preview.append(sizer);
     contentEl.append(preview);
     const commandPalette = document.createElement('div');
@@ -357,6 +359,7 @@ describe('Snapshot Annotation desktop core flow', () => {
     vi.spyOn(preview, 'getBoundingClientRect').mockReturnValue(rect(20, 30, 300, 200));
     vi.spyOn(heading, 'getBoundingClientRect').mockReturnValue(rect(40, 50, 180, 30));
     vi.spyOn(paragraph, 'getBoundingClientRect').mockReturnValue(rect(40, 110, 220, 50));
+    vi.spyOn(repeatedParagraph, 'getBoundingClientRect').mockReturnValue(rect(40, 165, 220, 30));
 
     const view = Object.assign(Object.create(MarkdownView.prototype) as MarkdownView, {
       contentEl,
@@ -394,7 +397,9 @@ describe('Snapshot Annotation desktop core flow', () => {
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext());
     const manager = new ObsidianSnapshotAnnotationManager({
       app: {
-        vault: { cachedRead: () => Promise.resolve('# Test\n\nVisible paragraph') },
+        vault: {
+          cachedRead: () => Promise.resolve('# Test\n\nVisible paragraph\n\nVisible paragraph'),
+        },
         workspace: { getActiveViewOfType: () => view },
       },
       backendId: 'fake-capture',
@@ -432,8 +437,9 @@ describe('Snapshot Annotation desktop core flow', () => {
       coverage: [
         { displayText: 'Test', quote: { exact: '# Test' } },
         { quote: { exact: 'Visible paragraph' } },
+        { quote: { exact: 'Visible paragraph' } },
       ],
-      focus: { quote: { exact: 'Visible paragraph' } },
+      focus: { position: { start: 8 }, quote: { exact: 'Visible paragraph' } },
       headingPath: ['Test'],
     });
     vi.spyOn(canvas as HTMLCanvasElement, 'getBoundingClientRect').mockReturnValue(

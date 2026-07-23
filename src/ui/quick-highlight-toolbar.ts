@@ -22,6 +22,10 @@ export interface QuickToolbarShowInput {
 }
 
 export interface QuickToolbarUnavailableInput {
+  readonly action?: {
+    readonly label: string;
+    readonly onActivate: () => Promise<void> | void;
+  };
   readonly anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>;
   readonly message: string;
 }

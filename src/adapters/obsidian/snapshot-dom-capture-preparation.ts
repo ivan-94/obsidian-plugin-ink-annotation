@@ -1,5 +1,6 @@
 export const SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR = [
   '.inkstone-reading-toolbar',
+  '[data-inkstone-quick-toolbar-host]',
   '.inkstone-note-anchor',
   '.collapse-indicator',
   '.heading-collapse-indicator',

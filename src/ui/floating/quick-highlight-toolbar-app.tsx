@@ -87,6 +87,19 @@ export function QuickHighlightToolbarApp({
   }`;
 
   if (model.kind === 'unavailable') {
+    const activateFallback = async (): Promise<void> => {
+      if (model.action === undefined || store.pendingAction.value !== null) return;
+      store.errorMessage.value = null;
+      store.pendingAction.value = 'unavailable-fallback';
+      try {
+        await model.action.onActivate();
+        onDismiss();
+      } catch (error) {
+        onError(error);
+        store.errorMessage.value = "Couldn't start Snapshot annotation. Retry.";
+        store.pendingAction.value = null;
+      }
+    };
     return (
       <div
         aria-label="Annotation actions"
@@ -97,6 +110,23 @@ export function QuickHighlightToolbarApp({
         tabIndex={-1}
       >
         <span className="inkstone-quick-toolbar__reason">{model.message}</span>
+        {model.action === undefined ? null : (
+          <button
+            aria-label={model.action.label}
+            className="inkstone-quick-toolbar__fallback"
+            disabled={pendingAction === 'unavailable-fallback'}
+            onClick={() => void activateFallback()}
+            onPointerDown={(event) => event.preventDefault()}
+            type="button"
+          >
+            {model.action.label}
+          </button>
+        )}
+        {errorMessage === null ? null : (
+          <span className="inkstone-quick-toolbar__error" role="alert">
+            {errorMessage}
+          </span>
+        )}
       </div>
     );
   }

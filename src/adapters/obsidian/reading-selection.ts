@@ -1,4 +1,6 @@
-export const SUPPORTED_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li';
+import { ownedReadingText, READING_SOURCE_BLOCK_SELECTOR } from './reading-source-projection';
+
+export const SUPPORTED_BLOCK_SELECTOR = READING_SOURCE_BLOCK_SELECTOR;
 
 export type CapturedReadingSelection =
   | {
@@ -39,6 +41,12 @@ export function captureReadingSelection(
     return { reason: 'outside-reading-view', supported: false };
   }
 
+  const restrictedEndpointReason =
+    restrictedContentReason(range.startContainer) ?? restrictedContentReason(range.endContainer);
+  if (restrictedEndpointReason !== null) {
+    return { reason: restrictedEndpointReason, supported: false };
+  }
+
   const selectedParts = selectedTextParts(readingRoot, range);
   if (selectedParts.length === 0) {
     return { reason: 'empty', supported: false };
@@ -52,10 +60,12 @@ export function captureReadingSelection(
     return { reason: restrictedReason, supported: false };
   }
 
-  if (selectedParts.some((part) => part.block === null)) {
+  if (selectedParts.some((part) => part.block === null && part.node.data.trim().length > 0)) {
     return { reason: 'unsupported-block', supported: false };
   }
-  const supportedParts = selectedParts as readonly (SelectedTextPart & { block: HTMLElement })[];
+  const supportedParts = selectedParts.filter(
+    (part): part is SelectedTextPart & { block: HTMLElement } => part.block !== null,
+  );
   const selectedBlocks = supportedParts.reduce<HTMLElement[]>((blocks, part) => {
     if (blocks.at(-1) !== part.block) blocks.push(part.block);
     return blocks;
@@ -65,11 +75,6 @@ export function captureReadingSelection(
   if (startBlock === undefined || endBlock === undefined) {
     return { reason: 'unsupported-block', supported: false };
   }
-  const structuralKind = supportedBlockKind(startBlock);
-  if (selectedBlocks.some((block) => supportedBlockKind(block) !== structuralKind)) {
-    return { reason: 'cross-block', supported: false };
-  }
-
   const fragments = selectedBlocks.map((block) => {
     const parts = supportedParts.filter((part) => part.block === block);
     const first = parts[0];
@@ -96,7 +101,7 @@ export function captureReadingSelection(
   const exact = exactRange.toString();
   if (
     startBlock === endBlock &&
-    startBlock.textContent?.slice(renderedStart, renderedEnd) !== exact
+    ownedReadingText(startBlock).text.slice(renderedStart, renderedEnd) !== exact
   ) {
     return { reason: 'unsupported-block', supported: false };
   }
@@ -151,13 +156,6 @@ function selectedTextParts(readingRoot: HTMLElement, range: Range): readonly Sel
   return parts;
 }
 
-function supportedBlockKind(block: HTMLElement): string {
-  if (block.closest('li') !== null) return 'list-item';
-  if (block.closest('blockquote') !== null) return 'blockquote';
-  if (block.closest('.callout') !== null) return 'callout';
-  return block.tagName;
-}
-
 function findSupportedBlock(node: Node): HTMLElement | null {
   const element = node.nodeType === 1 ? (node as Element) : node.parentElement;
   return element?.closest<HTMLElement>(SUPPORTED_BLOCK_SELECTOR) ?? null;
@@ -167,9 +165,6 @@ function restrictedContentReason(
   node: Node,
 ): Extract<CapturedReadingSelection, { supported: false }>['reason'] | null {
   const element = node.nodeType === 1 ? (node as Element) : node.parentElement;
-  if (element?.closest('pre, code') !== null) {
-    return 'code-content';
-  }
   if (element?.closest('mjx-container, .math, .math-block') !== null) {
     return 'math-content';
   }
@@ -183,8 +178,9 @@ function restrictedContentReason(
 }
 
 function textLengthBefore(block: HTMLElement, node: Node, offset: number): number {
-  const prefix = block.ownerDocument.createRange();
-  prefix.selectNodeContents(block);
-  prefix.setEnd(node, offset);
-  return prefix.toString().length;
+  const entry = ownedReadingText(block).entries.find((candidate) => candidate.node === node);
+  if (entry === undefined || offset < 0 || offset > entry.node.data.length) {
+    throw new Error('Selected text node is not owned by its Reading View block.');
+  }
+  return entry.start + offset;
 }
