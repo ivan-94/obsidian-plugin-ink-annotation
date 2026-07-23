@@ -39,6 +39,11 @@ import type {
 import { AnnotationService } from './application/annotation-service';
 import { AnnotationProjectionCoordinator } from './application/annotation-projection-coordinator';
 import { CanonicalInkSummarySource } from './application/canonical-ink-summary-source';
+import {
+  SidecarGarbageCollector,
+  type SidecarGarbageCollectionPreview,
+  type SidecarGarbageCollectionResult,
+} from './application/sidecar-garbage-collector';
 import { SidecarLifecycleService } from './application/sidecar-lifecycle-service';
 import {
   buildTextAnnotationExportPath,
@@ -78,6 +83,7 @@ import { IndexedDbSnapshotAnnotationDraftStore } from './storage/indexeddb-snaps
 import { LocalInkToolPreferenceStore } from './storage/local-ink-tool-preference';
 import { IndexedDbVaultCatalog } from './storage/indexeddb-vault-catalog';
 import { SnapshotAnnotationRepository } from './storage/snapshot-annotation-repository';
+import { GraveyardRepository } from './storage/graveyard-repository';
 import { SnapshotAnnotationEditor } from './ui/snapshot-annotation-editor';
 import { writeSnapshotAnnotationPngExport } from './application/snapshot-annotation-export';
 
@@ -87,6 +93,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
   private pluginSettings: InkstoneSettings = DEFAULT_SETTINGS;
   private inspector: AnnotationInspector | null = null;
   private readingView: ReadingViewIntegration | null = null;
+  private sidecarGarbageCollector: SidecarGarbageCollector | null = null;
   private sidebarView: AnnotationSidebarView | null = null;
 
   override async onload(): Promise<void> {
@@ -108,6 +115,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     this.runtime.registerDisposer(() => sourceProjectionCache.clear());
 
     const sidecarStore = new ObsidianVaultTextFileStore(this.app.vault.adapter);
+    const graveyardRepository = new GraveyardRepository(sidecarStore, this.pluginSettings.deviceId);
     const snapshotAnnotationRepository = new SnapshotAnnotationRepository(sidecarStore, {
       onDerivedIssue: (error) => console.warn('[Inkstone Annotations]', error),
     });
@@ -116,6 +124,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     const styleName = (styleId: string): string | undefined =>
       this.pluginSettings.stylePresets.find((preset) => preset.id === styleId)?.name;
     const repository = new SidecarRepository(sidecarStore, {
+      deletionEvidence: graveyardRepository,
       onEventIssue: (error) => console.warn('[Inkstone Annotations]', error),
       onRecordChanged: (record) => markVaultCatalogDirty(record.filePath),
       onRecordRemoved: (record) => markVaultCatalogDirty(record.filePath),
@@ -319,6 +328,11 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     this.runtime.registerDisposer(() => vaultCatalogSession.close());
     const annotationService = new AnnotationService({
       deviceId: this.pluginSettings.deviceId,
+      repository,
+    });
+    this.sidecarGarbageCollector = new SidecarGarbageCollector({
+      graveyard: graveyardRepository,
+      now: () => new Date().toISOString(),
       repository,
     });
     const sidecarLifecycle = new SidecarLifecycleService({
@@ -1445,6 +1459,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     const startedAt = performance.now();
     const cleanupErrors = this.runtime.stop();
     this.readingView = null;
+    this.sidecarGarbageCollector = null;
     this.sidebarView = null;
     this.inspector?.close(false);
     this.inspector = null;
@@ -1458,6 +1473,20 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
 
   getSettings(): InkstoneSettings {
     return this.pluginSettings;
+  }
+
+  previewCacheCleanup(): Promise<SidecarGarbageCollectionPreview> {
+    if (this.sidecarGarbageCollector === null) {
+      throw new Error('缓存清理服务尚未就绪。');
+    }
+    return this.sidecarGarbageCollector.preview();
+  }
+
+  clearCache(): Promise<SidecarGarbageCollectionResult> {
+    if (this.sidecarGarbageCollector === null) {
+      throw new Error('缓存清理服务尚未就绪。');
+    }
+    return this.sidecarGarbageCollector.clear();
   }
 
   async setDiagnosticsEnabled(enabled: boolean): Promise<void> {

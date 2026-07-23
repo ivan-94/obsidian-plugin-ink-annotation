@@ -51,10 +51,21 @@ v1；不要用旧版插件打开未来版本已经迁移的数据，除非该版
 - Ink 可导出 SVG、PNG 或 standalone HTML report。
 - 导出写入 `Inkstone Exports/`，同名文件使用数字后缀，绝不覆盖已有导出。
 
+## 清理缓存
+
+设置页中的 `清理缓存`
+面向普通用户提供已删除文字标注的手动垃圾回收。点击后会先扫描并显示可清理数量，再要求确认永久删除。插件只处理无冲突、未损坏且 revision 未变化的文字 tombstone；先持久化并校验 graveyard 删除凭证，再删除完整 annotation
+JSON。冲突、损坏或操作期间发生变化的数据会保留。
+
+该操作目前不清理 Ink 或 Snapshot Annotation
+tombstone，也不启用后台自动 GC。确认清理的文字标注无法 Restore；需要长期保留时应先导出或备份
+`.obsidian-annotations/`。
+
 ## 卸载
 
 禁用或删除插件目录不会删除 `.obsidian-annotations/` canonical sidecars，也不会删除
-`Inkstone Exports/`。若要彻底移除数据，请先备份/导出，再由用户手工删除这些目录；插件不提供自动销毁 canonical 数据的命令。
+`Inkstone Exports/`。设置页 `清理缓存`
+只回收已删除的安全文字 tombstone；若要彻底移除其余数据，请先备份/导出，再由用户手工删除这些目录。
 
 ## 本地诊断
 

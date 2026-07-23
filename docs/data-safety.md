@@ -5,7 +5,9 @@
 - Canonical：`.obsidian-annotations/v1/notes/<path-hash>/` 下的 note metadata、每条文字 annotation
   JSON 和每个 Ink surface JSON。
 - 派生：Vault `index.json`、note summary、Ink thumbnail summary。派生文件可删除并从 canonical 重建。
-- 插件卸载、cache clear、index rebuild 或 UI 错误不得删除 canonical 文件。
+- 插件卸载、普通派生 cache clear、index
+  rebuild 或 UI 错误不得删除 canonical 文件。设置页中用户明确确认的 `清理缓存`
+  是一个例外：它是有 graveyard 保护的手动文字 tombstone GC，不是普通缓存删除。
 
 ## iCloud 冲突策略
 
@@ -20,7 +22,9 @@
 
 ## 删除与保留
 
-文字和 Ink 删除默认写 tombstone，并保留目标、笔记、标签、样式和 vector 数据以支持恢复及迟到设备合并。v1 没有自动 tombstone 清理；这是防止 iCloud 延迟复活旧数据的保守默认。未来若增加清理，必须有明确保留期、备份和跨设备水位决策。
+文字和 Ink 删除默认写 tombstone，并保留目标、笔记、标签、样式和 vector 数据以支持恢复及迟到设备合并。v1 没有自动 tombstone 清理；这是防止 iCloud 延迟复活旧数据的保守默认。用户可在设置页运行
+`清理缓存`，永久清理无冲突、未损坏且 revision 未变化的已删除文字标注。清理会先写入并回读校验精简 graveyard 删除凭证，再物理删除完整文字 JSON；Ink 与 Snapshot
+Annotation 当前仍保留 tombstone。
 
 ## 故障恢复
 
@@ -33,6 +37,9 @@
 5. 损坏的单个 record 会隔离并报告，健康 sibling 继续可见。
 6. Markdown rename/move 通过 source fingerprint 对账；多候选时失败关闭并要求人工处理。
 7. 导出是可移植快照，不是 canonical round-trip 导入格式。
+8. `清理缓存`
+   的确认完成后，已回收的文字标注不能再通过五秒 Restore 恢复；graveyard 只保留防止旧 iCloud
+   artifact 复活所需的删除证据，不保留完整标注正文。
 
 ## 隐私
 

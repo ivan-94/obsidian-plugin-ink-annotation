@@ -19,6 +19,10 @@ export interface TextFileStore {
   write(path: string, contents: string): Promise<void>;
 }
 
+export interface TextRecordDeletionEvidence {
+  suppressesTextRecord(record: TextAnnotationRecord, contents: string): Promise<boolean>;
+}
+
 export interface NoteMeta {
   readonly filePath: string;
   readonly lastReconciledAt: string;
@@ -60,6 +64,11 @@ export interface RepositoryRecordCandidate {
   readonly record: TextAnnotationRecord;
 }
 
+export interface TextTombstonePurgeInspection {
+  readonly eligible: readonly TextAnnotationRecord[];
+  readonly held: number;
+}
+
 export interface RepositoryConflict {
   readonly annotationId: string;
   readonly candidates: readonly RepositoryRecordCandidate[];
@@ -75,6 +84,7 @@ export class RepositoryConflictError extends Error {
 }
 
 export class SidecarRepository {
+  private readonly deletionEvidence: TextRecordDeletionEvidence | undefined;
   private readonly onRecordChanged: (record: TextAnnotationRecord) => void;
   private readonly onRecordRemoved: (record: TextAnnotationRecord) => void;
   private readonly recordWrites = new Map<string, Promise<void>>();
@@ -82,11 +92,13 @@ export class SidecarRepository {
   constructor(
     private readonly store: TextFileStore,
     events: {
+      readonly deletionEvidence?: TextRecordDeletionEvidence;
       readonly onEventIssue?: (error: unknown) => void;
       readonly onRecordChanged?: (record: TextAnnotationRecord) => void;
       readonly onRecordRemoved?: (record: TextAnnotationRecord) => void;
     } = {},
   ) {
+    this.deletionEvidence = events.deletionEvidence;
     const onEventIssue = events.onEventIssue ?? (() => undefined);
     const reportEventIssue = (error: unknown): void => {
       try {
@@ -430,6 +442,35 @@ export class SidecarRepository {
     });
   }
 
+  /**
+   * Physical GC primitive. The application must durably verify deletion evidence before calling it.
+   */
+  async removeExactTombstonePayload(expected: TextAnnotationRecord): Promise<void> {
+    if (this.store.remove === undefined) {
+      throw new Error('The text file store does not support canonical payload cleanup.');
+    }
+    if (expected.deletedAt === undefined) {
+      throw new Error('Cannot physically remove an active annotation.');
+    }
+    const writeKey = recordWriteKey(expected.filePath, expected.id);
+    await this.enqueueRecordWrite(writeKey, async () => {
+      const candidates = await this.readRecordCandidates(expected.filePath, expected.id, true);
+      const candidate = candidates[0];
+      if (
+        candidates.length !== 1 ||
+        candidate === undefined ||
+        !candidate.path.endsWith(`/${expected.id}.json`) ||
+        encodeTextAnnotationRecord(candidate.record) !== encodeTextAnnotationRecord(expected)
+      ) {
+        throw new Error(
+          `Annotation ${expected.id} changed or gained another artifact during cleanup.`,
+        );
+      }
+      await this.store.remove?.(candidate.path);
+      this.onRecordRemoved(candidate.record);
+    });
+  }
+
   async listAnnotations(filePath: string): Promise<{
     readonly conflicts: readonly RepositoryConflict[];
     readonly issues: readonly RepositoryIssue[];
@@ -448,7 +489,11 @@ export class SidecarRepository {
       }
 
       try {
-        candidates.push({ path, record: decodeTextAnnotationRecord(contents) });
+        const record = decodeTextAnnotationRecord(contents);
+        if (await this.deletionEvidence?.suppressesTextRecord(record, contents)) {
+          continue;
+        }
+        candidates.push({ path, record });
       } catch (error) {
         issues.push({
           kind: 'corrupt-record',
@@ -571,6 +616,65 @@ export class SidecarRepository {
     };
   }
 
+  /**
+   * Reads physical text payloads without graveyard suppression so an interrupted GC can resume.
+   */
+  async inspectTextTombstonesForPurge(): Promise<TextTombstonePurgeInspection> {
+    const notes = await this.listNotes();
+    const eligible: TextAnnotationRecord[] = [];
+    let held = 0;
+    for (const note of notes.notes) {
+      const root = await this.annotationRoot(note.filePath);
+      const candidates: RepositoryRecordCandidate[] = [];
+      let unsafeDirectory = false;
+      for (const filename of (await this.store.list(root))
+        .filter((name) => name.endsWith('.json'))
+        .sort()) {
+        const path = `${root}/${filename}`;
+        const contents = await this.store.read(path);
+        if (contents === null) continue;
+        try {
+          const record = decodeTextAnnotationRecord(contents);
+          if (record.noteId !== note.noteId || record.filePath !== note.filePath) {
+            unsafeDirectory = true;
+          }
+          candidates.push({ path, record });
+        } catch {
+          unsafeDirectory = true;
+        }
+      }
+      const grouped = new Map<string, RepositoryRecordCandidate[]>();
+      for (const candidate of candidates) {
+        const group = grouped.get(candidate.record.id) ?? [];
+        group.push(candidate);
+        grouped.set(candidate.record.id, group);
+      }
+      for (const [annotationId, group] of grouped) {
+        const selected = selectPreferredCandidate(
+          [...group].sort(compareRecordCandidates),
+          annotationId,
+        );
+        if (selected.record.deletedAt === undefined) continue;
+        if (
+          unsafeDirectory ||
+          group.length !== 1 ||
+          !selected.path.endsWith(`/${annotationId}.json`)
+        ) {
+          held += 1;
+        } else {
+          eligible.push(selected.record);
+        }
+      }
+    }
+    return {
+      eligible: eligible.sort(
+        (left, right) =>
+          left.filePath.localeCompare(right.filePath) || left.id.localeCompare(right.id),
+      ),
+      held,
+    };
+  }
+
   async rebuildSummary(filePath: string, generatedAt: string): Promise<NoteSummary> {
     const normalizedPath = normalizeVaultPath(filePath);
     const loaded = await this.listAnnotations(normalizedPath);
@@ -666,6 +770,7 @@ export class SidecarRepository {
   private async readRecordCandidates(
     filePath: string,
     annotationId: string,
+    includeSuppressed = false,
   ): Promise<readonly RepositoryRecordCandidate[]> {
     normalizeRecordId(annotationId);
     const root = await this.annotationRoot(filePath);
@@ -679,7 +784,11 @@ export class SidecarRepository {
       }
       try {
         const record = decodeTextAnnotationRecord(contents);
-        if (record.id === annotationId) {
+        if (
+          record.id === annotationId &&
+          (includeSuppressed ||
+            !(await this.deletionEvidence?.suppressesTextRecord(record, contents)))
+        ) {
           candidates.push({ path, record });
         }
       } catch {

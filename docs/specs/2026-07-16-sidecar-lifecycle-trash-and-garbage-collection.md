@@ -3,8 +3,9 @@
 ## Status
 
 - Created: 2026-07-16
-- Status: implementation in progress; L1 lifecycle correctness is implemented and verified, while
-  L2–L4 Trash, graveyard, and automatic GC remain pending
+- Status: implementation in progress; L1 lifecycle correctness and the first text-only manual-GC
+  slice are implemented and verified, while L2 Trash, the remaining L3 payload kinds/UX, and L4
+  automatic GC remain pending
 - Scope: Markdown rename/delete reconciliation, source-missing visibility, annotation and Ink
   retention, recoverable Trash, compact deletion evidence, physical sidecar garbage collection, and
   the corresponding Entire Vault/storage-management UX.
@@ -83,24 +84,25 @@ an item never implies that its canonical bytes have already been deleted.
 
 ## Product and Architecture Decisions
 
-| ID     | Decision                                                                                                                                                                                                                              |
-| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| LGC-01 | Online rename uses Obsidian's exact `oldPath -> newPath` event. Source fingerprint is not the primary key for an observed online rename.                                                                                              |
-| LGC-02 | Offline rename may use a unique exact fingerprint match. Zero or multiple matches fail closed into a repair task.                                                                                                                     |
-| LGC-03 | Source deletion immediately marks the note missing and atomically removes its rows from the normal Entire Vault projection.                                                                                                           |
-| LGC-04 | Missing-source notes and recoverable tombstones appear only in Trash, not as apparently live file groups.                                                                                                                             |
-| LGC-05 | The default retention for new data is 30 days. Supported policies are 30 days, 90 days, and Never; manual Empty Trash remains available.                                                                                              |
-| LGC-06 | Existing Vaults do not automatically purge legacy retained data on first upgrade. Legacy cleanup requires one explicit policy acknowledgement.                                                                                        |
-| LGC-07 | A matching source restored before purge automatically leaves Trash. A different file recreated at the same path never inherits old annotations automatically.                                                                         |
-| LGC-08 | GC writes and verifies compact graveyard entries before deleting any full canonical payload.                                                                                                                                          |
-| LGC-09 | Graveyard entries are canonical and retained indefinitely by default; they are batched into bounded device-owned segments to avoid per-record fragmentation.                                                                          |
-| LGC-10 | Lower-revision delayed artifacts are suppressed by graveyard evidence. Equal divergent or higher-revision artifacts become repair tasks and are never silently deleted.                                                               |
-| LGC-11 | Unknown conflicts, corrupt files, read timeouts, partial hydration, and reachable local Ink recovery checkpoints are never automatically collected.                                                                                   |
-| LGC-12 | Automatic GC runs only after layout readiness and an idle delay, at most once per device per day, with strict item/time limits. It never performs a Vault-wide startup scan.                                                          |
-| LGC-13 | Rename, record writes, conflict repair, restore, and GC share the same Vault-scoped write coordinator and use deterministic lock ordering.                                                                                            |
-| LGC-14 | Derived indexes and summaries may be removed immediately and rebuilt; their presence never blocks canonical cleanup.                                                                                                                  |
-| LGC-15 | Manual permanent cleanup shows exact note/item counts, held counts, and the consequence that annotation payload recovery will no longer be possible.                                                                                  |
-| LGC-16 | Every successful delete/restore emits one mutation receipt and invalidates every affected projection. The five-second quick Restore window starts when the completed receipt is presented, not when the first canonical write begins. |
+| ID     | Decision                                                                                                                                                                                                                                                                                                    |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LGC-01 | Online rename uses Obsidian's exact `oldPath -> newPath` event. Source fingerprint is not the primary key for an observed online rename.                                                                                                                                                                    |
+| LGC-02 | Offline rename may use a unique exact fingerprint match. Zero or multiple matches fail closed into a repair task.                                                                                                                                                                                           |
+| LGC-03 | Source deletion immediately marks the note missing and atomically removes its rows from the normal Entire Vault projection.                                                                                                                                                                                 |
+| LGC-04 | Missing-source notes and recoverable tombstones appear only in Trash, not as apparently live file groups.                                                                                                                                                                                                   |
+| LGC-05 | The default retention for new data is 30 days. Supported policies are 30 days, 90 days, and Never; manual Empty Trash remains available.                                                                                                                                                                    |
+| LGC-06 | Existing Vaults do not automatically purge legacy retained data on first upgrade. Legacy cleanup requires one explicit policy acknowledgement.                                                                                                                                                              |
+| LGC-07 | A matching source restored before purge automatically leaves Trash. A different file recreated at the same path never inherits old annotations automatically.                                                                                                                                               |
+| LGC-08 | GC writes and verifies compact graveyard entries before deleting any full canonical payload.                                                                                                                                                                                                                |
+| LGC-09 | Graveyard entries are canonical and retained indefinitely by default; they are batched into bounded device-owned segments to avoid per-record fragmentation.                                                                                                                                                |
+| LGC-10 | Lower-revision delayed artifacts are suppressed by graveyard evidence. Equal divergent or higher-revision artifacts become repair tasks and are never silently deleted.                                                                                                                                     |
+| LGC-11 | Unknown conflicts, corrupt files, read timeouts, partial hydration, and reachable local Ink recovery checkpoints are never automatically collected.                                                                                                                                                         |
+| LGC-12 | Automatic GC runs only after layout readiness and an idle delay, at most once per device per day, with strict item/time limits. It never performs a Vault-wide startup scan.                                                                                                                                |
+| LGC-13 | Rename, record writes, conflict repair, restore, and GC share the same Vault-scoped write coordinator and use deterministic lock ordering.                                                                                                                                                                  |
+| LGC-14 | Derived indexes and summaries may be removed immediately and rebuilt; their presence never blocks canonical cleanup.                                                                                                                                                                                        |
+| LGC-15 | Manual permanent cleanup shows exact note/item counts, held counts, and the consequence that annotation payload recovery will no longer be possible.                                                                                                                                                        |
+| LGC-16 | Every successful delete/restore emits one mutation receipt and invalidates every affected projection. The five-second quick Restore window starts when the completed receipt is presented, not when the first canonical write begins.                                                                       |
+| LGC-17 | The Settings entry is labelled `清理缓存` for novice-facing discoverability, while its implementation remains canonical sidecar GC. Its preview and confirmation must explicitly say that deleted annotation data will be permanently removed; the friendly label never permits cache-style blind deletion. |
 
 ## Lifecycle Model
 
@@ -461,6 +463,11 @@ have an exact verified plan entry.
 The manual operation may continue beyond the automatic batch limit but remains chunked and
 cancellable. Cancellation finishes the current atomic batch and leaves the rest untouched.
 
+The first manual-GC delivery may support text-annotation tombstones before later payload kinds, but
+the Settings description and result must name the supported scope instead of implying that Ink or
+Snapshot Annotation payloads were removed. Every supported payload kind still follows the same
+graveyard-before-removal transaction.
+
 ## User Experience
 
 ### Entire Vault
@@ -685,11 +692,20 @@ longer invisible.
 
 - implement canonical segment codecs and derived graveyard lookup;
 - implement crash-safe GC planning/commit/removal batches;
-- add manual Run cleanup/Empty Trash with confirmation and cancellation;
+- add the novice-facing Settings action `清理缓存`, backed by a dry run, explicit permanent-deletion
+  confirmation, and bounded manual GC;
 - remove exact covered payloads and proven-empty directories;
 - suppress delayed lower-revision artifacts and expose divergent/newer ones.
 
 Exit: manual cleanup passes fault injection and local scale tests; automatic scheduling remains off.
+
+Implementation status on 2026-07-23: the first text-only vertical slice is complete. Settings
+exposes `清理缓存`, performs a count preview and permanent-deletion confirmation, writes and
+verifies device-owned text graveyard entries, removes only an unchanged single canonical tombstone,
+rebuilds the affected summary, suppresses lower-revision or exact delayed text artifacts, and
+retries a payload left behind after a verified marker. Corrupt graveyard evidence hides nothing and
+authorizes no cleanup. Ink, Snapshot Annotation, Trash UI, cancellation, storage-size reporting, and
+automatic GC remain pending.
 
 ### L4 — Automatic bounded GC and release evidence
 
@@ -746,6 +762,9 @@ acknowledgement.
   Entire-Vault bulk deletion hid Restore and left deleted highlights rendered in Markdown Reading
   View; the durable requirement is the unified receipt and projection-invalidation contract in
   `Record Delete and Restore`.
+- User instruction in the 2026-07-23 follow-up task: expose manual GC from Settings under the
+  novice-facing label `清理缓存`; the internal operation remains GC rather than disposable-cache
+  deletion.
 - `docs/specs/2026-07-14-obsidian-annotation-plugin-design.md`, especially Canonical Storage Model,
   iCloud Synchronization and Conflict Policy, Entire Vault, Performance, Reliability, and Deletion
   and Undo.
@@ -779,6 +798,9 @@ acknowledgement.
   `src/application/vault-index-events.ts`, `src/domain/vault-annotation-index.ts`,
   `src/adapters/obsidian/vault-text-file-store.ts`, `src/storage/sidecar-repository.ts`, and
   `src/storage/ink-surface-repository.ts`.
+- Text-only manual GC in `src/application/sidecar-garbage-collector.ts`,
+  `src/storage/graveyard-repository.ts`, `src/storage/sidecar-repository.ts`, `src/settings-tab.ts`,
+  and `src/main.ts`, with colocated tests and user/data-safety documentation.
 
 ### Key decisions
 
@@ -794,6 +816,8 @@ acknowledgement.
   active index free of tombstones.
 - Treat canonical mutation revisions and bytes—not UI timing, cache state, or file path alone—as the
   authority for delete, Restore, watcher deduplication, and projection replacement.
+- Keep `清理缓存` as the user-facing label while making its preview and confirmation distinguish
+  permanent tombstone payload removal from ordinary rebuildable-cache eviction.
 
 ### Verification evidence
 
@@ -813,10 +837,15 @@ acknowledgement.
   Restore receipts, iCloud content-aware watcher deduplication, and projection-event isolation.
 - `npm run install:dev` installed that verified follow-up build into
   `test-fixtures/vault/.obsidian/plugins/inkstone-annotations`.
+- After the 2026-07-23 text-only manual-GC slice, `npm run check` passed with 125 functional test
+  files / 889 tests, 9 performance files / 11 tests, coverage thresholds, formatting, ESLint,
+  typecheck, production build, mobile bundle verification, and the retired-document-Ink check.
 
 ### Open questions / risks
 
 - Automatic GC cannot be enabled by default until the physical iCloud gates above pass.
+- Manual `清理缓存` currently covers text tombstones only; Ink and Snapshot Annotation physical GC
+  remain pending and the Settings description must continue to state that limit.
 - The exact storage-size metadata available for unhydrated iCloud files must be confirmed during L2
   implementation; unknown sizes must remain explicit.
 - Compatibility with older builds remains bounded by documented rollback behavior rather than a

@@ -11,6 +11,7 @@
 - Live Preview 使用 canonical Markdown UTF-16
   offsets；IME 自动测试不能替代真实输入法和设备兼容验证。
 - iCloud 没有应用级事务或可靠“已同步”回执。同记录冲突会暴露，不承诺自动合并正文、tags 或 strokes。
-- v1 tombstone 无限期保留；当前没有自动垃圾回收。
+- 当前没有自动垃圾回收。设置页 `清理缓存` 仅手动回收安全的文字 tombstone；Ink、Snapshot
+  Annotation、冲突和损坏 payload 仍无限期保留。
 - 导出格式用于阅读和迁移快照；当前不提供无损重新导入。
 - 插件没有多人协作、云服务、OCR、手写识别或 PDF annotation 能力。
