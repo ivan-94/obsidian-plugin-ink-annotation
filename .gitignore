@@ -14,5 +14,7 @@ hats/
 test-fixtures/*
 !test-fixtures/ink-brush/
 !test-fixtures/ink-brush/**
+!test-fixtures/exports/
+!test-fixtures/exports/**
 docs/delivery/
 .scratch/

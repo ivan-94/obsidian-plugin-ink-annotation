@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>研究 &amp; Review</title>
+</head>
+<body>
+<h1>研究 &amp; Review</h1>
+<article data-annotation-id="highlight-1" data-kind="highlight" data-status="active">
+<mark>你好 &lt;world&gt; 😀 `code`</mark>
+<dl>
+<dt>Type</dt><dd>Highlight</dd>
+<dt>Style</dt><dd>Sun</dd>
+<dt>Status</dt><dd>active</dd>
+<dt>Source</dt><dd>研究/A &amp; B.md</dd>
+<dt>Position</dt><dd>4–24 UTF-16</dd>
+<dt>Tags</dt><dd>研究, review</dd>
+<dt>Conflict</dt><dd>no</dd>
+<dt>Overlap</dt><dd>yes</dd>
+</dl>
+<section><h2>Note</h2><p>想法 **保留**<br>第二行</p></section>
+</article>
+<article data-annotation-id="underline-1" data-kind="underline" data-status="unanchored">
+<u>可变 [Markdown] &amp; sync</u>
+<dl>
+<dt>Type</dt><dd>Underline</dd>
+<dt>Style</dt><dd>Violet</dd>
+<dt>Status</dt><dd>unanchored</dd>
+<dt>Source</dt><dd>研究/A &amp; B.md</dd>
+<dt>Position</dt><dd>40–60 UTF-16</dd>
+<dt>Tags</dt><dd>none</dd>
+<dt>Conflict</dt><dd>yes</dd>
+<dt>Overlap</dt><dd>no</dd>
+<dt>Context before</dt><dd>prefix *</dd>
+<dt>Context after</dt><dd> suffix</dd>
+<dt>Anchor failure</dt><dd>not-found (0 candidates)</dd>
+</dl>
+<section><h2>Note</h2><p>Needs [repair](unsafe)</p></section>
+</article>
+<footer>2 annotations</footer>
+</body>
+</html>

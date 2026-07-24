@@ -1,0 +1,39 @@
+# 研究 & Review
+
+==你好 \<world\> 😀 \`code\`==
+
+- Annotation: Highlight · Sun · active
+- Source: `研究/A & B.md`
+- Position: 4–24 UTF-16
+- Tags: `研究`, `review`
+- Annotation ID: `highlight-1`
+- Overlap: yes
+
+**Note**
+
+> 想法 **保留**
+> 第二行
+
+---
+
+> 可变 [Markdown] & sync
+
+_Underline is preserved as metadata; plain Markdown has no portable underline syntax._
+
+- Annotation: Underline · Violet · unanchored · conflict
+- Source: `研究/A & B.md`
+- Position: 40–60 UTF-16
+- Tags: none
+- Annotation ID: `underline-1`
+- Conflict: yes
+- Context before: `prefix *`
+- Context after: ` suffix`
+- Anchor failure: not-found (0 candidates)
+
+**Note**
+
+> Needs [repair](unsafe)
+
+---
+
+<!-- Inkstone export: 2 annotations -->
