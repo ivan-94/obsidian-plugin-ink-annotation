@@ -13,6 +13,9 @@
 Annotations。升级前先关闭插件，并备份插件目录与 Vault 根目录下的
 `.obsidian-annotations/`。覆盖三个运行时文件后重新启用。
 
+Beta 也可以通过 BRAT 安装：在 BRAT 中选择 `Add Beta plugin`，填入
+`https://github.com/ivan-94/obsidian-plugin-ink-annotation`，然后启用 Inkstone Annotations。
+
 回滚时恢复之前版本的三个运行时文件。当前 `0.1.x` 使用 canonical schema
 v1；不要用旧版插件打开未来版本已经迁移的数据，除非该版本的发布说明明确兼容。
 

@@ -40,17 +40,22 @@ New freehand markup is never persisted against a live DOM range or mutable page 
 
 ## Quick start
 
-Inkstone is not yet listed in the Obsidian Community directory. For a Beta or manual installation:
+Inkstone is not yet listed in the Obsidian Community directory. For a Beta installation:
 
-1. Download `main.js`, `manifest.json`, and `styles.css` from the matching GitHub Release.
-2. Create `<Vault>/.obsidian/plugins/inkstone-annotations/`.
-3. Copy the three files into that directory.
-4. Reload Obsidian and enable **Inkstone Annotations** under **Community plugins**.
-5. Open a Markdown note in Reading View.
-6. Select supported text to create a highlight, underline, or note, or use **Capture & annotate** to
+1. Install the **BRAT** community plugin in Obsidian.
+2. In BRAT, choose **Add Beta plugin** and enter
+   `https://github.com/ivan-94/obsidian-plugin-ink-annotation`.
+3. Enable **Inkstone Annotations** under **Community plugins**.
+4. Open a Markdown note in Reading View.
+5. Select supported text to create a highlight, underline, or note, or use **Capture & annotate** to
    create a Snapshot.
 
-For detailed workflows, see the [user guide](docs/user-guide.md).
+For a manual installation, download `main.js`, `manifest.json`, and `styles.css` from the matching
+GitHub Release and copy them into `<Vault>/.obsidian/plugins/inkstone-annotations/`, then reload
+Obsidian.
+
+For detailed workflows, see the [user guide](docs/user-guide.md). Report Beta results in the
+[0.1.0 feedback hub](https://github.com/ivan-94/obsidian-plugin-ink-annotation/issues/5).
 
 ## Data and privacy
 
