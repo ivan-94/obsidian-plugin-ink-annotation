@@ -15,4 +15,12 @@ describe('Inkstone locale normalization', () => {
     expect(createI18n('en').t('sidebar.selectedCount', { count: 2 })).toBe('2 selected');
     expect(createI18n('zh').t('sidebar.selectedCount', { count: 2 })).toBe('已选择 2 项');
   });
+
+  it('localizes command names and parameterized notices', () => {
+    expect(createI18n('en').t('command.openAnnotations')).toBe('Open annotations for current file');
+    expect(createI18n('zh').t('command.openAnnotations')).toBe('打开当前文件的标注');
+    expect(createI18n('zh').t('notice.backgroundCleanupFailed', { count: 3 })).toBe(
+      'Inkstone 无法清理 3 个后台任务。',
+    );
+  });
 });

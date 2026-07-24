@@ -2,6 +2,8 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { createI18n } from './ui/i18n/create-i18n';
+
 const notices: string[] = [];
 
 vi.mock('obsidian', () => {
@@ -101,7 +103,19 @@ describe('Inkstone settings cache cleanup', () => {
     vi.restoreAllMocks();
   });
 
-  it('previews and confirms permanent text tombstone cleanup behind the novice label', async () => {
+  it('renders the settings surface in English', () => {
+    const plugin = createPlugin();
+    const tab = new InkstoneSettingTab({} as never, plugin as never, createI18n('en'));
+
+    tab.display();
+
+    expect(settingNames(tab.containerEl)).toEqual(['Diagnostics', 'Clear cache']);
+    expect(
+      tab.containerEl.querySelector<HTMLButtonElement>('button[aria-label="Clear cache"]'),
+    ).not.toBeNull();
+  });
+
+  it('previews and confirms permanent text tombstone cleanup in Simplified Chinese', async () => {
     const plugin = {
       clearCache: vi.fn(() =>
         Promise.resolve({
@@ -124,7 +138,7 @@ describe('Inkstone settings cache cleanup', () => {
       setDiagnosticsEnabled: vi.fn(),
     };
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    const tab = new InkstoneSettingTab({} as never, plugin as never);
+    const tab = new InkstoneSettingTab({} as never, plugin as never, createI18n('zh'));
 
     tab.display();
     const button = tab.containerEl.querySelector<HTMLButtonElement>(
@@ -139,4 +153,44 @@ describe('Inkstone settings cache cleanup', () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('无法撤销'));
     expect(notices).toContain('缓存清理完成：已永久删除 2 条文字标注；1 条因冲突或损坏而保留。');
   });
+
+  it('shows a localized safe failure instead of the thrown error detail', async () => {
+    const plugin = createPlugin();
+    plugin.previewCacheCleanup.mockRejectedValue(new Error('private/path.md'));
+    const tab = new InkstoneSettingTab({} as never, plugin as never, createI18n('en'));
+
+    tab.display();
+    tab.containerEl.querySelector<HTMLButtonElement>('button[aria-label="Clear cache"]')?.click();
+
+    await vi.waitFor(() => expect(notices).toContain('Cache cleanup failed.'));
+    expect(notices.join(' ')).not.toContain('private/path.md');
+  });
 });
+
+function createPlugin() {
+  return {
+    clearCache: vi.fn(() =>
+      Promise.resolve({
+        failedTextAnnotations: 0,
+        heldTextAnnotations: 0,
+        removedTextAnnotations: 0,
+      }),
+    ),
+    getSettings: () => ({
+      deviceId: 'device-a',
+      diagnosticsEnabled: false,
+      stylePresets: [],
+    }),
+    previewCacheCleanup: vi.fn(() =>
+      Promise.resolve({
+        eligibleTextAnnotations: 0,
+        heldTextAnnotations: 0,
+      }),
+    ),
+    setDiagnosticsEnabled: vi.fn(),
+  };
+}
+
+function settingNames(container: HTMLElement): string[] {
+  return [...container.children].map((child) => (child as HTMLElement).dataset.name ?? '');
+}
