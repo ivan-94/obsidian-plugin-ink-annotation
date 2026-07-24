@@ -1,7 +1,7 @@
 {
   "id": "inkstone-annotations",
   "name": "Inkstone Annotations",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.7.2",
   "description": "Highlight and underline mutable Markdown, add notes, and draw on stable snapshots.",
   "author": "Ivan",

@@ -1,6 +1,6 @@
 {
   "name": "inkstone-annotations",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Highlight and underline mutable Markdown, add notes, and draw on stable snapshots.",
   "author": "Ivan",
   "license": "MIT",
