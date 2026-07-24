@@ -36,6 +36,19 @@ Test Files  7 passed (7)
 Tests       81 passed (81)
 ```
 
+Full verification:
+
+```text
+npm run check
+Coverage     130 files passed / 914 tests passed
+Performance  9 files passed / 11 tests passed
+Production bundle, mobile bundle, retired Ink, current types, and Obsidian 1.7.2 types passed
+```
+
+The first full build correctly rejected acceptance-only wording after it was placed in the
+production locale catalog. Those development-only labels now remain inside the compile-time
+acceptance branch, allowing the whole branch and its copy to be removed from production.
+
 ## Source Manifest
 
 - `AGENTS.md`

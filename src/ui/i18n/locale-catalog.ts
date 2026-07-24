@@ -7,7 +7,6 @@ export interface MessageParameters {
   readonly 'command.openAnnotations': undefined;
   readonly 'command.reopenSnapshot': undefined;
   readonly 'command.resumeSnapshotDraft': undefined;
-  readonly 'command.selectSnapshotBackend': { readonly label: string };
   readonly 'command.showDiagnostics': undefined;
   readonly 'command.undoAnnotationDelete': undefined;
   readonly 'inspector.annotationJsonCopied': undefined;
@@ -82,7 +81,6 @@ export interface MessageParameters {
   readonly 'notice.openSidebarFailed': undefined;
   readonly 'notice.selectReplacementReadingView': undefined;
   readonly 'notice.selectSupportedText': undefined;
-  readonly 'notice.snapshotBackendSelected': { readonly label: string };
   readonly 'notice.snapshotDraftReopenFailed': undefined;
   readonly 'notice.snapshotExportFromCard': undefined;
   readonly 'notice.snapshotRelinkFailed': undefined;

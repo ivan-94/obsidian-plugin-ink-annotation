@@ -1232,10 +1232,10 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
           if (!Platform.isDesktopApp && backendId === 'electron-capture-page') continue;
           this.addCommand({
             id: `select-snapshot-backend-${backendId}`,
-            name: i18n.t('command.selectSnapshotBackend', { label }),
+            name: `Snapshot acceptance: use ${label} backend`,
             callback: () => {
               snapshotAnnotationManager?.selectBackend(backendId);
-              new Notice(i18n.t('notice.snapshotBackendSelected', { label }));
+              new Notice(`Snapshot capture backend: ${label}`);
             },
           });
         }

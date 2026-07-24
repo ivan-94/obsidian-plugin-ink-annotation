@@ -8,7 +8,6 @@ export function createEnglishCatalog(formatNumber: (value: number) => string): L
     'command.openAnnotations': () => 'Open annotations for current file',
     'command.reopenSnapshot': () => 'Reopen latest Snapshot annotation',
     'command.resumeSnapshotDraft': () => 'Resume latest Snapshot annotation draft',
-    'command.selectSnapshotBackend': ({ label }) => `Snapshot acceptance: use ${label} backend`,
     'command.showDiagnostics': () => 'Show diagnostics',
     'command.undoAnnotationDelete': () => 'Undo last annotation delete',
     'inspector.annotationJsonCopied': () => 'Annotation JSON copied',
@@ -92,7 +91,6 @@ export function createEnglishCatalog(formatNumber: (value: number) => string): L
       'Select supported replacement text in Reading View first.',
     'notice.selectSupportedText': () =>
       'Select supported text in Reading View or Live Preview first.',
-    'notice.snapshotBackendSelected': ({ label }) => `Snapshot capture backend: ${label}`,
     'notice.snapshotDraftReopenFailed': () => 'Snapshot draft reopen failed.',
     'notice.snapshotExportFromCard': () => 'Snapshot annotations export from the card menu.',
     'notice.snapshotRelinkFailed': () => 'Snapshot relink failed.',
