@@ -1,0 +1,101 @@
+# I3 local Vault acceptance — 2026-07-24
+
+## Outcome
+
+**PASS for the implemented I0–I3 scope. Not a full-plugin i18n pass.**
+
+The production build was installed into the repository's disposable `vault` and exercised in
+Obsidian 1.12.7 on macOS 27.0 arm64. English and Simplified Chinese were each selected in Obsidian,
+followed by an application relaunch. Inkstone selected the matching startup locale in both cases.
+Obsidian was restored to Simplified Chinese after the walkthrough.
+
+## Environment
+
+- Vault:
+  `test-fixtures/vault`
+- Installed plugin:
+  `test-fixtures/vault/.obsidian/plugins/inkstone-annotations`
+- Obsidian: 1.12.7
+- macOS: 27.0 (`26A5388g`), arm64
+- Branch: `codex/inkstone-i18n`
+- Tested commit: `e6936e8`
+
+Installed artifacts matched the verified root build:
+
+| File            | SHA-256                                                            |
+| --------------- | ------------------------------------------------------------------ |
+| `main.js`       | `a9e16c86312bd6240cde10f8a466305d4020d07e8e6698c37071e631c9777ebd` |
+| `manifest.json` | `a8c5dc4cf202702321a5c06d2a27859de87ff9ef2b425ef232e894693e2480af` |
+| `styles.css`    | `7f8d255c0aacfa85b4aed7747a7ef4987d6cb367c24d36405db412ccf6d1e7bf` |
+
+## Acceptance matrix
+
+| Scenario                                              | Result | Evidence                                                                                           |
+| ----------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------- |
+| Simplified Chinese startup locale                     | PASS   | Reading View action rendered `截取并标注` after relaunch                                            |
+| Chinese settings labels, descriptions, placeholders  | PASS   | `诊断`, `清理缓存`, Chinese descriptions and `样式名称`                                             |
+| Chinese command registration                          | PASS   | Command palette found `Inkstone Annotations：打开当前文件的标注`                                    |
+| Chinese quick annotation toolbar                      | PASS   | `标注操作`, `高亮：…`, `下划线`, `添加笔记`, `打开标注详情`                                         |
+| Chinese annotation inspector and accessible names    | PASS   | `标注检查器`, localized mark/style groups, note/tags fields, copy/export/delete/save actions        |
+| English startup locale                                | PASS   | Reading View action rendered `Capture & annotate` after relaunch                                   |
+| English settings                                      | PASS   | `Diagnostics`, `Clear cache`, English descriptions and `Preset name`                               |
+| English quick annotation toolbar                      | PASS   | `Annotation actions`, `Highlight: …`, `Underline`, `Add note`, `Open annotation details`            |
+| Return to the user's original Simplified Chinese      | PASS   | Relaunched and re-observed `截取并标注`                                                              |
+| Temporary acceptance annotation cleanup               | PASS   | The exact test-created tombstone `93378223-88e3-46d2-bb54-94b603706ca1.json` was removed afterward |
+
+## Screenshots
+
+- [Simplified Chinese settings](zh-settings.jpg)
+- [Simplified Chinese quick toolbar](zh-quick-toolbar.jpg)
+- [Simplified Chinese inspector](zh-inspector.jpg)
+
+## Observed incomplete scope
+
+- The annotation sidebar, scope switcher, cards, empty states, search, menus, and trash feedback
+  remain English in the Simplified Chinese app. This is the planned I4–I5 migration, so it does not
+  fail I3 but blocks a full-plugin multilingual acceptance result.
+- Built-in preset display names (`Sun`, `Mint`, `Sky`, `Rose`, `Violet`) remain English. Localizing
+  built-in display labels without rewriting stored custom names remains planned for I6.
+- Locale selection is startup-only by design. Changing Obsidian's language required the host's
+  relaunch action before Inkstone changed locale.
+
+## Source Manifest
+
+### Sources
+
+- User instruction in the current task: validate the implementation in a local Vault.
+- `AGENTS.md`
+- `CONTEXT.md`
+- `docs/specs/2026-07-24-inkstone-internationalization.md`
+- `docs/delivery/slices/I1-i18n-foundation/README.md`
+- `docs/delivery/slices/I2-i18n-commands-settings/README.md`
+- `docs/delivery/slices/I3-i18n-toolbars-inspector/README.md`
+- `scripts/install-dev.mjs`
+- `test-fixtures/vault/S04 Style and Notes.md`
+
+### Produced artifacts
+
+- This report.
+- `zh-settings.jpg`
+- `zh-quick-toolbar.jpg`
+- `zh-inspector.jpg`
+
+### Key decisions
+
+- Use the repository fixture Vault rather than a personal knowledge Vault.
+- Validate both supported locales through the real Obsidian language setting and a real relaunch.
+- Treat untranslated I4–I6 surfaces as declared remaining scope, not as an I3 regression.
+- Remove the exact temporary annotation generated by the walkthrough.
+
+### Verification evidence
+
+- `npm run install:dev`
+- Root/install artifact SHA-256 comparison
+- Real Obsidian 1.12.7 accessibility-tree inspection and screenshots
+- Simplified Chinese → English → Simplified Chinese relaunch sequence
+
+### Open questions / risks
+
+- I4–I6 require another local Vault pass after sidebar, Snapshot/Ink, error, and built-in style
+  migrations land.
+- iPad/mobile locale behavior remains unverified in this desktop-only walkthrough.
