@@ -3,77 +3,50 @@
 Inkstone Annotations is a mobile-first Obsidian plugin for text and ink annotations over mutable
 Markdown.
 
-## Sources of truth
+## Operating context
 
-- Domain language glossary: `CONTEXT.md`
-- Product and UI/UX specification: `docs/specs/2026-07-14-obsidian-annotation-plugin-design.md`
-- Execution plan: `docs/specs/2026-07-14-obsidian-annotation-plugin-execution-plan.md`
-- Current Ink v1 follow-up specification:
-  `docs/specs/2026-07-15-ink-fixed-width-manual-repositioning.md`
-- Current Ink three-state view and toolbar/layout correction:
-  `docs/specs/2026-07-15-ink-three-state-view-and-toolbar-correction.md`
-- Current Ink 704 zoomable workspace and pane-wide drawing specification:
-  `docs/specs/2026-07-16-ink-704-zoomable-workspace.md`
-- Current Ink Stage Frame and native navigation correction:
-  `docs/specs/2026-07-16-ink-stage-frame-and-native-navigation.md`
-- Current Ink context-sensitive next-action button:
-  `docs/specs/2026-07-16-ink-next-action-button.md`
-- Current Ink closed-loop stroke eraser: `docs/specs/2026-07-16-ink-closed-loop-stroke-eraser.md`
-- Current editing-mode dormancy correction: `docs/specs/2026-07-17-editing-mode-dormancy.md`
-- Current Ink native-feel performance and brush-fidelity specification:
-  `docs/specs/2026-07-17-ink-native-feel-performance-and-brush-fidelity.md`
-- Current Ink native-feel execution plan: `docs/specs/2026-07-17-ink-native-feel-execution-plan.md`
-- Current Ink explicit-commit session and Canvas presentation foundation:
-  `docs/specs/2026-07-20-ink-explicit-commit-session.md`
-- Current Ink responsive commands, save, and Preview specification:
-  `docs/specs/2026-07-20-ink-responsive-commands-save-and-preview.md`
-- Current Ink retained tile scene and Worker rasterization specification:
-  `docs/specs/2026-07-20-ink-retained-tile-scene-and-worker-rasterization.md`
-- Current Ink simple snapshot persistence specification:
-  `docs/specs/2026-07-21-ink-simple-snapshot-persistence.md`
-- Current Ink semantic layers and transform-only interaction specification:
-  `docs/specs/2026-07-21-ink-semantic-layers-and-transform-only-interactions.md`
-- Current Ink shared scene, deterministic layout, and atomic camera specification:
-  `docs/specs/2026-07-21-ink-shared-scene-layout-and-atomic-camera.md`
-- Current Snapshot Annotation capture and markup specification:
-  `docs/specs/2026-07-22-snapshot-annotation-capture-and-markup.md`
-- UI architecture refactor specification: `docs/specs/2026_07_15_refactor_to_preact.md`
-- Slice evidence: `docs/delivery/slices/`
-
-Read the relevant specification and Slice before changing behavior. Code is not allowed to become a
-conflicting implicit specification.
+- Use `CONTEXT.md` for domain language.
+- Use `docs/specs/README.md` to find product specifications and execution plans.
+- Treat `docs/delivery/slices/` as implementation evidence, not a competing specification.
+- Before changing behavior, read the latest relevant approved specification and Slice evidence.
+- When code and specification disagree, reconcile the specification explicitly; do not let code
+  become an implicit product decision.
 
 ## Architecture boundaries
 
-- `src/domain/`: pure annotation, anchor, Ink, schema, and invariant logic. No Obsidian or DOM
-  imports.
-- `src/application/`: use cases coordinating domain ports. No direct file or DOM access.
-- `src/storage/`: sidecar codecs and repository implementations behind application ports.
-- `src/adapters/obsidian/`: Obsidian lifecycle, Vault, Reading View, and Editor adapters.
-- `src/ui/`: transient toolbars, inspectors, sidebars, and Ink controls.
-- `src/runtime/`: lifecycle, diagnostics, and performance plumbing only.
+- `src/domain/` is pure domain logic: no Obsidian, DOM, storage, or UI imports.
+- `src/application/` coordinates use cases through ports: no direct file or DOM access.
+- `src/storage/` implements persistence and codecs behind application ports.
+- `src/adapters/obsidian/` owns Obsidian, Vault, Reading View, and Editor integration.
+- `src/ui/` owns presentation and transient interaction; it invokes use cases instead of writing
+  persistence.
+- `src/runtime/` is limited to lifecycle, diagnostics, and performance plumbing.
 
-## Hard boundaries
+## Product invariants
 
 - Sidecars are canonical; caches and indexes are disposable.
-- Never persist a DOM `Range` as an anchor.
-- Ambiguous targets fail closed and become recoverable `unanchored` records.
-- Never discard unsaved Ink after persistence failure.
+- Persist source-based anchors, never DOM `Range` objects.
+- Ambiguous targets fail closed as recoverable `unanchored` records.
+- Persistence failure must not discard unsaved Ink.
 - Never claim iCloud sync based on a local write.
-- Runtime code must not import Node.js or Electron modules at the top level.
-- UI code never writes sidecars directly.
-- No telemetry or external service is allowed without a new explicit product decision.
+- Runtime code has no top-level Node.js or Electron imports.
+- UI code does not write Sidecars directly.
+- Telemetry and external services require an explicit product decision.
 
-## Development workflow
+## Development and completion
 
-Use vertical TDD cycles: one observable failing test, the minimum implementation, green
-verification, then refactor. Mock only system boundaries.
+- Use vertical TDD: one observable failing test, minimum implementation, green verification, then
+  refactor. Mock only system boundaries.
+- Update the relevant specification when behavior, architecture, persistence, or user-facing
+  contracts change.
+- Run the focused tests while iterating, then the full project gate before completion.
 
 ```bash
 npm run format
 npm run check
-npm run install:dev
 ```
 
-Do not mark a Slice complete without its automated tests, HAT evidence, performance/reliability
-evidence, and Source Manifest.
+- Run `npm run install:dev` only when the task includes manual Obsidian verification.
+- Persistent plans, Slice evidence, reports, and handoffs must include a Source Manifest.
+- Do not mark work complete without its required automated tests and any acceptance, performance, or
+  reliability evidence defined by the relevant specification.
