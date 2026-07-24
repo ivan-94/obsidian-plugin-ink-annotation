@@ -4,6 +4,8 @@ import {
   type QuickHighlightToolbarAppProps,
   type QuickHighlightToolbarModel,
 } from './floating/quick-highlight-toolbar-app';
+import type { I18n } from './i18n/contract';
+import { createI18n } from './i18n/create-i18n';
 import { createPreactIsland, type UiIsland } from './runtime/mount-preact-island';
 import { createQuickToolbarStore, resetQuickToolbarStore } from './stores/quick-toolbar-store';
 
@@ -33,8 +35,7 @@ export interface QuickToolbarUnavailableInput {
 export class QuickHighlightToolbar {
   private readonly document: Document;
   private host: HTMLDivElement | null = null;
-  private readonly island: UiIsland<QuickHighlightToolbarAppProps> =
-    createPreactIsland(QuickHighlightToolbarApp);
+  private readonly island: UiIsland<QuickHighlightToolbarAppProps>;
   private readonly onAction: (action: QuickToolbarAction) => Promise<void>;
   private readonly onDismiss: () => void;
   private readonly onError: (error: unknown) => void;
@@ -43,12 +44,16 @@ export class QuickHighlightToolbar {
 
   constructor(input: {
     readonly document: Document;
+    readonly i18n?: I18n;
     readonly layout?: QuickToolbarLayout;
     readonly onAction: (action: QuickToolbarAction) => Promise<void>;
     readonly onDismiss: () => void;
     readonly onError?: (error: unknown) => void;
   }) {
     this.document = input.document;
+    this.island = createPreactIsland(QuickHighlightToolbarApp, {
+      i18n: input.i18n ?? createI18n('en'),
+    });
     this.layout = input.layout ?? 'anchored';
     this.onAction = input.onAction;
     this.onDismiss = input.onDismiss;

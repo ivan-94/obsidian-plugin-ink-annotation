@@ -507,6 +507,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     };
     const inspector = new AnnotationInspector({
       document: globalThis.document,
+      i18n,
       onDelete: async (record) => {
         const deleted = await annotationService.deleteAnnotation(
           record.filePath,
@@ -593,6 +594,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
       }),
       document: globalThis.document,
       enabled: false,
+      i18n,
       onAnnotationHit: (annotationIds, invoker) => {
         this.sidebarView?.selectAnnotation(annotationIds);
         openInspector(annotationIds, invoker);
@@ -1024,6 +1026,7 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     });
     const readingView = new ReadingViewIntegration({
       document: globalThis.document,
+      i18n,
       isMobile: Platform.isMobile,
       onAnnotationHit: (annotationIds, invoker) => {
         this.sidebarView?.selectAnnotation(annotationIds);

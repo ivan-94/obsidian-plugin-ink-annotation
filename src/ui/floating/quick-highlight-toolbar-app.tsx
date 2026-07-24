@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef } from 'preact/hooks';
 
 import type { StylePreset } from '../../domain/style-preset';
+import { useI18n } from '../i18n/locale-context';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
 import {
   observeAnchoredElement,
@@ -38,6 +39,7 @@ export function QuickHighlightToolbarApp({
   onError,
   store,
 }: QuickHighlightToolbarAppProps) {
+  const i18n = useI18n();
   const toolbar = useRef<HTMLDivElement>(null);
   const errorMessage = store.errorMessage.value;
   const pendingAction = store.pendingAction.value;
@@ -96,13 +98,13 @@ export function QuickHighlightToolbarApp({
         onDismiss();
       } catch (error) {
         onError(error);
-        store.errorMessage.value = "Couldn't start Snapshot annotation. Retry.";
+        store.errorMessage.value = i18n.t('quickToolbar.snapshotStartFailed');
         store.pendingAction.value = null;
       }
     };
     return (
       <div
-        aria-label="Annotation actions"
+        aria-label={i18n.t('quickToolbar.label')}
         className={`${toolbarClassName} inkstone-quick-toolbar--unavailable`}
         data-inkstone-quick-toolbar=""
         ref={toolbar}
@@ -144,7 +146,7 @@ export function QuickHighlightToolbarApp({
       onDismiss();
     } catch (error) {
       onError(error);
-      store.errorMessage.value = "Couldn't save locally. Retry.";
+      store.errorMessage.value = i18n.t('quickToolbar.saveFailed');
       store.pendingAction.value = null;
       button.focus({ preventScroll: true });
     }
@@ -152,7 +154,7 @@ export function QuickHighlightToolbarApp({
 
   return (
     <div
-      aria-label="Annotation actions"
+      aria-label={i18n.t('quickToolbar.label')}
       className={toolbarClassName}
       data-inkstone-quick-toolbar=""
       onKeyDown={(event) => handleRovingFocus(event, document)}
@@ -161,7 +163,9 @@ export function QuickHighlightToolbarApp({
     >
       {model.presets.map((preset, index) => {
         const actionKey = `highlight:${preset.id}`;
-        const label = `Highlight: ${preset.name ?? preset.id}`;
+        const label = i18n.t('quickToolbar.highlightStyle', {
+          name: preset.name ?? preset.id,
+        });
         const recent = preset.id === recentStyleId;
         return (
           <button
@@ -189,7 +193,7 @@ export function QuickHighlightToolbarApp({
         className="inkstone-quick-toolbar__underline"
         commit={commit}
         icon="underline"
-        label="Underline"
+        label={i18n.t('quickToolbar.underline')}
         pendingAction={pendingAction}
       />
       <ToolbarIconAction
@@ -197,7 +201,7 @@ export function QuickHighlightToolbarApp({
         actionKey="add-note"
         commit={commit}
         icon="message-square-plus"
-        label="Add note"
+        label={i18n.t('quickToolbar.addNote')}
         pendingAction={pendingAction}
       />
       <ToolbarIconAction
@@ -206,7 +210,7 @@ export function QuickHighlightToolbarApp({
         className="inkstone-quick-toolbar__details"
         commit={commit}
         icon="square-pen"
-        label="Open annotation details"
+        label={i18n.t('quickToolbar.openDetails')}
         pendingAction={pendingAction}
       />
       {errorMessage === null ? null : (

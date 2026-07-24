@@ -5,6 +5,8 @@ import {
   AnnotationInspectorApp,
   type AnnotationInspectorAppProps,
 } from './inspector/annotation-inspector-app';
+import type { I18n } from './i18n/contract';
+import { createI18n } from './i18n/create-i18n';
 import { createPreactIsland, type UiIsland } from './runtime/mount-preact-island';
 import {
   createAnnotationInspectorStore,
@@ -26,10 +28,10 @@ export class AnnotationInspector {
   private anchorRect: Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'> = new DOMRect();
   private readonly document: Document;
   private host: HTMLDivElement | null = null;
+  private readonly i18n: I18n;
   private initialFocus: AnnotationInspectorInitialFocus = 'mark-type';
   private invoker: HTMLElement | undefined;
-  private readonly island: UiIsland<AnnotationInspectorAppProps> =
-    createPreactIsland(AnnotationInspectorApp);
+  private readonly island: UiIsland<AnnotationInspectorAppProps>;
   private readonly onDeleteRecord: (record: TextAnnotationRecord) => Promise<TextAnnotationRecord>;
   private readonly onDiscardRecord: (record: TextAnnotationRecord) => Promise<void> | void;
   private readonly onExportRecord: (record: TextAnnotationRecord, invoker: HTMLElement) => void;
@@ -71,13 +73,13 @@ export class AnnotationInspector {
     const state = this.store.state.value;
     if (state.kind !== 'editing') return;
     this.onExportRecord(state.draft.record, invoker);
-    this.setEditingFeedback('Export options opened', 'export');
+    this.setEditingFeedback(this.i18n.t('inspector.exportOpened'), 'export');
   };
   private readonly handleNavigate = (): void => {
     const state = this.store.state.value;
     if (state.kind !== 'editing') return;
     this.onNavigateRecord(state.draft.record);
-    this.setEditingFeedback('Source opened', 'navigate');
+    this.setEditingFeedback(this.i18n.t('inspector.sourceOpened'), 'navigate');
   };
   private readonly handleRequestDismiss = (): Promise<boolean> => this.requestDismiss();
   private readonly handleSave = (): void => {
@@ -104,6 +106,7 @@ export class AnnotationInspector {
 
   constructor(input: {
     readonly document: Document;
+    readonly i18n?: I18n;
     readonly onDelete: (record: TextAnnotationRecord) => Promise<TextAnnotationRecord>;
     readonly onDiscard?: (record: TextAnnotationRecord) => Promise<void> | void;
     readonly onExport?: (record: TextAnnotationRecord, invoker: HTMLElement) => void;
@@ -121,6 +124,8 @@ export class AnnotationInspector {
     readonly writeClipboard: (text: string) => Promise<void>;
   }) {
     this.document = input.document;
+    this.i18n = input.i18n ?? createI18n('en');
+    this.island = createPreactIsland(AnnotationInspectorApp, { i18n: this.i18n });
     this.onDeleteRecord = input.onDelete;
     this.onDiscardRecord = input.onDiscard ?? (() => undefined);
     this.onExportRecord = input.onExport ?? (() => undefined);
@@ -226,7 +231,7 @@ export class AnnotationInspector {
         ...state,
         action: {
           kind: 'error',
-          message: "Couldn't reattach locally. The original target is unchanged.",
+          message: this.i18n.t('inspector.reattachFailed'),
         },
       });
     }
@@ -246,26 +251,30 @@ export class AnnotationInspector {
       await this.writeClipboard(text);
       this.setEditingFeedback(
         kind === 'quote'
-          ? 'Quote copied'
+          ? this.i18n.t('inspector.quoteCopied')
           : kind === 'link'
-            ? 'Annotation link copied'
-            : 'Annotation JSON copied',
+            ? this.i18n.t('inspector.annotationLinkCopied')
+            : this.i18n.t('inspector.annotationJsonCopied'),
         kind,
       );
     } catch {
-      this.setEditingFeedback("Couldn't copy. Retry.", null);
+      this.setEditingFeedback(this.i18n.t('inspector.copyFailed'), null);
     }
   }
 
   private async deleteRecord(): Promise<void> {
     const state = this.store.state.value;
     if (state.kind !== 'editing') return;
-    this.transition({ ...state, feedback: 'Deleting…', successfulAction: null });
+    this.transition({
+      ...state,
+      feedback: this.i18n.t('inspector.deleting'),
+      successfulAction: null,
+    });
     try {
       const deleted = await this.onDeleteRecord(state.draft.record);
       this.transition({ action: { kind: 'idle' }, kind: 'deleted', record: deleted });
     } catch {
-      this.setEditingFeedback("Couldn't delete locally. Retry.", null);
+      this.setEditingFeedback(this.i18n.t('inspector.deleteFailed'), null);
     }
   }
 
@@ -290,7 +299,7 @@ export class AnnotationInspector {
       if (current.kind === 'editing') {
         this.transition({
           ...current,
-          save: { kind: 'error', message: "Couldn't save locally. Retry." },
+          save: { kind: 'error', message: this.i18n.t('inspector.saveFailed') },
         });
       }
       return false;
@@ -362,7 +371,7 @@ export class AnnotationInspector {
     } catch {
       this.transition({
         ...state,
-        action: { kind: 'error', message: "Couldn't undo locally. Retry." },
+        action: { kind: 'error', message: this.i18n.t('inspector.undoFailed') },
       });
     }
   }

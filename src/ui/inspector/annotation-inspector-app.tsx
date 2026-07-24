@@ -3,6 +3,8 @@ import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 
 import type { StylePreset } from '../../domain/style-preset';
 import { annotationTargetText, type TextAnnotationRecord } from '../../domain/text-annotation';
+import type { I18n } from '../i18n/contract';
+import { useI18n } from '../i18n/locale-context';
 import { IconButton } from '../primitives/icon-button';
 import { ObsidianIcon } from '../primitives/obsidian-icon';
 import {
@@ -37,6 +39,7 @@ export interface AnnotationInspectorAppProps {
 }
 
 export function AnnotationInspectorApp(props: AnnotationInspectorAppProps) {
+  const i18n = useI18n();
   const inspector = useRef<HTMLDivElement>(null);
   const retrySave = useRef<HTMLButtonElement>(null);
   const state = props.state.value;
@@ -78,11 +81,9 @@ export function AnnotationInspectorApp(props: AnnotationInspectorAppProps) {
         ? 'button[data-inkstone-overlap-choice]'
         : state.kind === 'editing'
           ? props.initialFocus === 'note'
-            ? 'textarea[aria-label="Note"]'
+            ? 'textarea[data-inkstone-note-field]'
             : `button[data-inkstone-mark-type="${state.draft.markKind}"]`
-          : state.kind === 'previewing-reattachment'
-            ? 'button[aria-label="Confirm reattachment"]'
-            : 'button[aria-label="Undo delete"]';
+          : 'button.mod-cta';
     element.querySelector<HTMLElement>(selector)?.focus({ preventScroll: true });
   }, [focusKey, props.initialFocus]);
 
@@ -96,7 +97,7 @@ export function AnnotationInspectorApp(props: AnnotationInspectorAppProps) {
 
   return (
     <div
-      aria-label="Annotation inspector"
+      aria-label={i18n.t('inspector.label')}
       aria-modal="false"
       className="inkstone-annotation-inspector"
       data-annotation-id={state.kind === 'editing' ? state.draft.record.id : undefined}
@@ -132,10 +133,11 @@ function OverlapChooser({
   readonly onChoose: (record: TextAnnotationRecord) => void;
   readonly records: readonly TextAnnotationRecord[];
 }) {
+  const i18n = useI18n();
   return (
     <>
-      <InspectorHeader icon="layers-3" title="Choose annotation" />
-      <p className="inkstone-annotation-inspector__hint">Several annotations share this passage.</p>
+      <InspectorHeader icon="layers-3" title={i18n.t('inspector.chooseTitle')} />
+      <p className="inkstone-annotation-inspector__hint">{i18n.t('inspector.chooseHint')}</p>
       {records.map((record) => (
         <button
           data-annotation-id={record.id}
@@ -145,7 +147,7 @@ function OverlapChooser({
           type="button"
         >
           <span>{annotationTargetText(record.target)}</span>
-          <span>{markTypeLabel(record.mark?.kind ?? 'note')}</span>
+          <span>{markTypeLabel(i18n, record.mark?.kind ?? 'note')}</span>
         </button>
       ))}
     </>
@@ -166,15 +168,20 @@ function AnnotationEditor({
   readonly retrySave: { readonly current: HTMLButtonElement | null };
   readonly state: Extract<InspectorState, { readonly kind: 'editing' }>;
 }) {
+  const i18n = useI18n();
   const availablePresets = useMemo(() => {
     const result = [...presets];
     const { record, styleId } = state.draft;
     if (record.mark !== undefined && !result.some((preset) => preset.id === styleId)) {
-      result.push({ color: 'var(--text-muted)', id: styleId, name: 'Legacy style' });
+      result.push({
+        color: 'var(--text-muted)',
+        id: styleId,
+        name: i18n.t('inspector.legacyStyle'),
+      });
     }
     return result;
-  }, [presets, state.draft.record, state.draft.styleId]);
-  const status = inspectorStatus(state);
+  }, [i18n, presets, state.draft.record, state.draft.styleId]);
+  const status = inspectorStatus(i18n, state);
   const failed = state.save.kind === 'error';
 
   return (
@@ -185,27 +192,35 @@ function AnnotationEditor({
       </blockquote>
       <div className="inkstone-annotation-inspector__editor-controls">
         <div
-          aria-label="Mark type"
+          aria-label={i18n.t('inspector.markType')}
           className="inkstone-annotation-inspector__segments"
           role="group"
         >
           {(['highlight', 'underline', 'note'] as const).map((kind) => (
             <button
-              aria-label={`${markTypeLabel(kind)} mark type`}
+              aria-label={i18n.t('inspector.markTypeLabel', {
+                type: markTypeLabel(i18n, kind),
+              })}
               aria-pressed={kind === state.draft.markKind}
               data-inkstone-mark-type={kind}
               key={kind}
               onClick={() => onUpdateDraft({ markKind: kind })}
               type="button"
             >
-              {kind === 'note' ? 'Note' : markTypeLabel(kind)}
+              {markTypeLabel(i18n, kind)}
             </button>
           ))}
         </div>
-        <div aria-label="Style" className="inkstone-annotation-inspector__styles" role="group">
+        <div
+          aria-label={i18n.t('inspector.style')}
+          className="inkstone-annotation-inspector__styles"
+          role="group"
+        >
           {availablePresets.map((preset) => (
             <button
-              aria-label={`Style: ${preset.name ?? preset.id}`}
+              aria-label={i18n.t('inspector.styleLabel', {
+                name: preset.name ?? preset.id,
+              })}
               aria-pressed={preset.id === state.draft.styleId}
               className="inkstone-annotation-inspector__style"
               data-inkstone-style-id={preset.id}
@@ -221,20 +236,21 @@ function AnnotationEditor({
         </div>
       </div>
       <textarea
-        aria-label="Note"
+        aria-label={i18n.t('inspector.note')}
+        data-inkstone-note-field=""
         onChange={(event) => onUpdateDraft({ body: event.currentTarget.value })}
         onInput={(event) => onUpdateDraft({ body: event.currentTarget.value })}
-        placeholder="Add a note…"
+        placeholder={i18n.t('inspector.notePlaceholder')}
         rows={2}
         value={state.draft.body}
       />
       <label className="inkstone-annotation-inspector__tag-field">
         <ObsidianIcon icon="tag" />
         <input
-          aria-label="Tags"
+          aria-label={i18n.t('inspector.tags')}
           onChange={(event) => onUpdateDraft({ tags: event.currentTarget.value })}
           onInput={(event) => onUpdateDraft({ tags: event.currentTarget.value })}
-          placeholder="Tags"
+          placeholder={i18n.t('inspector.tags')}
           type="text"
           value={state.draft.tags}
         />
@@ -247,49 +263,54 @@ function AnnotationEditor({
           <InspectorAction
             action="quote"
             icon="copy"
-            label="Copy quote"
+            label={i18n.t('inspector.copyQuote')}
             onClick={() => onCopy('quote')}
             successfulAction={state.successfulAction}
           />
           <InspectorAction
             action="link"
             icon="link"
-            label="Copy annotation link"
+            label={i18n.t('inspector.copyLink')}
             onClick={() => onCopy('link')}
             successfulAction={state.successfulAction}
           />
           <InspectorAction
             action="navigate"
             icon="external-link"
-            label="Go to source"
+            label={i18n.t('inspector.goToSource')}
             onClick={onNavigate}
             successfulAction={state.successfulAction}
           />
           <InspectorAction
             action="export"
             icon="share"
-            label="Export annotation"
+            label={i18n.t('inspector.exportAnnotation')}
             onClick={(event) => onExport(event.currentTarget as HTMLElement)}
             successfulAction={state.successfulAction}
           />
           <InspectorAction
             action="json"
             icon="braces"
-            label="Copy annotation JSON"
+            label={i18n.t('inspector.copyJson')}
             onClick={() => onCopy('json')}
             successfulAction={state.successfulAction}
           />
-          <IconButton danger icon="trash-2" label="Delete annotation" onClick={onDelete} />
+          <IconButton
+            danger
+            icon="trash-2"
+            label={i18n.t('inspector.deleteAnnotation')}
+            onClick={onDelete}
+          />
         </div>
         <button
-          aria-label={failed ? 'Retry save' : 'Save annotation'}
+          aria-label={failed ? i18n.t('inspector.retrySave') : i18n.t('inspector.saveAnnotation')}
           className="inkstone-annotation-inspector__save mod-cta"
           disabled={state.save.kind === 'pending'}
           onClick={onSave}
           ref={retrySave}
           type="button"
         >
-          {failed ? 'Retry' : 'Save'}
+          {failed ? i18n.t('inspector.retry') : i18n.t('inspector.save')}
         </button>
       </div>
     </>
@@ -328,37 +349,41 @@ function ReattachmentPreview({
   readonly onConfirm: () => void;
   readonly state: Extract<InspectorState, { readonly kind: 'previewing-reattachment' }>;
 }) {
+  const i18n = useI18n();
   return (
     <>
-      <InspectorHeader icon="scan-text" title="Repair annotation" />
-      <p className="inkstone-annotation-inspector__repair-hint">
-        Replace the missing target with your current selection?
-      </p>
+      <InspectorHeader icon="scan-text" title={i18n.t('inspector.repairTitle')} />
+      <p className="inkstone-annotation-inspector__repair-hint">{i18n.t('inspector.repairHint')}</p>
       <div
-        aria-label="Target replacement preview"
+        aria-label={i18n.t('inspector.repairPreview')}
         className="inkstone-annotation-inspector__repair-comparison"
       >
         <section className="inkstone-annotation-inspector__repair-target">
-          <span>Current target</span>
+          <span>{i18n.t('inspector.targetCurrent')}</span>
           <blockquote>{annotationTargetText(state.record.target)}</blockquote>
         </section>
         <ObsidianIcon className="inkstone-annotation-inspector__repair-arrow" icon="arrow-down" />
         <section className="inkstone-annotation-inspector__repair-target inkstone-annotation-inspector__repair-target--new">
-          <span>New target</span>
+          <span>{i18n.t('inspector.newTarget')}</span>
           <blockquote>{annotationTargetText(state.candidate.target)}</blockquote>
         </section>
       </div>
       <span role="alert">{state.action.kind === 'error' ? state.action.message : ''}</span>
       <div className="inkstone-annotation-inspector__decision-actions">
-        <IconButton icon="x" label="Cancel reattachment" onClick={onCancel} text="Cancel" />
+        <IconButton
+          icon="x"
+          label={i18n.t('inspector.cancelReattachment')}
+          onClick={onCancel}
+          text={i18n.t('inspector.cancel')}
+        />
         <IconButton
           busy={state.action.kind === 'pending'}
           className="mod-cta"
           disabled={state.action.kind === 'pending'}
           icon="check"
-          label="Confirm reattachment"
+          label={i18n.t('inspector.confirmReattachment')}
           onClick={onConfirm}
-          text="Use selection"
+          text={i18n.t('inspector.useSelection')}
         />
       </div>
     </>
@@ -372,18 +397,21 @@ function DeletedAnnotationState({
   readonly onUndo: () => void;
   readonly state: Extract<InspectorState, { readonly kind: 'deleted' }>;
 }) {
+  const i18n = useI18n();
   return (
     <>
-      <InspectorHeader icon="trash-2" title="Annotation deleted" />
-      <p>{state.action.kind === 'error' ? state.action.message : 'Saved locally'}</p>
+      <InspectorHeader icon="trash-2" title={i18n.t('inspector.deletedTitle')} />
+      <p>
+        {state.action.kind === 'error' ? state.action.message : i18n.t('inspector.savedLocally')}
+      </p>
       <IconButton
         busy={state.action.kind === 'pending'}
         className="mod-cta"
         disabled={state.action.kind === 'pending'}
         icon="undo-2"
-        label="Undo delete"
+        label={i18n.t('inspector.undoDelete')}
         onClick={onUndo}
-        text="Undo"
+        text={i18n.t('inspector.undo')}
       />
     </>
   );
@@ -398,15 +426,18 @@ function InspectorHeader({ icon, title }: { readonly icon: string; readonly titl
   );
 }
 
-function inspectorStatus(state: Extract<InspectorState, { readonly kind: 'editing' }>): string {
-  if (state.save.kind === 'pending') return 'Saving…';
+function inspectorStatus(
+  i18n: I18n,
+  state: Extract<InspectorState, { readonly kind: 'editing' }>,
+): string {
+  if (state.save.kind === 'pending') return i18n.t('inspector.saving');
   if (state.save.kind === 'error') return state.save.message;
-  if (state.save.kind === 'success') return 'Saved locally';
+  if (state.save.kind === 'success') return i18n.t('inspector.savedLocally');
   return state.feedback;
 }
 
-function markTypeLabel(kind: 'highlight' | 'note' | 'underline'): string {
-  if (kind === 'highlight') return 'Highlight';
-  if (kind === 'underline') return 'Underline';
-  return 'Note';
+function markTypeLabel(i18n: I18n, kind: 'highlight' | 'note' | 'underline'): string {
+  if (kind === 'highlight') return i18n.t('inspector.mark.highlight');
+  if (kind === 'underline') return i18n.t('inspector.mark.underline');
+  return i18n.t('inspector.mark.note');
 }

@@ -3,9 +3,42 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_STYLE_PRESETS } from '../domain/style-preset';
+import { createI18n } from './i18n/create-i18n';
 import { QuickHighlightToolbar, type QuickToolbarAction } from './quick-highlight-toolbar';
 
 describe('quick highlight toolbar', () => {
+  it('renders actions and accessible names in Simplified Chinese', () => {
+    const toolbar = new QuickHighlightToolbar({
+      document,
+      i18n: createI18n('zh'),
+      onAction: () => Promise.resolve(),
+      onDismiss: () => undefined,
+    });
+
+    toolbar.show({
+      anchorRect: new DOMRect(),
+      presets: DEFAULT_STYLE_PRESETS,
+      recentStyleId: 'highlight-sun',
+    });
+
+    expect(
+      [...document.querySelectorAll<HTMLButtonElement>('.inkstone-quick-toolbar button')].map(
+        (button) => button.getAttribute('aria-label'),
+      ),
+    ).toEqual([
+      '高亮：Sun',
+      '高亮：Mint',
+      '高亮：Sky',
+      '高亮：Rose',
+      '高亮：Violet',
+      '下划线',
+      '添加笔记',
+      '打开标注详情',
+    ]);
+    expect(document.querySelector('[role="toolbar"]')?.getAttribute('aria-label')).toBe('标注操作');
+    toolbar.close(false);
+  });
+
   it('shows five colors, underline, add note and explicit details in stable order', async () => {
     let committedAction: QuickToolbarAction | null = null;
     const toolbar = new QuickHighlightToolbar({

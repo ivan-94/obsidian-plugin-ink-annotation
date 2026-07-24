@@ -25,6 +25,7 @@ import {
   type StylePreset,
 } from '../../domain/style-preset';
 import type { TextAnnotationRecord } from '../../domain/text-annotation';
+import type { I18n } from '../../ui/i18n/contract';
 import type { NoteDraftRenderTarget } from './reading-annotation-controller';
 import {
   bindReadingBlocks,
@@ -115,6 +116,7 @@ export class ReadingViewIntegration {
 
   constructor(input: {
     readonly document: Document;
+    readonly i18n?: I18n;
     readonly isMobile?: boolean;
     readonly now?: () => number;
     readonly onAnnotationHit?: (annotationIds: readonly string[], invoker: HTMLElement) => void;
@@ -155,6 +157,7 @@ export class ReadingViewIntegration {
     this.controller = new ReadingAnnotationController({
       collapseSelection: () => this.document.getSelection()?.removeAllRanges(),
       document: input.document,
+      ...(input.i18n === undefined ? {} : { i18n: input.i18n }),
       onCommitted: (record) => {
         this.resolvedCache.delete(record.filePath);
         onRecordsChanged(record.filePath);

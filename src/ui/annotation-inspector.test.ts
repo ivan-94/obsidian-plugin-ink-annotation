@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { TextAnnotationRecord } from '../domain/text-annotation';
 import { AnnotationInspector } from './annotation-inspector';
+import { createI18n } from './i18n/create-i18n';
 
 describe('annotation inspector', () => {
   afterEach(() => {
@@ -13,6 +14,33 @@ describe('annotation inspector', () => {
       configurable: true,
       value: undefined,
     });
+  });
+
+  it('renders editing controls and accessible names in Simplified Chinese', () => {
+    const inspector = new AnnotationInspector({
+      document,
+      i18n: createI18n('zh'),
+      onDelete: (item) => Promise.resolve(item),
+      onNavigate: () => undefined,
+      onSave: (item) => Promise.resolve(item),
+      onUndo: (item) => Promise.resolve(item),
+      presets: [{ color: '#f0c94b', id: 'highlight-sun', name: 'Sun' }],
+      writeClipboard: () => Promise.resolve(),
+    });
+
+    inspector.show({ anchorRect: new DOMRect(), records: [record('zh', '中文标注')] });
+
+    expect(
+      document.querySelector('[data-inkstone-annotation-inspector]')?.getAttribute('aria-label'),
+    ).toBe('标注检查器');
+    expect(
+      document.querySelector('[data-inkstone-mark-type="highlight"]')?.getAttribute('aria-label'),
+    ).toBe('高亮标记类型');
+    expect(document.querySelector('textarea')?.getAttribute('aria-label')).toBe('笔记');
+    expect(document.querySelector('textarea')?.getAttribute('placeholder')).toBe('添加笔记…');
+    expect(document.querySelector('button[aria-label="复制引用"]')).not.toBeNull();
+    expect(document.querySelector('button[aria-label="删除标注"]')).not.toBeNull();
+    expect(document.querySelector('button[aria-label="保存标注"]')?.textContent).toBe('保存');
   });
 
   it('groups editor controls and footer actions into a compact layout', () => {
