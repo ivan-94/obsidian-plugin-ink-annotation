@@ -1,16 +1,20 @@
 {
   "name": "inkstone-annotations",
   "version": "0.1.0",
-  "description": "Text annotations and snapshot markup for mutable Markdown in Obsidian.",
+  "description": "Highlight and underline mutable Markdown, add notes, and draw on stable snapshots.",
+  "author": "Ivan",
+  "license": "MIT",
   "engines": {
     "node": ">=20.19.0"
   },
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "npm run typecheck && node esbuild.config.mjs production && npm run check:mobile && npm run check:retired-document-ink",
+    "build": "npm run typecheck && npm run typecheck:obsidian-1.7.2 && node esbuild.config.mjs production && npm run check:production-bundle && npm run check:mobile && npm run check:retired-document-ink",
+    "build:web-hat": "npm run typecheck && npm run typecheck:obsidian-1.7.2 && node esbuild.config.mjs web-hat && npm run check:mobile && npm run check:retired-document-ink",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run test:performance && npm run build",
     "check:mobile": "node scripts/check-mobile-bundle.mjs",
+    "check:production-bundle": "node scripts/check-production-bundle.mjs",
     "check:retired-document-ink": "node scripts/check-retired-document-ink.mjs",
     "check:vault-catalog-bounds": "node scripts/check-vault-catalog-bounds.mjs",
     "dev": "node esbuild.config.mjs",
@@ -26,6 +30,8 @@
     "test:performance": "vitest run performance --coverage=false --maxWorkers=1",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "typecheck:obsidian-1.7.2": "tsc --noEmit -p tsconfig.obsidian-1.7.2.json",
+    "verify:release-tag": "node scripts/verify-release-tag.mjs",
     "verify:rc-lifecycle": "node scripts/verify-release-lifecycle.mjs"
   },
   "devDependencies": {
@@ -39,6 +45,7 @@
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^29.1.1",
     "obsidian": "^1.13.1",
+    "obsidian-1-7-2": "npm:obsidian@1.7.2",
     "prettier": "^3.9.5",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.64.0",

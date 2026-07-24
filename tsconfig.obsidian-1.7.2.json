@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "obsidian": ["./node_modules/obsidian-1-7-2"]
+    }
+  }
+}

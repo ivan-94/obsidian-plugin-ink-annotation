@@ -18,15 +18,16 @@ import { ReadingViewIntegration } from './adapters/obsidian/reading-view-integra
 import { ObsidianSnapshotAnnotationManager } from './adapters/obsidian/snapshot-annotation-manager';
 import { ElectronSnapshotCaptureBackend } from './adapters/obsidian/electron-snapshot-capture-backend';
 import { resolveDesktopElectronCaptureSubject } from './adapters/obsidian/desktop-electron-capture-subject';
-import { SnapshotCaptureBackendRegistry } from './adapters/obsidian/snapshot-capture-backend';
-import { leaseSnapshotCaptureSubject } from './adapters/obsidian/snapshot-capture-backend';
+import {
+  leaseSnapshotCaptureSubject,
+  SnapshotCaptureBackendRegistry,
+  type SnapshotCaptureBackend,
+} from './adapters/obsidian/snapshot-capture-backend';
 import {
   disposeSnapshotCaptureActions,
   ensureSnapshotCaptureActions,
 } from './adapters/obsidian/snapshot-capture-action';
 import { BrowserSnapshotAnnotationFlattener } from './adapters/obsidian/browser-snapshot-annotation-flattener';
-import { HtmlToImageSnapshotCaptureBackend } from './adapters/obsidian/html-to-image-snapshot-capture-backend';
-import { ForeignObjectSnapshotCaptureBackend } from './adapters/obsidian/foreign-object-snapshot-capture-backend';
 import { BrowserSnapshotThumbnailer } from './adapters/obsidian/browser-snapshot-thumbnailer';
 import { BrowserSnapshotPngCoverageValidator } from './adapters/obsidian/browser-snapshot-png-coverage-validator';
 import { CurrentMarkdownFileContext } from './adapters/obsidian/current-markdown-file-context';
@@ -86,6 +87,9 @@ import { SnapshotAnnotationRepository } from './storage/snapshot-annotation-repo
 import { GraveyardRepository } from './storage/graveyard-repository';
 import { SnapshotAnnotationEditor } from './ui/snapshot-annotation-editor';
 import { writeSnapshotAnnotationPngExport } from './application/snapshot-annotation-export';
+
+declare const __INKSTONE_WEB_CAPTURE_BACKENDS__: boolean;
+declare const __INKSTONE_ACCEPTANCE_COMMANDS__: boolean;
 
 export default class InkstoneAnnotationsPlugin extends Plugin {
   private readonly diagnostics = new Diagnostics(false);
@@ -1044,14 +1048,26 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
     });
     this.readingView = readingView;
     this.runtime.registerDisposer(() => readingView.dispose());
-    snapshotAnnotationManager = new ObsidianSnapshotAnnotationManager({
-      app: this.app,
-      backendId: Platform.isDesktopApp ? 'electron-capture-page' : 'html-to-image',
-      captureBackends: new SnapshotCaptureBackendRegistry([
-        new ElectronSnapshotCaptureBackend(),
+    const snapshotCaptureBackends: SnapshotCaptureBackend[] = [
+      new ElectronSnapshotCaptureBackend(),
+    ];
+    let snapshotCaptureBackendId = 'electron-capture-page';
+    if (__INKSTONE_WEB_CAPTURE_BACKENDS__) {
+      const [{ HtmlToImageSnapshotCaptureBackend }, { ForeignObjectSnapshotCaptureBackend }] =
+        await Promise.all([
+          import('./adapters/obsidian/html-to-image-snapshot-capture-backend'),
+          import('./adapters/obsidian/foreign-object-snapshot-capture-backend'),
+        ]);
+      snapshotCaptureBackends.push(
         new HtmlToImageSnapshotCaptureBackend({ document: globalThis.document }),
         new ForeignObjectSnapshotCaptureBackend({ document: globalThis.document }),
-      ]),
+      );
+      if (!Platform.isDesktopApp) snapshotCaptureBackendId = 'html-to-image';
+    }
+    snapshotAnnotationManager = new ObsidianSnapshotAnnotationManager({
+      app: this.app,
+      backendId: snapshotCaptureBackendId,
+      captureBackends: new SnapshotCaptureBackendRegistry(snapshotCaptureBackends),
       createCaptureSubject: (readingRoot, backendId) =>
         backendId === 'electron-capture-page'
           ? resolveDesktopElectronCaptureSubject()
@@ -1199,20 +1215,22 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
             });
         },
       });
-      for (const [backendId, label] of [
-        ['electron-capture-page', 'Electron'],
-        ['html-to-image', 'html-to-image'],
-        ['inkstone-foreign-object', 'Inkstone foreignObject'],
-      ] as const) {
-        if (!Platform.isDesktopApp && backendId === 'electron-capture-page') continue;
-        this.addCommand({
-          id: `select-snapshot-backend-${backendId}`,
-          name: `Snapshot acceptance: use ${label} backend`,
-          callback: () => {
-            snapshotAnnotationManager?.selectBackend(backendId);
-            new Notice(`Snapshot capture backend: ${label}`);
-          },
-        });
+      if (__INKSTONE_ACCEPTANCE_COMMANDS__) {
+        for (const [backendId, label] of [
+          ['electron-capture-page', 'Electron'],
+          ['html-to-image', 'html-to-image'],
+          ['inkstone-foreign-object', 'Inkstone foreignObject'],
+        ] as const) {
+          if (!Platform.isDesktopApp && backendId === 'electron-capture-page') continue;
+          this.addCommand({
+            id: `select-snapshot-backend-${backendId}`,
+            name: `Snapshot acceptance: use ${label} backend`,
+            callback: () => {
+              snapshotAnnotationManager?.selectBackend(backendId);
+              new Notice(`Snapshot capture backend: ${label}`);
+            },
+          });
+        }
       }
       this.addCommand({
         id: 'reopen-latest-snapshot-annotation',

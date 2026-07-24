@@ -27,6 +27,7 @@ Inkstone Annotations plugin.
 - [Parser-backed Text Source Projection and powerful Reading selection](2026-07-23-parser-backed-text-source-projection.md)
 - [Entire Vault demand-bounded local Catalog and automated Gate — reassessed 2026-07-23](2026-07-19-entire-vault-demand-bounded-index.md)
 - [Preact UI architecture refactor specification](2026_07_15_refactor_to_preact.md)
+- [Production and Community market release](2026-07-24-production-market-release.md)
 
 Historical plan updates that have already been reconciled into the master plan are retained here for
 traceability:
@@ -87,6 +88,7 @@ are no longer valid sources of truth.
 - `docs/specs/2026-07-23-parser-backed-text-source-projection.md`
 - `docs/specs/2026-07-19-entire-vault-demand-bounded-index.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`
+- `docs/specs/2026-07-24-production-market-release.md`
 - `docs/specs/2026-07-15-preact-execution-plan-update.md`
 - `docs/specs/assets/obsidian-annotation-plugin-ui-v2/`
 
@@ -133,6 +135,10 @@ are no longer valid sources of truth.
   candidates with one parser-backed bidirectional projection shared by selection creation, highlight
   restoration, and Snapshot source binding. It keeps compound source anchors, typed fail-closed
   behavior, bounded revision caches, and explicit Snapshot fallback for generated content.
+- The 2026-07-24 production release specification adopts `Inkstone Annotations`,
+  `inkstone-annotations`, and the MIT License; separates local release foundations from external
+  publication; and defines Beta, policy audit, real-device HAT, Community submission, and maintained
+  production gates.
 - Supporting design images moved with the plan so all relative references remain repository-local.
 
 ### Verification evidence

@@ -19,6 +19,10 @@ export interface ActionMenuHandle {
   readonly close: () => void;
 }
 
+interface WarningCapableMenuItem {
+  readonly setWarning?: (warning: boolean) => unknown;
+}
+
 export function showActionMenu({
   anchor,
   items,
@@ -35,7 +39,10 @@ export function showActionMenu({
       if (action.icon !== undefined) item.setIcon(action.icon);
       if (action.checked !== undefined) item.setChecked(action.checked);
       if (action.disabled !== undefined) item.setDisabled(action.disabled);
-      if (action.warning !== undefined) item.setWarning(action.warning);
+      const setWarning = (item as WarningCapableMenuItem).setWarning;
+      if (action.warning !== undefined && typeof setWarning === 'function') {
+        Reflect.apply(setWarning, item, [action.warning]);
+      }
       if (action.section !== undefined) item.setSection(action.section);
       item.onClick(action.onSelect);
     });

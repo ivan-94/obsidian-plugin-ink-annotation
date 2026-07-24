@@ -1,5 +1,3 @@
-import { toBlob } from 'html-to-image';
-
 import { readPngImageDimensions } from '../../domain/png-image';
 import {
   resolveSnapshotCaptureSubject,
@@ -10,14 +8,15 @@ import {
   type SnapshotCaptureRequest,
 } from './snapshot-capture-backend';
 import {
-  pairSnapshotCaptureElements,
+  inlineSnapshotCaptureImages,
   removeSnapshotCaptureExcludedNodes,
   replaceDirectlyUnsupportedCaptureNodes,
   replaceGeneratedCaptureNodesForRetry,
-  replaceSnapshotCaptureNodeWithPlaceholder,
-  snapshotImageIsRemote,
+  resolveLoadedSnapshotImageDataUrl,
   SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR,
+  type SnapshotLocalImageResolver,
 } from './snapshot-dom-capture-preparation';
+import { toEmbeddedHtmlBlob } from './embedded-html-to-image-renderer';
 
 type HtmlToImageRenderer = (
   node: HTMLElement,
@@ -26,6 +25,7 @@ type HtmlToImageRenderer = (
     readonly height: number;
     readonly pixelRatio: number;
     readonly skipAutoScale: boolean;
+    readonly skipFonts: boolean;
     readonly width: number;
   },
 ) => Promise<Blob | null>;
@@ -50,12 +50,18 @@ const CAPABILITIES = Object.freeze({
 export class HtmlToImageSnapshotCaptureBackend implements SnapshotCaptureBackend {
   private readonly document: Document;
   private readonly renderToBlob: HtmlToImageRenderer;
+  private readonly resolveImageDataUrl: SnapshotLocalImageResolver;
 
   constructor(
-    input: { readonly document?: Document; readonly renderToBlob?: HtmlToImageRenderer } = {},
+    input: {
+      readonly document?: Document;
+      readonly renderToBlob?: HtmlToImageRenderer;
+      readonly resolveImageDataUrl?: SnapshotLocalImageResolver;
+    } = {},
   ) {
     this.document = input.document ?? globalThis.document;
-    this.renderToBlob = input.renderToBlob ?? toBlob;
+    this.renderToBlob = input.renderToBlob ?? toEmbeddedHtmlBlob;
+    this.resolveImageDataUrl = input.resolveImageDataUrl ?? resolveLoadedSnapshotImageDataUrl;
   }
 
   describe(): SnapshotCaptureCapabilities {
@@ -75,7 +81,7 @@ export class HtmlToImageSnapshotCaptureBackend implements SnapshotCaptureBackend
     if (request.signal.aborted) throw aborted();
     const { clone, isolation } = isolateViewport(this.document, subject, request.viewportCssRect);
     try {
-      prepareHtmlToImageClone(subject, clone);
+      await prepareHtmlToImageClone(subject, clone, request.signal, this.resolveImageDataUrl);
       positionIsolatedClone(
         clone,
         request.subjectCssRect ?? subject.getBoundingClientRect(),
@@ -87,6 +93,7 @@ export class HtmlToImageSnapshotCaptureBackend implements SnapshotCaptureBackend
         height: request.viewportCssRect.height,
         pixelRatio: request.desiredPixelRatio,
         skipAutoScale: true,
+        skipFonts: true,
         width: request.viewportCssRect.width,
       };
       let fallbackUsed = false;
@@ -189,21 +196,14 @@ function positionIsolatedClone(
   clone.style.width = `${sourceBounds.width}px`;
 }
 
-function prepareHtmlToImageClone(sourceRoot: HTMLElement, cloneRoot: HTMLElement): void {
+async function prepareHtmlToImageClone(
+  sourceRoot: HTMLElement,
+  cloneRoot: HTMLElement,
+  signal: AbortSignal,
+  resolveImageDataUrl: SnapshotLocalImageResolver,
+): Promise<void> {
   removeSnapshotCaptureExcludedNodes(cloneRoot);
-  for (const { clone, source } of pairSnapshotCaptureElements<HTMLImageElement>(
-    sourceRoot,
-    cloneRoot,
-    'img',
-  )) {
-    if (source === null) {
-      replaceSnapshotCaptureNodeWithPlaceholder(clone, clone, 'image');
-    } else if (snapshotImageIsRemote(source)) {
-      replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'remote-image');
-    } else if (!source.complete || source.naturalWidth <= 0 || source.naturalHeight <= 0) {
-      replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'local-image');
-    }
-  }
+  await inlineSnapshotCaptureImages(sourceRoot, cloneRoot, signal, resolveImageDataUrl);
   replaceDirectlyUnsupportedCaptureNodes(sourceRoot, cloneRoot);
 }
 

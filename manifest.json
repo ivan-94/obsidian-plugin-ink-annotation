@@ -3,7 +3,8 @@
   "name": "Inkstone Annotations",
   "version": "0.1.0",
   "minAppVersion": "1.7.2",
-  "description": "Highlight mutable Markdown and mark up stable snapshots.",
+  "description": "Highlight and underline mutable Markdown, add notes, and draw on stable snapshots.",
   "author": "Ivan",
+  "authorUrl": "https://github.com/ivan-94",
   "isDesktopOnly": false
 }

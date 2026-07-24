@@ -56,6 +56,42 @@ describe('Inkstone foreignObject Snapshot capture backend', () => {
     });
   });
 
+  it('inlines an already loaded Vault image without issuing a fetch request', async () => {
+    const root = document.createElement('div');
+    root.innerHTML = '<img src="app://vault/local.png">';
+    const sourceImage = root.querySelector('img') as HTMLImageElement;
+    Object.defineProperties(sourceImage, {
+      complete: { value: true },
+      naturalHeight: { value: 50 },
+      naturalWidth: { value: 80 },
+    });
+    const drawImage = vi.fn();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+      () => ({ drawImage }) as unknown as CanvasRenderingContext2D,
+    );
+    vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation((callback) => {
+      callback(new Blob(['local-image'], { type: 'image/png' }));
+    });
+    const fetchRequest = vi.fn();
+    vi.stubGlobal('fetch', fetchRequest);
+    const rasterizeSvg = vi.fn(({ svg }: { svg: string }) => {
+      expect(svg).toContain('data:image/png;base64,');
+      return Promise.resolve(pngHeader(100, 100));
+    });
+    const backend = new ForeignObjectSnapshotCaptureBackend({ document, rasterizeSvg });
+
+    await backend.capture({
+      captureGeneration: 2,
+      desiredPixelRatio: 1,
+      signal: new AbortController().signal,
+      subject: leaseSnapshotCaptureSubject(root),
+      viewportCssRect: { height: 100, left: 0, top: 0, width: 100 },
+    });
+
+    expect(fetchRequest).not.toHaveBeenCalled();
+    expect(drawImage).toHaveBeenCalledWith(sourceImage, 0, 0, 80, 50);
+  });
+
   it('honors cancellation before publishing a raster result', async () => {
     const root = document.createElement('div');
     root.textContent = 'Test';

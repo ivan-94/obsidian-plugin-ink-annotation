@@ -1,0 +1,92 @@
+name: Bug report
+description: Report a reproducible Inkstone Annotations problem.
+title: '[Bug] '
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Use synthetic content and remove private note text, screenshots, sidecars, credentials, and Vault paths before submitting.
+  - type: input
+    id: inkstone-version
+    attributes:
+      label: Inkstone version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: obsidian-version
+    attributes:
+      label: Obsidian version
+      placeholder: 1.12.7
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - iPadOS
+        - iOS
+        - Android
+    validations:
+      required: true
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: Affected workflow
+      options:
+        - Text annotation
+        - Snapshot capture
+        - Snapshot drawing or editing
+        - Sidebar or Entire Vault
+        - Export
+        - Persistence, recovery, or sync conflict
+        - Install, upgrade, rollback, or uninstall
+        - Performance or accessibility
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide minimal steps using a disposable Vault and synthetic note content.
+      placeholder: |
+        1. Create a new disposable Vault.
+        2. Create a note containing…
+        3. In Reading View…
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include only logs or screenshots that contain no private Vault data.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data-safety confirmation
+      options:
+        - label:
+            I removed private note text, screenshots, sidecars, credentials, and personal Vault
+            paths.
+          required: true
+        - label: I used a backup or disposable Vault before reproducing a possible data-loss issue.
+          required: true

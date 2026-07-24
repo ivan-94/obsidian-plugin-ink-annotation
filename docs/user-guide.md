@@ -2,7 +2,7 @@
 
 ## 安装与升级
 
-发布候选包只包含 `main.js`、`manifest.json`、`styles.css` 和校验用的
+`0.1.x` 是 Beta。发布候选包只包含 `main.js`、`manifest.json`、`styles.css` 和校验用的
 `checksums.json`。手工安装时，将前三个运行时文件复制到：
 
 ```text
@@ -16,13 +16,17 @@ Annotations。升级前先关闭插件，并备份插件目录与 Vault 根目�
 回滚时恢复之前版本的三个运行时文件。当前 `0.1.x` 使用 canonical schema
 v1；不要用旧版插件打开未来版本已经迁移的数据，除非该版本的发布说明明确兼容。
 
+移动端默认使用内嵌在 `main.js` 中的
+`html-to-image`。插件不会从 CDN 下载这个库；捕获时会跳过 font 下载，把已经加载的 Vault 图片转为 data
+URL，并将 remote 或 URL-backed 资源替换为占位，避免为了截图发起新的资源请求。
+
 ## 文字标注
 
 - Reading View：选择受支持的正文文本后，使用悬浮工具条选择颜色、下划线或添加笔记。
 - 相邻同类型的简单块（例如段落到段落）可作为一条标注，渲染时会拆成各块内部的局部fragment；跨段落/列表等不同复杂块类型仍会明确拒绝，避免破坏 Markdown
   DOM。
-- Live Preview：选择文本后使用同一悬浮工具条；也可运行 `Apply last highlight to selection` 和
-  `Add note to selection` 命令。
+- Source mode 与 Live Preview 保持休眠，不提供文字标注创建。切回 Reading View 后，可使用悬浮工具条或
+  `Apply last highlight to selection`、`Add note to selection` 命令。
 - 点击正文标注、侧栏条目或 note-only 标记可打开 Inspector，编辑样式、正文和标签。
 - 锚点无法唯一恢复时会显示为
   `unanchored`，不会静默绑定到猜测文本。使用 Inspector 的 repair 流程预览并确认新目标。
@@ -48,7 +52,8 @@ v1；不要用旧版插件打开未来版本已经迁移的数据，除非该版
 - 发现同一文字标注或 Ink surface 的 iCloud 同 revision 冲突时，侧栏会显示
   `Review conflicts`。逐项比较设备、时间、内容或 Ink 缩略图后，必须明确选择一个副本；插件会写入更高 revision，并保留所有原冲突文件。若候选在确认前变化，保存会失败并要求重新审阅。
 - 文字可导出为 standalone Markdown report、Markdown highlight、footnote 或 HTML mark。
-- Ink 可导出 SVG、PNG 或 standalone HTML report。
+- Snapshot Annotation 导出为扁平化 PNG。只读兼容的旧版 Ink 可导出 SVG、PNG 或 standalone HTML
+  report。
 - 导出写入 `Inkstone Exports/`，同名文件使用数字后缀，绝不覆盖已有导出。
 
 ## 清理缓存

@@ -15,7 +15,7 @@ export function resolveDesktopElectronCaptureSubject(
 ): SnapshotCaptureSubjectHandle {
   const load = host.require;
   if (typeof load !== 'function') throw unavailable();
-  for (const moduleId of [joinModuleId('@electron', 'remote'), joinModuleId('elect', 'ron')]) {
+  for (const moduleId of ['@electron/remote', 'electron']) {
     try {
       const loaded = load(moduleId);
       const webContents = currentWebContentsFromModule(loaded);
@@ -58,10 +58,6 @@ function isWebContents(value: unknown): value is ElectronWebContentsCaptureLike 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
-}
-
-function joinModuleId(left: string, right: string): string {
-  return left.startsWith('@') ? `${left}/${right}` : `${left}${right}`;
 }
 
 function unavailable(): SnapshotCaptureError {

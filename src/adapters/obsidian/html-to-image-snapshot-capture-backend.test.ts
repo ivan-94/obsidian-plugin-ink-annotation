@@ -7,6 +7,7 @@ import {
   SnapshotCaptureBackendRegistry,
 } from './snapshot-capture-backend';
 import { HtmlToImageSnapshotCaptureBackend } from './html-to-image-snapshot-capture-backend';
+import { toEmbeddedHtmlSvg } from './embedded-html-to-image-renderer';
 
 describe('html-to-image Snapshot capture backend', () => {
   it('isolates the leased Reading DOM and returns the shared bounded PNG contract', async () => {
@@ -290,6 +291,84 @@ describe('html-to-image Snapshot capture backend', () => {
       }),
     ).resolves.toMatchObject({ backendId: 'html-to-image' });
     expect(renderToBlob).toHaveBeenCalledOnce();
+  });
+
+  it('uses the embedded renderer without refetching fonts, backgrounds, or loaded images', async () => {
+    const style = document.createElement('style');
+    style.textContent = `
+      @font-face {
+        font-family: "Remote fixture";
+        src: url("https://example.invalid/font.woff2");
+      }
+      .resource-fixture {
+        background-image: url("https://example.invalid/background.png");
+        font-family: "Remote fixture";
+      }
+    `;
+    const root = document.createElement('div');
+    root.className = 'resource-fixture';
+    root.style.backgroundImage =
+      'linear-gradient(rgb(1, 2, 3), rgb(4, 5, 6)), url("https://example.invalid/inline-background.png")';
+    root.innerHTML =
+      '<img class="local" src="app://vault/local.png"><img class="remote" src="https://example.invalid/remote.png">';
+    document.head.append(style);
+    document.body.append(root);
+    const localImage = root.querySelector('.local') as HTMLImageElement;
+    const remoteImage = root.querySelector('.remote') as HTMLImageElement;
+    Object.defineProperties(localImage, {
+      complete: { value: true },
+      naturalHeight: { value: 50 },
+      naturalWidth: { value: 80 },
+    });
+    Object.defineProperties(remoteImage, {
+      complete: { value: true },
+      currentSrc: { value: remoteImage.src },
+      naturalHeight: { value: 50 },
+      naturalWidth: { value: 80 },
+    });
+    const fetchRequest = vi.fn();
+    vi.stubGlobal('fetch', fetchRequest);
+    vi.stubGlobal('SVGImageElement', window.SVGElement);
+    const renderToBlob = vi.fn(
+      async (
+        node: HTMLElement,
+        options: {
+          filter: (node: HTMLElement) => boolean;
+          height: number;
+          pixelRatio: number;
+          skipAutoScale: boolean;
+          skipFonts?: boolean;
+          width: number;
+        },
+      ) => {
+        expect(options.skipFonts).toBe(true);
+        const svg = decodeURIComponent(await toEmbeddedHtmlSvg(node, options));
+        expect(svg).toContain('data:image/png;base64,fixture');
+        expect(svg).not.toContain('example.invalid');
+        expect(svg).toContain('linear-gradient');
+        return new Blob([pngHeader(100, 100).buffer as ArrayBuffer], { type: 'image/png' });
+      },
+    );
+    const backend = new HtmlToImageSnapshotCaptureBackend({
+      document,
+      renderToBlob,
+      resolveImageDataUrl: () => Promise.resolve('data:image/png;base64,fixture'),
+    });
+
+    try {
+      await backend.capture({
+        captureGeneration: 10,
+        desiredPixelRatio: 1,
+        signal: new AbortController().signal,
+        subject: leaseSnapshotCaptureSubject(root),
+        viewportCssRect: { height: 100, left: 0, top: 0, width: 100 },
+      });
+      expect(fetchRequest).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      root.remove();
+      style.remove();
+    }
   });
 
   it('retries once with a generated-content placeholder when direct SVG rendering fails', async () => {

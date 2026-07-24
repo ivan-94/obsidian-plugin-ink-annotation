@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify and publish immutable runtime assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Verify exact release tag
+        run: npm run verify:release-tag -- "${GITHUB_REF_NAME}"
+
+      - name: Build and verify release candidate
+        run: npm run package:rc
+
+      - name: Refuse to replace an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; release assets are immutable."
+            exit 1
+          fi
+
+      - name: Publish Obsidian runtime assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          package_directory="dist/inkstone-annotations-${GITHUB_REF_NAME}"
+          notes_file="docs/release/${GITHUB_REF_NAME}.md"
+          test -f "${notes_file}"
+          gh release create "${GITHUB_REF_NAME}" \
+            "${package_directory}/main.js#main.js" \
+            "${package_directory}/manifest.json#manifest.json" \
+            "${package_directory}/styles.css#styles.css" \
+            "${package_directory}/checksums.json#checksums.json" \
+            --notes-file "${notes_file}" \
+            --prerelease \
+            --title "Inkstone Annotations ${GITHUB_REF_NAME}" \
+            --verify-tag

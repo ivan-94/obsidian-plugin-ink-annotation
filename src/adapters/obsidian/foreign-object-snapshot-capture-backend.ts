@@ -8,13 +8,13 @@ import {
   type SnapshotCaptureRequest,
 } from './snapshot-capture-backend';
 import {
+  inlineSnapshotCaptureImages,
   inlineSnapshotCaptureComputedStyles,
-  pairSnapshotCaptureElements,
   removeSnapshotCaptureExcludedNodes,
   replaceDirectlyUnsupportedCaptureNodes,
   replaceGeneratedCaptureNodesForRetry,
-  replaceSnapshotCaptureNodeWithPlaceholder,
-  snapshotImageIsRemote,
+  resolveLoadedSnapshotImageDataUrl,
+  type SnapshotLocalImageResolver,
 } from './snapshot-dom-capture-preparation';
 
 interface ForeignObjectRasterInput {
@@ -25,7 +25,6 @@ interface ForeignObjectRasterInput {
 }
 
 type ForeignObjectRasterizer = (input: ForeignObjectRasterInput) => Promise<Uint8Array>;
-type LocalImageResolver = (image: HTMLImageElement, signal: AbortSignal) => Promise<string>;
 type SvgImageLoader = (dataUrl: string, signal: AbortSignal) => Promise<CanvasImageSource>;
 
 const CAPABILITIES = Object.freeze({
@@ -48,14 +47,14 @@ const CAPABILITIES = Object.freeze({
 export class ForeignObjectSnapshotCaptureBackend implements SnapshotCaptureBackend {
   private readonly document: Document;
   private readonly rasterizeSvg: ForeignObjectRasterizer;
-  private readonly resolveImageDataUrl: LocalImageResolver;
+  private readonly resolveImageDataUrl: SnapshotLocalImageResolver;
 
   constructor(
     input: {
       readonly document?: Document;
       readonly loadSvgImage?: SvgImageLoader;
       readonly rasterizeSvg?: ForeignObjectRasterizer;
-      readonly resolveImageDataUrl?: LocalImageResolver;
+      readonly resolveImageDataUrl?: SnapshotLocalImageResolver;
     } = {},
   ) {
     this.document = input.document ?? globalThis.document;
@@ -66,7 +65,7 @@ export class ForeignObjectSnapshotCaptureBackend implements SnapshotCaptureBacke
     this.rasterizeSvg =
       input.rasterizeSvg ??
       ((request) => rasterizeForeignObject(this.document, request, loadSvgImage));
-    this.resolveImageDataUrl = input.resolveImageDataUrl ?? resolveLocalImageDataUrl;
+    this.resolveImageDataUrl = input.resolveImageDataUrl ?? resolveLoadedSnapshotImageDataUrl;
   }
 
   describe(): SnapshotCaptureCapabilities {
@@ -85,7 +84,7 @@ export class ForeignObjectSnapshotCaptureBackend implements SnapshotCaptureBacke
     const clone = subject.cloneNode(true) as HTMLElement;
     removeSnapshotCaptureExcludedNodes(clone);
     await inlineSnapshotCaptureComputedStyles(subject, clone, request.signal);
-    await inlineLocalImages(subject, clone, request.signal, this.resolveImageDataUrl);
+    await inlineSnapshotCaptureImages(subject, clone, request.signal, this.resolveImageDataUrl);
     replaceDirectlyUnsupportedCaptureNodes(subject, clone);
     const bounds = request.subjectCssRect ?? subject.getBoundingClientRect();
     clone.removeAttribute('id');
@@ -133,59 +132,9 @@ export class ForeignObjectSnapshotCaptureBackend implements SnapshotCaptureBacke
   }
 }
 
-async function inlineLocalImages(
-  sourceRoot: HTMLElement,
-  cloneRoot: HTMLElement,
-  signal: AbortSignal,
-  resolveImageDataUrl: LocalImageResolver,
-): Promise<void> {
-  const pairs = pairSnapshotCaptureElements<HTMLImageElement>(sourceRoot, cloneRoot, 'img');
-  for (let index = 0; index < pairs.length; index += 1) {
-    if (signal.aborted) throw aborted();
-    const { clone, source } = pairs[index] as (typeof pairs)[number];
-    if (source === null) {
-      replaceSnapshotCaptureNodeWithPlaceholder(clone, clone, 'image');
-      continue;
-    }
-    if (snapshotImageIsRemote(source)) {
-      replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'remote-image');
-      continue;
-    }
-    if (!source.complete || source.naturalWidth <= 0 || source.naturalHeight <= 0) {
-      replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'local-image');
-      continue;
-    }
-    try {
-      clone.src = await resolveImageDataUrl(source, signal);
-    } catch (error) {
-      if (signal.aborted) throw aborted();
-      void error;
-      replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'local-image');
-    }
-  }
-}
-
 function serializeForeignObjectClone(clone: HTMLElement, width: number, height: number): string {
   const serialized = new XMLSerializer().serializeToString(clone);
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><foreignObject x="0" y="0" width="100%" height="100%"><div xmlns="http://www.w3.org/1999/xhtml" style="position:relative;overflow:hidden;width:${width}px;height:${height}px">${serialized}</div></foreignObject></svg>`;
-}
-
-async function resolveLocalImageDataUrl(
-  image: HTMLImageElement,
-  signal: AbortSignal,
-): Promise<string> {
-  const response = await fetch(image.currentSrc || image.src, { signal });
-  if (!response.ok) throw new Error(`Snapshot local image fetch failed: ${response.status}`);
-  const blob = await response.blob();
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error('Snapshot image encoding failed.'));
-    reader.onload = () =>
-      typeof reader.result === 'string'
-        ? resolve(reader.result)
-        : reject(new Error('Snapshot image encoding returned no data URL.'));
-    reader.readAsDataURL(blob);
-  });
 }
 
 async function rasterizeForeignObject(

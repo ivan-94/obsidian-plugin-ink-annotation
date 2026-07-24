@@ -30,6 +30,11 @@ export interface CaptureElementPair<T extends Element> {
   readonly source: T | null;
 }
 
+export type SnapshotLocalImageResolver = (
+  image: HTMLImageElement,
+  signal: AbortSignal,
+) => Promise<string>;
+
 export function removeSnapshotCaptureExcludedNodes(root: HTMLElement): void {
   for (const element of root.querySelectorAll(SNAPSHOT_CAPTURE_EXCLUDED_SELECTOR)) element.remove();
 }
@@ -92,6 +97,88 @@ export function pairSnapshotCaptureElements<T extends Element>(
     clone,
     source: sources[index] ?? null,
   }));
+}
+
+export async function inlineSnapshotCaptureImages(
+  sourceRoot: HTMLElement,
+  cloneRoot: HTMLElement,
+  signal: AbortSignal,
+  resolveImageDataUrl: SnapshotLocalImageResolver,
+): Promise<void> {
+  const pairs = pairSnapshotCaptureElements<HTMLImageElement>(sourceRoot, cloneRoot, 'img');
+  for (let index = 0; index < pairs.length; index += 1) {
+    if (signal.aborted) throw captureAborted();
+    const { clone, source } = pairs[index] as (typeof pairs)[number];
+    if (source === null) {
+      replaceSnapshotCaptureNodeWithPlaceholder(clone, clone, 'image');
+      continue;
+    }
+    if (snapshotImageIsRemote(source)) {
+      replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'remote-image');
+      continue;
+    }
+    if (!source.complete || source.naturalWidth <= 0 || source.naturalHeight <= 0) {
+      replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'local-image');
+      continue;
+    }
+    try {
+      clone.src = await resolveImageDataUrl(source, signal);
+      clone.srcset = '';
+    } catch (error) {
+      if (signal.aborted) throw captureAborted();
+      void error;
+      replaceSnapshotCaptureNodeWithPlaceholder(source, clone, 'local-image');
+    }
+  }
+}
+
+export async function resolveLoadedSnapshotImageDataUrl(
+  image: HTMLImageElement,
+  signal: AbortSignal,
+): Promise<string> {
+  if (signal.aborted) throw captureAborted();
+  const canvas = image.ownerDocument.createElement('canvas');
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const context = canvas.getContext('2d');
+  if (context === null) throw new Error('Snapshot local image Canvas 2D is unavailable.');
+  context.drawImage(image, 0, 0, image.naturalWidth, image.naturalHeight);
+  const blob = await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob(
+      (value) =>
+        value === null
+          ? reject(new Error('Snapshot local image PNG encoding failed.'))
+          : resolve(value),
+      'image/png',
+    ),
+  );
+  if (signal.aborted) throw captureAborted();
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    const cleanup = (): void => {
+      reader.onerror = null;
+      reader.onload = null;
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = (): void => {
+      cleanup();
+      reader.abort();
+      reject(captureAborted());
+    };
+    reader.onerror = () => {
+      const error = reader.error ?? new Error('Snapshot image encoding failed.');
+      cleanup();
+      reject(error);
+    };
+    reader.onload = () => {
+      const result = reader.result;
+      cleanup();
+      if (typeof result === 'string') resolve(result);
+      else reject(new Error('Snapshot image encoding returned no data URL.'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    reader.readAsDataURL(blob);
+  });
 }
 
 export function replaceDirectlyUnsupportedCaptureNodes(
@@ -188,4 +275,8 @@ function resolvedDimension(
 
 function nextTask(): Promise<void> {
   return new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+}
+
+function captureAborted(): SnapshotCaptureError {
+  return new SnapshotCaptureError('aborted', 'Snapshot capture was cancelled.');
 }
