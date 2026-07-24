@@ -1,6 +1,6 @@
 {
   "name": "inkstone-annotations",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Highlight and underline mutable Markdown, add notes, and draw on stable snapshots.",
   "author": "Ivan",
   "license": "MIT",
@@ -12,7 +12,8 @@
   "scripts": {
     "build": "npm run typecheck && npm run typecheck:obsidian-1.7.2 && node esbuild.config.mjs production && npm run check:production-bundle && npm run check:mobile && npm run check:retired-document-ink",
     "build:web-hat": "npm run typecheck && npm run typecheck:obsidian-1.7.2 && node esbuild.config.mjs web-hat && npm run check:mobile && npm run check:retired-document-ink",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run test:performance && npm run build",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run check:i18n && npm run test:coverage && npm run test:performance && npm run build",
+    "check:i18n": "vitest run src/ui/i18n src/adapters/obsidian/obsidian-locale.test.ts --coverage=false",
     "check:mobile": "node scripts/check-mobile-bundle.mjs",
     "check:production-bundle": "node scripts/check-production-bundle.mjs",
     "check:retired-document-ink": "node scripts/check-retired-document-ink.mjs",

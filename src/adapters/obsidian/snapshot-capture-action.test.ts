@@ -22,11 +22,22 @@ describe('Snapshot capture Reading View action', () => {
     const view = { addAction, contentEl };
     const actions = new Map<typeof view, HTMLElement>();
 
-    const first = ensureSnapshotCaptureAction({ actions, onActivate: vi.fn(), view });
-    const second = ensureSnapshotCaptureAction({ actions, onActivate: vi.fn(), view });
+    const first = ensureSnapshotCaptureAction({
+      actionLabel: '截取并标注',
+      actions,
+      onActivate: vi.fn(),
+      view,
+    });
+    const second = ensureSnapshotCaptureAction({
+      actionLabel: '截取并标注',
+      actions,
+      onActivate: vi.fn(),
+      view,
+    });
 
     expect(first).toBe(second);
-    expect(addAction).toHaveBeenCalledOnce();
+    expect(addAction).toHaveBeenCalledWith('camera', '截取并标注', expect.any(Function));
+    expect(first.getAttribute('aria-label')).toBe('截取并标注');
     expect(viewActions.querySelectorAll('[data-inkstone-snapshot-action]')).toHaveLength(1);
     expect(contentEl.querySelector('[data-inkstone-snapshot-action]')).toBeNull();
   });
@@ -37,8 +48,18 @@ describe('Snapshot capture Reading View action', () => {
     const first = createView();
     const second = createView();
 
-    ensureSnapshotCaptureActions({ actions, onActivate: vi.fn(), views: [first, second] });
-    ensureSnapshotCaptureActions({ actions, onActivate: vi.fn(), views: [first, second] });
+    ensureSnapshotCaptureActions({
+      actionLabel: 'Capture & annotate',
+      actions,
+      onActivate: vi.fn(),
+      views: [first, second],
+    });
+    ensureSnapshotCaptureActions({
+      actionLabel: 'Capture & annotate',
+      actions,
+      onActivate: vi.fn(),
+      views: [first, second],
+    });
 
     expect(first.addAction).toHaveBeenCalledOnce();
     expect(second.addAction).toHaveBeenCalledOnce();

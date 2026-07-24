@@ -15,6 +15,7 @@ import {
   type QuickToolbarAction,
   type QuickToolbarLayout,
 } from '../../ui/quick-highlight-toolbar';
+import type { I18n } from '../../ui/i18n/contract';
 import { renderHighlight } from '../../ui/reading-highlight-renderer';
 import { captureReadingSelection } from './reading-selection';
 import {
@@ -98,6 +99,7 @@ export class ReadingAnnotationController {
   constructor(input: {
     readonly collapseSelection: () => void;
     readonly document: Document;
+    readonly i18n?: I18n;
     readonly onCommitted?: (record: TextAnnotationRecord) => void;
     readonly onIssue?: (error: unknown) => void;
     readonly onOpenDetails?: (
@@ -133,6 +135,7 @@ export class ReadingAnnotationController {
     this.recentStyleId = defaultStyleId;
     this.toolbar = new QuickHighlightToolbar({
       document: input.document,
+      ...(input.i18n === undefined ? {} : { i18n: input.i18n }),
       ...(input.toolbarLayout === undefined ? {} : { layout: input.toolbarLayout }),
       onAction: async (action) => this.commit(action),
       onDismiss: () => {

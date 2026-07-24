@@ -28,6 +28,7 @@ Inkstone Annotations plugin.
 - [Entire Vault demand-bounded local Catalog and automated Gate — reassessed 2026-07-23](2026-07-19-entire-vault-demand-bounded-index.md)
 - [Preact UI architecture refactor specification](2026_07_15_refactor_to_preact.md)
 - [Production and Community market release](2026-07-24-production-market-release.md)
+- [Inkstone Annotations internationalization](2026-07-24-inkstone-internationalization.md)
 
 Historical plan updates that have already been reconciled into the master plan are retained here for
 traceability:
@@ -89,6 +90,7 @@ are no longer valid sources of truth.
 - `docs/specs/2026-07-19-entire-vault-demand-bounded-index.md`
 - `docs/specs/2026_07_15_refactor_to_preact.md`
 - `docs/specs/2026-07-24-production-market-release.md`
+- `docs/specs/2026-07-24-inkstone-internationalization.md`
 - `docs/specs/2026-07-15-preact-execution-plan-update.md`
 - `docs/specs/assets/obsidian-annotation-plugin-ui-v2/`
 
@@ -139,6 +141,9 @@ are no longer valid sources of truth.
   `inkstone-annotations`, and the MIT License; separates local release foundations from external
   publication; and defines Beta, policy audit, real-device HAT, Community submission, and maintained
   production gates.
+- The 2026-07-24 internationalization specification keeps English as the source language, adds
+  Simplified Chinese first, follows Obsidian locale with a 1.7.2-compatible fallback, and keeps
+  localization out of canonical annotation data.
 - Supporting design images moved with the plan so all relative references remain repository-local.
 
 ### Verification evidence

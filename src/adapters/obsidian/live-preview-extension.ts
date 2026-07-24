@@ -22,6 +22,7 @@ import {
 import { DEFAULT_STYLE_PRESETS, type StylePreset } from '../../domain/style-preset';
 import type { TextAnnotationRecord, TextStructuralScope } from '../../domain/text-annotation';
 import { QuickHighlightToolbar, type QuickToolbarAction } from '../../ui/quick-highlight-toolbar';
+import type { I18n } from '../../ui/i18n/contract';
 
 export interface LivePreviewContext {
   readonly filePath: string | null;
@@ -87,6 +88,7 @@ export class LivePreviewAnnotationCoordinator {
     readonly contextForState: (state: EditorState) => LivePreviewContext;
     readonly document?: Document;
     readonly enabled?: boolean;
+    readonly i18n?: I18n;
     readonly onAnnotationHit?: (annotationIds: readonly string[], invoker: HTMLElement) => void;
     readonly onAnnotationsChanged?: (filePath: string) => void | Promise<void>;
     readonly onIssue?: (error: unknown) => void;
@@ -115,6 +117,7 @@ export class LivePreviewAnnotationCoordinator {
         ? null
         : new QuickHighlightToolbar({
             document: input.document,
+            ...(input.i18n === undefined ? {} : { i18n: input.i18n }),
             onAction: (action) => this.handleToolbarAction(action),
             onDismiss: () => this.activeInstance()?.view.focus(),
             onError: this.onIssue,
