@@ -594,7 +594,9 @@ export class InkSurfaceRepository {
     }
     const loaded = await this.listSurfaces(filePath);
     const summaries = summarizeLoadedSurfaces(loaded);
-    await this.writeSummaryIndex(filePath, summaries);
+    if (loaded.records.length > 0) {
+      await this.writeSummaryIndex(filePath, summaries);
+    }
     return sortSummaries(summaries);
   }
 

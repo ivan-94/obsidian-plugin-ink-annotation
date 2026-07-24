@@ -1350,6 +1350,16 @@ describe('ink surface repository contract', () => {
     expect(store.readCountBySuffix(`/surfaces/${surface.id}.json`)).toBe(0);
   });
 
+  it('does not create an empty summary sidecar when an unannotated note is only read', async () => {
+    const store = new MemoryTextFileStore();
+    const repository = new InkSurfaceRepository(store);
+
+    await expect(repository.listSurfaceSummaries('Unannotated.md')).resolves.toEqual([]);
+
+    expect(store.readBySuffix('/ink-summaries.json')).toBeNull();
+    expect(store.writeCountBySuffix('/ink-summaries.json')).toBe(0);
+  });
+
   it('stores joined physical geometry in every cross-surface thumbnail summary', async () => {
     const { repository, surface } = await createFixture();
     const top: InkSurfaceRecord = {
