@@ -4,6 +4,49 @@ import type { CatalogResultMeta } from './vault-catalog';
 import { VaultCatalogSession, type VaultCatalogSessionStore } from './vault-catalog-session';
 
 describe('VaultCatalogSession', () => {
+  it('reconciles once before serving the first Catalog query of a plugin session', async () => {
+    const meta: CatalogResultMeta = { freshness: 'current', projectionEpoch: 1 };
+    let notes: Awaited<ReturnType<VaultCatalogSessionStore['recentNotes']>>['notes'] = [];
+    const store: VaultCatalogSessionStore = {
+      close: vi.fn(),
+      entriesForNote: vi.fn(),
+      recentNotes: vi.fn(() => Promise.resolve({ meta, notes })),
+      recordNoteOpened: vi.fn(),
+      search: vi.fn(),
+      suggestFacet: vi.fn(),
+    };
+    const openCatalog = vi.fn(() => Promise.resolve(store));
+    const reconcile = vi.fn(() => {
+      notes = [
+        {
+          activityAt: '2026-07-25T04:20:09.647Z',
+          annotationCount: 1,
+          conflictCount: 0,
+          filePath: 'Reports/Annotated.md',
+          folder: 'Reports',
+          legacyInkCount: 0,
+          lastAnnotatedAt: '2026-07-25T04:20:09.647Z',
+          noteId: 'note-annotated',
+          problemCount: 0,
+          snapshotCount: 0,
+          textCount: 1,
+          title: 'Annotated',
+        },
+      ];
+      return Promise.resolve();
+    });
+    const session = new VaultCatalogSession({ openCatalog, reconcile });
+
+    await expect(session.recentNotes()).resolves.toMatchObject({
+      notes: [{ filePath: 'Reports/Annotated.md' }],
+    });
+    session.close();
+    await session.recentNotes();
+
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(openCatalog).toHaveBeenCalledTimes(2);
+  });
+
   it('keeps only 20 note-open hints without opening IndexedDB while the Catalog is closed', async () => {
     const opened: Array<{ readonly noteId: string; readonly openedAt: string }> = [];
     const meta: CatalogResultMeta = { freshness: 'current', projectionEpoch: 0 };

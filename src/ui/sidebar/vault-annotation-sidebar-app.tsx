@@ -70,6 +70,7 @@ export interface VaultAnnotationSidebarAppProps {
   readonly onExportSnapshot: (summary: SnapshotAnnotationSummary) => void;
   readonly onOpen: (entry: AnnotationIndexEntry, invoker: HTMLElement) => void;
   readonly onPreviewSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  readonly onRefresh: () => void | Promise<void>;
   readonly onRelinkSnapshot: (summary: SnapshotAnnotationSummary) => void;
   readonly onRestoreSnapshot: (summary: SnapshotAnnotationSummary) => void;
   readonly onSelectSnapshotSource: (summary: SnapshotAnnotationSummary) => void;
@@ -208,6 +209,7 @@ function VaultReadyApp(props: VaultAnnotationSidebarAppProps) {
 function VaultHeader({
   entries,
   onExport,
+  onRefresh,
   onRenderNow,
   showScope,
   state,
@@ -242,7 +244,7 @@ function VaultHeader({
         <button
           aria-label="Refresh annotation index"
           className="inkstone-icon-button"
-          onClick={onRenderNow}
+          onClick={() => void onRefresh()}
           type="button"
         >
           <ObsidianIcon icon="refresh-cw" />

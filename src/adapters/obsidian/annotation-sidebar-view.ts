@@ -730,6 +730,7 @@ export class AnnotationSidebarView extends ItemView {
       },
       onOpen: (entry) => this.commands.navigateToVaultAnnotation(entry),
       onPreviewSnapshot: (summary) => this.snapshots?.preview(summary),
+      onRefresh: () => this.refreshEntireVaultFromCanonical(),
       onRelinkSnapshot: (summary) => this.snapshots?.relink(summary),
       onRestoreSnapshot: (summary) => this.snapshots?.restore(summary),
       onSelectSnapshotSource: (summary) => this.snapshots?.jump(summary),
@@ -822,6 +823,12 @@ export class AnnotationSidebarView extends ItemView {
         component.showUnavailable(storageFailureMessage(error));
       }
     }
+  }
+
+  private async refreshEntireVaultFromCanonical(): Promise<void> {
+    this.legacyVaultFresh = false;
+    this.requestVaultCatalogReconcile();
+    await this.refreshVaultCatalog();
   }
 
   private markCanonicalMutation(filePath: string, currentFilePath: string | null): void {

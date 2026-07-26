@@ -41,6 +41,7 @@ export class VaultCatalogSession implements VaultCatalogQueryPort {
   private openStore: Promise<VaultCatalogSessionStore> | null = null;
   private readonly recentNoteHints = new Map<string, string>();
   private readonly dirtyPaths = new Set<string>();
+  private reconciledThisSession = false;
   private needsReconcile = false;
   private writeLane: Promise<void> = Promise.resolve();
 
@@ -143,7 +144,21 @@ export class VaultCatalogSession implements VaultCatalogQueryPort {
     if (this.openStore === null) {
       const abort = new AbortController();
       this.lifecycleAbort = abort;
-      this.openStore = this.openCatalog(abort.signal);
+      this.openStore = this.openCatalog(abort.signal).then(async (store) => {
+        if (this.reconciledThisSession || this.reconcile === undefined) {
+          return store;
+        }
+        this.needsReconcile = false;
+        this.dirtyPaths.clear();
+        try {
+          await this.reconcile(store, abort.signal);
+          this.reconciledThisSession = true;
+        } catch (error) {
+          this.needsReconcile = true;
+          throw error;
+        }
+        return store;
+      });
     }
     return this.openStore;
   }

@@ -283,10 +283,12 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
           });
     const vaultCatalogSession = new VaultCatalogSession({
       onIssue: (error) => console.warn('[Inkstone Annotations]', error),
-      openCatalog: async (signal) => {
+      openCatalog: (signal) => {
         if (vaultCatalog === null) throw new Error('Vault Catalog IndexedDB is unavailable.');
-        await vaultCatalogReconciler.ensureInitialized(vaultCatalog, signal);
-        return vaultCatalog;
+        if (signal?.aborted === true) {
+          throw new DOMException('Vault Catalog session was closed.', 'AbortError');
+        }
+        return Promise.resolve(vaultCatalog);
       },
       projectPaths: async (_store, paths, signal) => {
         if (vaultCatalog === null) throw new Error('Vault Catalog IndexedDB is unavailable.');

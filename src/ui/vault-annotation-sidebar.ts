@@ -54,6 +54,7 @@ export class VaultAnnotationSidebar {
   private readonly onOpen: (entry: AnnotationIndexEntry, invoker: HTMLElement) => void;
   private readonly onExportSnapshot: (summary: SnapshotAnnotationSummary) => void;
   private readonly onPreviewSnapshot: (summary: SnapshotAnnotationSummary) => void;
+  private readonly onRefresh: () => void | Promise<void>;
   private readonly onRelinkSnapshot: (summary: SnapshotAnnotationSummary) => void;
   private readonly onRestoreSnapshot: (summary: SnapshotAnnotationSummary) => void;
   private readonly onSelectSnapshotSource: (summary: SnapshotAnnotationSummary) => void;
@@ -90,6 +91,7 @@ export class VaultAnnotationSidebar {
     readonly onExportSnapshot?: (summary: SnapshotAnnotationSummary) => void;
     readonly onOpen?: (entry: AnnotationIndexEntry, invoker: HTMLElement) => void;
     readonly onPreviewSnapshot?: (summary: SnapshotAnnotationSummary) => void;
+    readonly onRefresh?: () => void | Promise<void>;
     readonly onRelinkSnapshot?: (summary: SnapshotAnnotationSummary) => void;
     readonly onRestoreSnapshot?: (summary: SnapshotAnnotationSummary) => void;
     readonly onSelectSnapshotSource?: (summary: SnapshotAnnotationSummary) => void;
@@ -124,6 +126,7 @@ export class VaultAnnotationSidebar {
     this.onExportSnapshot = input.onExportSnapshot ?? (() => undefined);
     this.onOpen = input.onOpen ?? (() => undefined);
     this.onPreviewSnapshot = input.onPreviewSnapshot ?? (() => undefined);
+    this.onRefresh = input.onRefresh ?? (() => this.refreshCatalog());
     this.onRelinkSnapshot = input.onRelinkSnapshot ?? (() => undefined);
     this.onRestoreSnapshot = input.onRestoreSnapshot ?? (() => undefined);
     this.onSelectSnapshotSource = input.onSelectSnapshotSource ?? (() => undefined);
@@ -252,6 +255,7 @@ export class VaultAnnotationSidebar {
       onExportSnapshot: this.onExportSnapshot,
       onOpen: this.onOpen,
       onPreviewSnapshot: this.onPreviewSnapshot,
+      onRefresh: this.onRefresh,
       onRelinkSnapshot: this.onRelinkSnapshot,
       onRestoreSnapshot: this.onRestoreSnapshot,
       onSelectSnapshotSource: this.onSelectSnapshotSource,

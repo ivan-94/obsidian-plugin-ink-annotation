@@ -34,6 +34,43 @@ vi.mock('obsidian', async (importOriginal) => {
 describe('Annotation sidebar scope switching', () => {
   afterEach(() => document.body.replaceChildren());
 
+  it('requests canonical reconciliation from the Entire Vault refresh button', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const requestVaultCatalogReconcile = vi.fn();
+    const recentNotes = vi.fn().mockResolvedValue({
+      meta: { freshness: 'current', projectionEpoch: 1 },
+      notes: [],
+    });
+    const catalog: VaultCatalogQueryPort = {
+      entriesForNote: vi.fn(),
+      recentNotes,
+      search: vi.fn(),
+      suggestFacet: vi.fn(),
+    };
+    const view = new AnnotationSidebarView({ contentEl: container } as never, {
+      commands: sidebarCommands(),
+      inkRepository: { listSurfaceSummaries: () => Promise.resolve([]) } as never,
+      requestVaultCatalogReconcile,
+      service: {
+        listCurrentFile: () =>
+          Promise.resolve({ conflicts: [], issues: [], model: { groups: [], total: 0 } }),
+      } as never,
+      stylePresets: [],
+      vaultCatalog: catalog,
+    });
+    await view.onOpen();
+    clickScope(container, 'Entire Vault');
+    await vi.waitFor(() => expect(recentNotes).toHaveBeenCalled());
+
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Refresh annotation index"]')
+      ?.click();
+
+    await vi.waitFor(() => expect(requestVaultCatalogReconcile).toHaveBeenCalledTimes(1));
+    await view.onClose();
+  });
+
   it('keeps one shell while reusing a fresh Vault index across scope switches', async () => {
     const container = document.createElement('div');
     document.body.append(container);
