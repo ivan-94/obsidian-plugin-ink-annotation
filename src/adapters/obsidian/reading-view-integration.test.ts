@@ -568,6 +568,47 @@ describe('Reading View integration', () => {
     integration.dispose();
   });
 
+  it('opens the mobile action bar after native selection handles stabilize', async () => {
+    const source = 'Native handle selection remains annotatable.';
+    const integration = new ReadingViewIntegration({
+      document,
+      isMobile: true,
+      service: new AnnotationService({
+        repository: new SidecarRepository(new MemoryTextFileStore()),
+      }),
+    });
+    const root = document.createElement('p');
+    root.textContent = source;
+    document.body.append(root);
+    await integration.mountSection({
+      filePath: 'Native Handles.md',
+      getFullSource: () => Promise.resolve(source),
+      getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: source }),
+      root,
+    });
+    const text = root.firstChild;
+    if (!(text instanceof Text)) {
+      throw new Error('Fixture did not create text.');
+    }
+    const range = document.createRange();
+    range.setStart(text, 0);
+    range.setEnd(text, 'Native handle selection'.length);
+    document.getSelection()?.addRange(range);
+
+    document.dispatchEvent(new Event('selectionchange'));
+    expect(document.querySelector('[data-inkstone-quick-toolbar]')).toBeNull();
+    await vi.waitFor(() =>
+      expect(
+        document
+          .querySelector('[data-inkstone-quick-toolbar]')
+          ?.classList.contains('inkstone-quick-toolbar--mobile-action-bar'),
+      ).toBe(true),
+    );
+
+    integration.dispose();
+    document.getSelection()?.removeAllRanges();
+  });
+
   it('captures a replacement target for repair without opening the creation toolbar or writing', async () => {
     const source = 'Choose this replacement target.';
     const store = new MemoryTextFileStore();

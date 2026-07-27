@@ -55,11 +55,14 @@ interface ReadingViewDelegate {
   sectionRoot: HTMLElement;
 }
 
+const MOBILE_SELECTION_STABILIZATION_MS = 120;
+
 export class ReadingViewIntegration {
   private static readonly MAX_SOURCE_ARTIFACTS = 8;
 
   private readonly controller: ReadingAnnotationController;
   private readonly document: Document;
+  private readonly isMobile: boolean;
   private readonly onIssue: (error: unknown) => void;
   private readonly onAnnotationHit: (
     annotationIds: readonly string[],
@@ -113,6 +116,7 @@ export class ReadingViewIntegration {
   private sectionPruneTimeout: ReturnType<typeof setTimeout> | null = null;
   private readonly sections = new Map<HTMLElement, ReadingSectionMountInput>();
   private readonly service: AnnotationService;
+  private selectionStabilizationTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(input: {
     readonly document: Document;
@@ -133,6 +137,7 @@ export class ReadingViewIntegration {
     readonly sourceProjectionCache?: SourceProjectionCache;
   }) {
     this.document = input.document;
+    this.isMobile = input.isMobile === true;
     this.now = input.now ?? (() => performance.now());
     this.onAnnotationHit = input.onAnnotationHit ?? (() => undefined);
     this.onIssue = input.onIssue ?? (() => undefined);
@@ -152,6 +157,9 @@ export class ReadingViewIntegration {
         : new MutationObserverConstructor(() => this.scheduleDisconnectedSectionPrune());
     if (this.document.body !== null) {
       this.sectionObserver?.observe(this.document.body, { childList: true, subtree: true });
+    }
+    if (this.isMobile) {
+      this.document.addEventListener('selectionchange', this.onSelectionChange);
     }
     const onRecordsChanged = input.onRecordsChanged ?? (() => undefined);
     this.controller = new ReadingAnnotationController({
@@ -229,6 +237,13 @@ export class ReadingViewIntegration {
 
   dispose(): void {
     this.sectionObserver?.disconnect();
+    if (this.isMobile) {
+      this.document.removeEventListener('selectionchange', this.onSelectionChange);
+    }
+    if (this.selectionStabilizationTimeout !== null) {
+      clearTimeout(this.selectionStabilizationTimeout);
+      this.selectionStabilizationTimeout = null;
+    }
     if (this.sectionPruneTimeout !== null) clearTimeout(this.sectionPruneTimeout);
     this.sectionPruneTimeout = null;
     for (const cleanup of [...this.sectionCleanups]) {
@@ -250,6 +265,16 @@ export class ReadingViewIntegration {
     this.pulseTimeouts.clear();
     this.controller.dispose();
   }
+
+  private readonly onSelectionChange = (): void => {
+    if (this.selectionStabilizationTimeout !== null) {
+      clearTimeout(this.selectionStabilizationTimeout);
+    }
+    this.selectionStabilizationTimeout = setTimeout(() => {
+      this.selectionStabilizationTimeout = null;
+      void this.prepareCurrentSelection().catch(this.onIssue);
+    }, MOBILE_SELECTION_STABILIZATION_MS);
+  };
 
   private scheduleDisconnectedSectionPrune(): void {
     if (this.sectionPruneTimeout !== null) clearTimeout(this.sectionPruneTimeout);

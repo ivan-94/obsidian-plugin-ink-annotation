@@ -16,6 +16,7 @@ import {
   AnnotationSidebarView,
 } from './adapters/obsidian/annotation-sidebar-view';
 import { ReadingViewIntegration } from './adapters/obsidian/reading-view-integration';
+import { refreshAlreadyOpenReadingViews } from './adapters/obsidian/reading-view-startup';
 import { ObsidianSnapshotAnnotationManager } from './adapters/obsidian/snapshot-annotation-manager';
 import { ElectronSnapshotCaptureBackend } from './adapters/obsidian/electron-snapshot-capture-backend';
 import { resolveDesktopElectronCaptureSubject } from './adapters/obsidian/desktop-electron-capture-subject';
@@ -1189,6 +1190,21 @@ export default class InkstoneAnnotationsPlugin extends Plugin {
         root: element,
       });
       context.addChild(new ReadingSectionChild(element, cleanup));
+    });
+    this.app.workspace.onLayoutReady(() => {
+      refreshAlreadyOpenReadingViews(
+        this.app.workspace.getLeavesOfType('markdown').flatMap((leaf) => {
+          const view = leaf.view;
+          return view instanceof MarkdownView
+            ? [
+                {
+                  mode: view.getMode(),
+                  rerender: (full: boolean) => view.previewMode.rerender(full),
+                },
+              ]
+            : [];
+        }),
+      );
     });
 
     this.addSettingTab(new InkstoneSettingTab(this.app, this, i18n));

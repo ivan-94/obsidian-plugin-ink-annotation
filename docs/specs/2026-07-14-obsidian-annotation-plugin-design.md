@@ -373,6 +373,8 @@ instance model.
 ### Reading View
 
 - Use Markdown post-processing and section information to render only relevant annotations.
+- After registering the Markdown postprocessor, fully rerender already-open Reading Views once so
+  their existing sections enter the same mount lifecycle as views opened later.
 - Build an interval render plan before mutating the DOM.
 - Split cross-node or cross-block annotations into text-node-local fragments.
 - Do not use one cross-block `Range.extractContents()` wrapper that can invalidate heading, list,
@@ -380,6 +382,8 @@ instance model.
 - Clean up plugin-owned wrappers/listeners on rerender and unload.
 - Cache source line offsets and mapping artifacts by file revision.
 - Render only annotations intersecting the current rendered section.
+- On mobile, observe native selection changes at the document boundary and wait briefly for drag
+  handles to stabilize before resolving the selection and presenting the touch action bar.
 
 ### Editing View
 
@@ -1040,6 +1044,9 @@ pass:
   Save closes the inspector, while a failed dismissal abandons invalid changes and hides it.
 - User follow-up in the 2026-07-17 Codex conversation: keep the shared inspector visible above the
   iPad software keyboard and prevent long overlap-choice text from overflowing its row.
+- User report and physical-iPad acceptance on 2026-07-27: a selection made in a Reading View that
+  was already open when the plugin loaded must show the mobile annotation action bar after native
+  drag handles stabilize.
 - [Apple Books on iPad](https://support.apple.com/en-ae/guide/ipad/ipade2f8027b/ipados):
   selection-adjacent Highlight, Add Note, Translate, Search, Copy, and Share actions.
 - [Apple Books on Mac](https://support.apple.com/en-kw/guide/books/ibks3975f128/mac): select text,
@@ -1145,13 +1152,17 @@ pass:
 - The 2026-07-17 annotation editor and overlap-choice follow-up passed focused DOM/state/CSS tests,
   the full 103-file / 718 test coverage suite, 10 performance tests, formatting, lint, typecheck,
   production/mobile build, `git diff --check`, and development Vault installation.
+- The 2026-07-27 Reading View startup/mobile-selection correction passed 4 focused files / 48 tests
+  and the full 131-file / 918-test coverage suite plus 11 performance tests. The packaged runtime
+  was synced to a physical iPad, read back with matching hashes, reloaded, and accepted by the
+  product owner.
 
 ### Open Questions / Risks
 
 - Exact visual tokens, component dimensions, motion values, and high-fidelity desktop/iPad designs
   are not selected.
-- Real iPad pointer, scrolling, palm, native selection-menu collision, safe-area, split-view, and
-  keyboard behavior is unverified.
+- Broader iPad pointer, scrolling, palm, native selection-menu collision, safe-area, split-view, and
+  keyboard combinations remain unverified beyond the accepted text-selection action-bar path.
 - Fixed-layout typography consistency and acceptable scaling limits across devices are unverified.
 - The exact bounded-surface partitioning algorithm and cross-boundary stroke-fragment contract
   require a prototype.
