@@ -310,6 +310,89 @@ describe('Reading View integration', () => {
     readingView.remove();
   });
 
+  it('keeps Reading View annotations interactive after a background-length postprocessor disconnect', async () => {
+    vi.useFakeTimers();
+    const integration = createIntegration(new MemoryTextFileStore());
+    const readingView = document.createElement('div');
+    try {
+      const source = 'Backgrounded paragraph remains selectable.';
+      readingView.className = 'markdown-reading-view';
+      const originalRoot = document.createElement('section');
+      originalRoot.innerHTML = `<p>${source}</p>`;
+      readingView.append(originalRoot);
+      document.body.append(readingView);
+      await integration.mountSection({
+        filePath: 'Backgrounded.md',
+        getFullSource: () => Promise.resolve(source),
+        getSectionInfo: () => ({ lineEnd: 0, lineStart: 0, text: source }),
+        root: originalRoot,
+      });
+      const resumedRoot = document.createElement('section');
+      const paragraph = originalRoot.querySelector('p');
+      if (paragraph === null || paragraph.firstChild === null)
+        throw new Error('Missing paragraph.');
+      resumedRoot.append(paragraph);
+      originalRoot.remove();
+      readingView.append(resumedRoot);
+
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      const range = document.createRange();
+      range.setStart(paragraph.firstChild, 0);
+      range.setEnd(paragraph.firstChild, 'Backgrounded'.length);
+      document.getSelection()?.addRange(range);
+      paragraph.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      await vi.waitFor(() =>
+        expect(document.querySelector('button[aria-label="Highlight: Sun"]')).not.toBeNull(),
+      );
+    } finally {
+      integration.dispose();
+      document.getSelection()?.removeAllRanges();
+      readingView.remove();
+      vi.useRealTimers();
+    }
+  });
+
+  it('rebinds a Reading View selection after Obsidian replaces cached virtualized blocks', async () => {
+    const source = 'First paragraph.\n\nSecond paragraph.';
+    const integration = createIntegration(new MemoryTextFileStore());
+    const readingView = document.createElement('div');
+    readingView.className = 'markdown-reading-view';
+    const section = document.createElement('section');
+    section.innerHTML = '<p>First paragraph.</p>';
+    readingView.append(section);
+    document.body.append(readingView);
+
+    try {
+      await integration.mountSection({
+        filePath: 'Virtualized cache.md',
+        getFullSource: () => Promise.resolve(source),
+        getSectionInfo: (element) =>
+          element.textContent === 'First paragraph.'
+            ? { lineEnd: 0, lineStart: 0, text: 'First paragraph.' }
+            : { lineEnd: 2, lineStart: 2, text: 'Second paragraph.' },
+        root: section,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      selectText(section.querySelector('p'), 'First');
+      await expect(integration.captureCurrentSelection()).resolves.toBeTruthy();
+      document.getSelection()?.removeAllRanges();
+
+      section.innerHTML = '<p>Second paragraph.</p>';
+      await Promise.resolve();
+      selectText(section.querySelector('p'), 'Second');
+
+      await expect(integration.captureCurrentSelection()).resolves.toMatchObject({
+        target: { quote: { exact: 'Second' } },
+      });
+    } finally {
+      document.getSelection()?.removeAllRanges();
+      integration.dispose();
+      readingView.remove();
+    }
+  });
+
   it('restores highlights after Obsidian replaces and unloads one postprocessor root', async () => {
     const source = 'First paragraph.\n\nSecond paragraph.';
     const store = new MemoryTextFileStore();
@@ -1095,6 +1178,15 @@ function createSection(): HTMLElement {
   root.innerHTML = '<p>Mutable <strong>Markdown</strong> remains readable.</p>';
   document.body.append(root);
   return root;
+}
+
+function selectText(element: Element | null, exact: string): void {
+  const text = element?.firstChild;
+  if (!(text instanceof Text)) throw new Error('Selection fixture is missing text.');
+  const range = document.createRange();
+  range.setStart(text, 0);
+  range.setEnd(text, exact.length);
+  document.getSelection()?.addRange(range);
 }
 
 function mountedSectionCount(integration: ReadingViewIntegration): number {

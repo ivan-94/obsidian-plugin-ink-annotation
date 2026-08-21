@@ -34,6 +34,9 @@ annotation refresh work caused by typing or editor autosave.
 ### Returning to Reading View
 
 - Re-register document-attached actions and discover Ink only after the current Reading View exists.
+- If Obsidian disconnects a post-processor section during backgrounding or Reading View
+  virtualization while the owning Reading View remains connected, preserve the view-level selection
+  delegate until that view disconnects or a replacement section takes ownership.
 - A cleaned preview section must not leave a delegate holding its source context. During the remount
   gap, selection is ignored rather than mapped against an edited, stale Markdown source.
 - Once the new section mounts, text selection uses the latest section/source context and the normal
@@ -54,11 +57,15 @@ Reading View is active.
   unsaved Ink still follows the existing fail-safe persistence contract.
 - Switching back to Reading View restores text selection and Ink entry from the current rendered
   source without the false `This selection is ambiguous in the Markdown source.` message.
+- A background-length post-processor disconnect does not make the still-connected Reading View lose
+  its text-selection actions.
 
 ## Source Manifest
 
 ### Sources
 
+- User report and Obsidian 1.13.7 screenshots on 2026-08-21 that text annotation controls and marks
+  could disappear after focus loss or app backgrounding, especially on iPad.
 - User instruction on 2026-07-17 in the current Codex task: editing mode feels slower with the
   plugin enabled and text selection/Ink must be completely disabled there.
 - User screenshot from the same task:
@@ -85,6 +92,9 @@ Reading View is active.
 
 ### Verification evidence
 
+- A 2026-08-21 lifecycle regression covers a post-processor section moved out of its original root,
+  followed by a background-length cleanup interval, and proves the retained Reading View delegate
+  still opens selection actions.
 - TDD regressions cover stale Reading View remounts, inert editor behavior, active-file modify
   policy, and Ink discovery/detachment across editing-mode transitions.
 - `npm run check` passed on 2026-07-17: formatting, ESLint, TypeScript, 101 test files / 693 tests,

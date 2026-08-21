@@ -126,13 +126,22 @@ export function bindReadingBlocks(input: {
     const range = input.sectionRange(element);
     const kind = readingBlockKind(element);
     const visibleText = visible[elementIndex]?.text ?? '';
-    return input.projection.blocks.map(
+    const global = input.projection.blocks.map(
       (block) =>
         generated[elementIndex] !== true &&
         block.kind === kind &&
-        block.visibleText === visibleText &&
-        (range === null || (block.sourceStart >= range.start && block.sourceEnd <= range.end)),
+        block.visibleText === visibleText,
     );
+    if (range === null) return global;
+    // Section metadata is a host-provided hint and can briefly lag a Reading View rerender. Use it
+    // when it identifies candidates, otherwise let global ordering prove a unique binding.
+    const withinSection = input.projection.blocks.map(
+      (block, blockIndex) =>
+        global[blockIndex] === true &&
+        block.sourceStart >= range.start &&
+        block.sourceEnd <= range.end,
+    );
+    return withinSection.some(Boolean) ? withinSection : global;
   });
   const prefix = buildPrefixAlignment(compatible);
   const suffix = buildSuffixAlignment(compatible);

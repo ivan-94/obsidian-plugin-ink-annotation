@@ -384,9 +384,10 @@ The binder must collect only text owned by the candidate block:
 
 1. Resolve the nearest supported semantic DOM block for each captured selection fragment.
 2. Read section information immediately before candidate resolution. Treat null or stale data as a
-   missing hint, not as permission to scan globally.
-3. Restrict candidates to the current source section when valid; otherwise use a bounded neighboring
-   block window derived from already-bound siblings.
+   missing hint rather than an authoritative exclusion.
+3. Restrict candidates to the current source section when valid. Otherwise, candidates may widen
+   only when semantic kind, complete visible text, and monotonic whole-view ordering still prove one
+   binding; text equality by itself is insufficient.
 4. Filter by compatible semantic kind and structural ancestry.
 5. Validate the complete owned visible-text stream against each projected candidate, accounting for
    declared atomic and synthetic runs.
@@ -403,6 +404,12 @@ closed.
 Each Reading View mount or post-processor rerender receives a new render epoch. DOM bindings and
 text-node indices are scoped to that epoch. Source Projection can survive a rerender when the source
 revision is unchanged; DOM bindings cannot.
+
+Obsidian may virtualize or replace rendered blocks inside a retained Reading View root without
+mounting a new post-processor root. A child-list or owned-text mutation in that retained root must
+therefore invalidate its DOM bindings and advance the effective render epoch before the next user
+interaction. Disconnected element identities must never remain authoritative merely because the view
+root itself stayed connected.
 
 ## DOM Selection to Source Algorithm
 
@@ -592,6 +599,8 @@ string used to build the projection.
 - DOM binding key additionally includes `{viewId, renderEpoch}`.
 - Source revision change invalidates projection and every dependent DOM binding.
 - Reading View rerender invalidates DOM bindings but may reuse an unchanged Source Projection.
+- Host-driven block replacement inside a retained Reading View root invalidates DOM bindings even
+  when Obsidian does not emit a new post-processor mount.
 - Dialect registry change invalidates every projection built by the previous dialect version.
 
 ### Bounded Resources
@@ -673,6 +682,7 @@ Every supported syntax fixture records:
 - Repeated identical text in sibling and distant blocks.
 - Cross-kind, monotonic multi-block selection.
 - Generated, reordered, embedded, and stale-render rejection.
+- Retained-root virtualization that replaces cached DOM blocks before the next selection.
 - UTF-16 and CRLF matrix.
 - Forward/reverse round-trip property tests.
 - Existing resolver mutation, unanchored, and overlap suites.
@@ -833,6 +843,11 @@ This implementation is release-qualified only when all of the following are true
 
 ### Sources
 
+- User reports on 2026-08-21 that Reading View annotations intermittently disappeared after app
+  background/foreground transitions, especially on iPad, and that a unique visible paragraph could
+  still report `Inkstone could not connect this rendered block to the current source.`
+- Failure screenshot supplied on 2026-08-21:
+  `/var/folders/2q/6mht0dc90jxfygb7pxx6w5yh0000gn/T/codex-clipboard-0b72bca5-b3a1-46ea-b0fb-1a5bfe3d8f61.png`.
 - User report in the current Codex task on 2026-07-23 that many Reading View selections cannot be
   annotated, including the supplied screenshot showing the generic message
   `This selection is ambiguous in the Markdown source.`
@@ -893,6 +908,12 @@ This implementation is release-qualified only when all of the following are true
 
 ### Verification Evidence
 
+- Live Obsidian 1.13.7 diagnosis on 2026-08-21 captured one failed selection whose cached binding
+  result contained 47 bindings, including 5 disconnected DOM elements, while the selected new
+  paragraph was absent. Invalidating only the retained view's DOM-binding cache preserved the
+  selection and immediately restored source capture; no source, sidecar, or view reload changed.
+- A minimized retained-root block-replacement regression fails with `source-target-not-found` before
+  mutation-driven invalidation and passes after it.
 - Live Obsidian scan on 2026-07-23: 17 blocks accepted by the current controller's structural
   filter, 8 mapped, and 9 failed; all 9 failures were list items.
 - The paragraph shown in the report, `这是独立的人工验收 Vault。`, occurs once and mapped to source

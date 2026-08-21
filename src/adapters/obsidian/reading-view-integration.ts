@@ -154,9 +154,13 @@ export class ReadingViewIntegration {
     this.sectionObserver =
       MutationObserverConstructor === undefined
         ? null
-        : new MutationObserverConstructor(() => this.scheduleDisconnectedSectionPrune());
+        : new MutationObserverConstructor((mutations) => this.handleDocumentMutations(mutations));
     if (this.document.body !== null) {
-      this.sectionObserver?.observe(this.document.body, { childList: true, subtree: true });
+      this.sectionObserver?.observe(this.document.body, {
+        characterData: true,
+        childList: true,
+        subtree: true,
+      });
     }
     if (this.isMobile) {
       this.document.addEventListener('selectionchange', this.onSelectionChange);
@@ -289,6 +293,19 @@ export class ReadingViewIntegration {
     }, 10_000);
   }
 
+  private handleDocumentMutations(mutations: readonly MutationRecord[]): void {
+    const mutatedRoots = new Set<HTMLElement>();
+    for (const mutation of mutations) {
+      for (const root of this.viewDelegates.keys()) {
+        if (root.contains(mutation.target)) mutatedRoots.add(root);
+      }
+    }
+    for (const root of mutatedRoots) this.invalidateDomBindings(root);
+    if (mutations.some((mutation) => mutation.type === 'childList')) {
+      this.scheduleDisconnectedSectionPrune();
+    }
+  }
+
   private ensureViewDelegate(
     root: HTMLElement,
     context: ReadingSectionMountInput,
@@ -327,6 +344,14 @@ export class ReadingViewIntegration {
       .reverse()
       .find((candidate) => readingViewDelegateRoot(candidate.root) === root);
     if (replacement === undefined) {
+      // Obsidian can move rendered blocks out of a virtualized postprocessor root. Keep the
+      // view-level delegate until the Reading View itself disconnects, but never retain it when a
+      // still-mounted section explicitly enters the editing-mode remount gap.
+      if (root.isConnected && !sectionRoot.isConnected) {
+        delegate.context = { ...delegate.context, root };
+        delegate.sectionRoot = root;
+        return;
+      }
       this.removeViewDelegate(root);
       return;
     }

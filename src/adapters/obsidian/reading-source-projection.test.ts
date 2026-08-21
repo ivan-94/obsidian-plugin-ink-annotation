@@ -176,6 +176,33 @@ describe('Reading View source projection binding', () => {
     expect(generated.failures).toMatchObject([{ code: 'generated-content' }]);
   });
 
+  it('connects a unique rendered block when Obsidian temporarily reports a stale section range', () => {
+    const source = 'First section.\n\nTarget paragraph.\n\nLast section.';
+    const projection = buildSourceProjection({
+      dialectVersion: 'obsidian-gfm-v1',
+      filePath: 'Resumed long note.md',
+      source,
+      sourceRevision: 'revision-1',
+    });
+    const root = document.createElement('section');
+    root.innerHTML = '<p>Target paragraph.</p>';
+    const staleStart = source.indexOf('Last section.');
+
+    const result = bindReadingBlocks({
+      projection,
+      root,
+      sectionRange: () => ({ end: source.length, start: staleStart }),
+    });
+
+    expect(result.failures).toEqual([]);
+    expect(result.bindings.get(root.querySelector('p')!)).toMatchObject({
+      projectedBlock: {
+        sourceStart: source.indexOf('Target paragraph.'),
+        visibleText: 'Target paragraph.',
+      },
+    });
+  });
+
   it('binds loose-list paragraphs and nested items as separately owned blocks', () => {
     const source = '- first paragraph\n\n  second paragraph\n\n  - nested child';
     const projection = buildSourceProjection({
